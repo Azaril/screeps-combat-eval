@@ -521,7 +521,7 @@ fn sweep_kite_weights() -> (KiteScoreParams, i64, i64, usize) {
     for &w_future in &[0.0f32, 0.5, 1.0, 2.0] {
         for &w_prox in &[0.5f32, 1.0, 1.5, 2.0] {
             let kite = KiteScoreParams { w_future, w_prox, ..base };
-            let s = run_kite_vs_melee(SquadTacticParams { kite, engage: KiteScoreParams::engage() }, true).score();
+            let s = run_kite_vs_melee(SquadTacticParams { kite, engage: KiteScoreParams::engage(), healer: KiteScoreParams::healer() }, true).score();
             scores.insert(s);
             if s > best.1 {
                 best = (kite, s);

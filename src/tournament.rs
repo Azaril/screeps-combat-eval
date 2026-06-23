@@ -129,12 +129,12 @@ pub fn strategy_population() -> Vec<Strategy> {
     let with_engage = |f: fn(&mut KiteScoreParams)| {
         let mut e = base.engage;
         f(&mut e);
-        SquadTacticParams { kite: base.kite, engage: e }
+        SquadTacticParams { kite: base.kite, engage: e, healer: base.healer }
     };
     let with_kite = |f: fn(&mut KiteScoreParams)| {
         let mut k = base.kite;
         f(&mut k);
-        SquadTacticParams { kite: k, engage: base.engage }
+        SquadTacticParams { kite: k, engage: base.engage, healer: base.healer }
     };
     vec![
         Strategy { name: "default", tactics: base },

@@ -95,6 +95,7 @@ fn run_worst_case(ticks: usize, shared: bool) -> BenchResult {
                 centroid: c,
                 threats: &threats,
                 towers: &towers,
+                allies: &[],
                 focus: None,
                 focus_damage: None,
                 params: KiteScoreParams::default(),
