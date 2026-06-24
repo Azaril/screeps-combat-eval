@@ -5,8 +5,8 @@
 //! and multi-room generators + opponent force specs.
 
 use crate::harness::scenario::{Objective, Scenario};
-use screeps::{Position, RoomCoordinate, RoomName};
-use screeps_combat_engine::{CombatWorld, PlayerId, StructureKind};
+use screeps::{Part, Position, RoomCoordinate, RoomName};
+use screeps_combat_engine::{CombatWorld, PlayerId, SimBody, SimCreep, StructureKind};
 use screeps_combat_agent::scenario::ScenarioBuilder;
 
 pub const ATTACKER: PlayerId = 0;
@@ -199,8 +199,56 @@ fn layout_terrain(layout: Layout, core: (u8, u8)) -> (Tiles, Tiles) {
     (walls, swamps)
 }
 
-/// Assemble a single-room defended-objective scenario with terrain, a core (+ optional rampart), and
-/// towers. The breach staging + a clear western `entry` come from [`breach_geometry`].
+/// The opponent (defender) creep force guarding the objective — random or designed. Realized into
+/// defender `SimCreep`s near the core; their attack/ranged output flows into the oracle's `enemy_dps`
+/// (the validator's `derive_profile` sums it) and they fight the managed assault (the combat the
+/// operator sees). Stationary (`defense_intents` issues no moves), so they don't perturb the sizing
+/// calibration's movement-free purity.
+#[derive(Clone, Copy, Debug)]
+pub enum ForceSpec {
+    /// No defender creeps (towers/structures only).
+    None,
+    /// `n` ranged skirmishers (RANGED_ATTACK + MOVE).
+    Skirmishers(u32),
+    /// `n` melee defenders (TOUGH + ATTACK + MOVE) + 1 healer.
+    Guard(u32),
+}
+
+/// Place a [`ForceSpec`]'s defender creeps in `world` around `core`, owned by `defender`. Ids start at
+/// 10_000 so they never collide with attacker ids (1..N).
+fn place_force(world: &mut CombatWorld, rm: RoomName, core: (u8, u8), spec: ForceSpec, defender: PlayerId) {
+    let (cx, cy) = core;
+    // A ring of guard tiles around the core (skip the core + the western breach approach).
+    let ring: [(i32, i32); 6] = [(1, 0), (2, 0), (1, 2), (2, 1), (1, -2), (2, -1)];
+    let mut push = |i: usize, parts: &[Part], id: u32| {
+        let (dx, dy) = ring[i % ring.len()];
+        let x = (cx as i32 + dx).clamp(0, 49) as u8;
+        let y = (cy as i32 + dy).clamp(0, 49) as u8;
+        let pos = Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), rm);
+        world.creeps.push(SimCreep { id, owner: defender, pos, body: SimBody::unboosted(parts), fatigue: 0 });
+    };
+    match spec {
+        ForceSpec::None => {}
+        ForceSpec::Skirmishers(n) => {
+            let body = [Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::Move, Part::Move, Part::Move];
+            for i in 0..n as usize {
+                push(i, &body, 10_000 + i as u32);
+            }
+        }
+        ForceSpec::Guard(n) => {
+            let melee = [Part::Tough, Part::Tough, Part::Attack, Part::Attack, Part::Move, Part::Move, Part::Move, Part::Move];
+            for i in 0..n as usize {
+                push(i, &melee, 10_000 + i as u32);
+            }
+            let healer = [Part::Heal, Part::Heal, Part::Heal, Part::Move, Part::Move, Part::Move];
+            push(n as usize, &healer, 10_000 + n);
+        }
+    }
+}
+
+/// Assemble a single-room defended-objective scenario with terrain, a core (+ optional rampart),
+/// towers, and an opponent force. The breach staging + a clear western `entry` come from
+/// [`breach_geometry`].
 #[allow(clippy::too_many_arguments)]
 fn assemble_single_room(
     label: String,
@@ -211,6 +259,7 @@ fn assemble_single_room(
     rampart_hits: u32,
     towers: &[((u8, u8), u32)],
     layout: Layout,
+    force: ForceSpec,
     safe_mode: bool,
 ) -> Scenario {
     let rm = room();
@@ -234,6 +283,7 @@ fn assemble_single_room(
     if safe_mode {
         world.safe_mode_owner = Some(DEFENDER);
     }
+    place_force(&mut world, rm, core, force, DEFENDER);
     let objective = Objective {
         id: core_id,
         room: rm,
@@ -287,6 +337,7 @@ impl Generator for Permutations {
             rampart,
             &towers,
             layout,
+            ForceSpec::None,
             false,
         )
     }
@@ -306,10 +357,10 @@ impl Generator for Designed {
     }
     fn generate(&self, index: u32) -> Scenario {
         match index {
-            0 => assemble_single_room("designed#0 open-rcl7".into(), 0, 5600, 1200, (25, 25), 30_000, &[((24, 16), 100_000)], Layout::Open, false),
-            1 => assemble_single_room("designed#1 wall-corridor".into(), 1, 5600, 1200, (32, 25), 20_000, &[((32, 12), 100_000), ((28, 12), 100_000)], Layout::Corridor, false),
-            2 => assemble_single_room("designed#2 swamp-approach".into(), 2, 12_900, 1300, (25, 25), 40_000, &[((24, 14), 100_000)], Layout::SwampApproach, false),
-            3 => assemble_single_room("designed#3 bunker".into(), 3, 12_900, 1300, (25, 25), 60_000, &[((25, 22), 100_000), ((25, 28), 100_000)], Layout::Bunker, false),
+            0 => assemble_single_room("designed#0 open + skirmishers".into(), 0, 5600, 1200, (25, 25), 30_000, &[((24, 16), 100_000)], Layout::Open, ForceSpec::Skirmishers(3), false),
+            1 => assemble_single_room("designed#1 wall-corridor + guard".into(), 1, 5600, 1200, (32, 25), 20_000, &[((32, 12), 100_000), ((28, 12), 100_000)], Layout::Corridor, ForceSpec::Guard(2), false),
+            2 => assemble_single_room("designed#2 swamp-approach".into(), 2, 12_900, 1300, (25, 25), 40_000, &[((24, 14), 100_000)], Layout::SwampApproach, ForceSpec::None, false),
+            3 => assemble_single_room("designed#3 bunker + guard".into(), 3, 12_900, 1300, (25, 25), 60_000, &[((25, 22), 100_000), ((25, 28), 100_000)], Layout::Bunker, ForceSpec::Guard(3), false),
             _ => twin_room_siege(),
         }
     }
@@ -333,7 +384,8 @@ fn twin_room_siege() -> Scenario {
     let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000);
     b.structure(StructureKind::Rampart, Some(DEFENDER), rampart_xy.0, rampart_xy.1, 30_000, 30_000);
     b.tower(DEFENDER, core.0, 18, 100_000);
-    let world = b.build();
+    let mut world = b.build();
+    place_force(&mut world, target, core, ForceSpec::Skirmishers(2), DEFENDER);
     let objective = Objective {
         id: core_id,
         room: target,

@@ -57,6 +57,7 @@ pub fn calibration_replay(index: u32) -> String {
 mod tests {
     use super::*;
     use generate::{Designed, Permutations};
+    use validate::ManagedSquadIntegration;
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
     /// the force-sizing oracle is calibrated against the engine — winnable verdicts breach (fp ≤ 1%) and
@@ -132,31 +133,49 @@ mod tests {
         }
     }
 
-    /// On-demand: write a few sample replays (a winnable-breach + a deferred) to `target/replays/` for
-    /// eyeballing. `cargo test -p screeps-combat-eval --lib -- --ignored write_sample_replays`.
+    /// The traversal lens works end-to-end: a moving managed squad navigates the open-field designed
+    /// fixture to the objective + engages (the movement the operator validates). `Designed#0` is
+    /// terrain-free so pathing is unobstructed — the squad must reach the objective vicinity.
+    #[test]
+    fn managed_squad_navigates_to_the_objective() {
+        // Permutations#0 is open / no rampart / no towers / no force — pure navigation, so the moving
+        // squad MUST reach + engage the objective (isolates the pathing from the engage/retreat gate).
+        let scenario = Permutations.generate(0);
+        let mut v = ManagedSquadIntegration;
+        let verdict = v.validate(&scenario);
+        assert!(verdict.pass, "the managed assault did not reach/engage the undefended objective: {}", verdict.detail);
+    }
+
+    /// On-demand: write sample replays to `target/replays/` for eyeballing — the movement-rich MANAGED
+    /// assaults over the terrain-rich Designed fixtures (the depth the operator wants) + a calibration
+    /// breach/defer pair. `cargo test -p screeps-combat-eval --lib -- --ignored write_sample_replays`.
     #[test]
     #[ignore]
     fn write_sample_replays() {
-        use crate::harness::validate::render_calibration_replay;
+        use crate::harness::validate::{render_calibration_replay, render_managed_replay};
         let _ = std::fs::create_dir_all("target/replays");
+        // Movement-rich managed assaults over every terrain-rich Designed fixture (incl. multi-room).
+        for i in 0..Designed.count() {
+            let s = Designed.generate(i);
+            let name = s.label.replace([' ', '#'], "_");
+            std::fs::write(format!("target/replays/managed-{name}.html"), render_managed_replay(&s)).unwrap();
+        }
+        // A calibration breach + defer (the sizing-pure lens).
         let gen = RandomDefendedBase { n: 200 };
-        let (mut wrote_breach, mut wrote_defer) = (false, false);
+        let (mut breach, mut defer) = (false, false);
         for i in 0..200 {
-            let s = gen.generate(i);
-            let html = render_calibration_replay(&s);
-            let breached = html.contains("→ BREACHED");
-            let deferred = html.contains("deferred (");
-            if breached && !wrote_breach {
-                std::fs::write(format!("target/replays/breach-seed{i}.html"), &html).unwrap();
-                wrote_breach = true;
-            } else if deferred && !wrote_defer {
-                std::fs::write(format!("target/replays/defer-seed{i}.html"), &html).unwrap();
-                wrote_defer = true;
+            let html = render_calibration_replay(&gen.generate(i));
+            if html.contains("→ BREACHED") && !breach {
+                std::fs::write(format!("target/replays/calib-breach-seed{i}.html"), &html).unwrap();
+                breach = true;
+            } else if html.contains("deferred (") && !defer {
+                std::fs::write(format!("target/replays/calib-defer-seed{i}.html"), &html).unwrap();
+                defer = true;
             }
-            if wrote_breach && wrote_defer {
+            if breach && defer {
                 break;
             }
         }
-        println!("wrote samples to target/replays/ (breach={wrote_breach}, defer={wrote_defer})");
+        println!("wrote managed (x{}) + calibration replays to target/replays/", Designed.count());
     }
 }

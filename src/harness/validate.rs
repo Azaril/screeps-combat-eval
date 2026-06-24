@@ -9,12 +9,13 @@ use crate::harness::scenario::{Objective, Scenario};
 use crate::harness::visualize::{replay_to_html, ReplayMeta};
 use screeps::Position;
 use screeps_combat_agent::objective_bed::defense_intents;
+use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
 use screeps_combat_decision::composition::{BodyType, SquadComposition, SquadRole, SquadSlot};
 use screeps_combat_decision::damage::tower_repair_at_range;
 use screeps_combat_decision::force_sizing::{assess, AssaultMode, DefenseProfile, ForceBudget, RequiredForce, TowerThreat};
 use screeps_combat_engine::constants::TOWER_ENERGY_COST;
-use screeps_combat_engine::{CombatAction, CombatWorld, Intents, PlayerId, SimBody, SimCreep, StructureId};
+use screeps_combat_engine::{CombatAction, CombatWorld, CreepId, Intents, PlayerId, SimBody, SimCreep, StructureId};
 
 /// A validator's judgement of one scenario.
 #[derive(Clone, Debug)]
@@ -280,13 +281,11 @@ fn breaches(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Op
     Some(outcome.stop == StopReason::ObjectivesComplete)
 }
 
-/// Render an interactive HTML replay of the oracle's decision on `scenario`: derive the profile,
-/// assess the fieldable ceiling, FIELD the force the validator would (the sized squad when winnable,
-/// else the ceiling falsifier), record the scripted siege, and render it with a verdict header. The
-/// full Generation → Evaluation(record) → Visualization chain in one call — for the operator's visual
-/// validation of outcomes + permutation variety.
-pub fn render_calibration_replay(scenario: &Scenario) -> String {
-    let obj = &scenario.objectives[0];
+// ── ManagedSquadIntegration: drive the REAL squad brain (movement/pathing) — the traversal lens ────
+
+/// Decide what to FIELD for a scenario (the sized squad when winnable+breach, else the ceiling), with a
+/// human label. Shared by the replay + managed-assault paths.
+fn choose_fielded_comp(scenario: &Scenario, obj: &Objective) -> (SquadComposition, String) {
     let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
     let ceiling = siege_ceiling(scenario.member_energy);
     let caps = ceiling.capabilities(scenario.member_energy);
@@ -297,16 +296,130 @@ pub fn render_calibration_replay(scenario: &Scenario) -> String {
         onsite_budget_ticks: scenario.onsite_budget,
     };
     let a = assess(&profile, &budget);
-    let (comp, decision) = if a.winnable && a.mode == AssaultMode::Breach {
+    if a.winnable && a.mode == AssaultMode::Breach {
         match SquadComposition::siege_quad().sized_for(RequiredForce::from_assessment(&a), scenario.member_energy) {
             Some(sized) => (sized, "winnable → fielded the sized force".to_string()),
-            None => (ceiling.clone(), "winnable but the comp can't field the required force; showing the ceiling".to_string()),
+            None => (ceiling, "winnable but the comp can't field the required force; showing the ceiling".to_string()),
         }
     } else if a.winnable {
-        (ceiling.clone(), "winnable (drain mode); showing the ceiling".to_string())
+        (ceiling, "winnable (drain mode); showing the ceiling".to_string())
     } else {
-        (ceiling.clone(), format!("deferred ({}); showing the ceiling falsifier", a.reason))
-    };
+        (ceiling, format!("deferred ({}); showing the ceiling", a.reason))
+    }
+}
+
+/// The composition the MANAGED lens fields: a ranged+heal combat quad the squad brain can actually
+/// drive (advance, kite, focus-fire creeps, shoot structures), auto-sized to the home's energy. (The
+/// sizing-pure siege force is `choose_fielded_comp`/`OracleCalibration`.)
+fn managed_assault_comp(_scenario: &Scenario) -> SquadComposition {
+    SquadComposition::quad_ranged()
+}
+
+/// Place `comp`'s members as attacker creeps clustered at the objective's ENTRY (a MOVING assault),
+/// returning their ids in slot order (the `ManagedSimSquad` roster). `None` ⇒ a body wouldn't build.
+fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposition, attacker: PlayerId, energy: u32) -> Option<Vec<CreepId>> {
+    const OFF: [(i32, i32); 9] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+    let (ex, ey, rm) = (obj.entry.x().u8() as i32, obj.entry.y().u8() as i32, obj.entry.room_name());
+    let mut ids = Vec::new();
+    for (i, slot) in comp.slots.iter().enumerate().take(OFF.len()) {
+        let body = slot.body_type.build_body(energy, MoveProfile::Plains)?;
+        let (dx, dy) = OFF[i];
+        let x = (ex + dx).clamp(0, 49) as u8;
+        let y = (ey + dy).clamp(0, 49) as u8;
+        let id = i as u32 + 1;
+        let pos = Position::new(screeps::RoomCoordinate::new(x).unwrap(), screeps::RoomCoordinate::new(y).unwrap(), rm);
+        world.creeps.push(SimCreep { id, owner: attacker, pos, body: SimBody::unboosted(&body), fatigue: 0 });
+        ids.push(id);
+    }
+    Some(ids)
+}
+
+/// Field `comp` as a MOVING managed squad at the entry and run the REAL `decide_squad_with_pathing`
+/// brain to the objective (recording each tick). `None` ⇒ couldn't field.
+fn run_managed_assault(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
+    let mut world = scenario.world.clone();
+    let members = place_at_entry(&mut world, obj, comp, scenario.attacker_owner, scenario.member_energy)?;
+    let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos);
+    let defender = scenario.defender_owner;
+    let core_pos = obj.pos;
+    let run_until = AnyOf(vec![Box::new(ObjectivesDestroyed(vec![obj.id])), Box::new(SideWiped(scenario.attacker_owner))]);
+    let out = evaluate_recorded(
+        world,
+        &mut |w| squad.step(w),
+        &mut |w, intents| defense_intents(w, defender, core_pos, intents),
+        &run_until,
+        scenario.onsite_budget,
+    );
+    Some(out)
+}
+
+/// The **traversal lens** (ADR 0023a stage 3): field the real moving squad and grade whether it
+/// NAVIGATES to + ENGAGES the objective (the movement/pathing the operator validates) — distinct from
+/// `OracleCalibration` (which is sizing-pure, in-range). Pass = the assault breached, was wiped engaging,
+/// or reached the objective vicinity; fail = it never approached (a pathing break).
+#[derive(Default)]
+pub struct ManagedSquadIntegration;
+
+impl Validator for ManagedSquadIntegration {
+    fn label(&self) -> &str {
+        "managed-squad-integration"
+    }
+    fn validate(&mut self, scenario: &Scenario) -> Verdict {
+        let obj = &scenario.objectives[0];
+        // Field a COMBAT composition (ranged + heal) — the managed brain (`decide_combat`) engages
+        // creeps + structures with it, unlike a WORK-only siege squad it can't drive. The sizing-pure
+        // siege lens is `OracleCalibration`; this is the movement/engagement lens.
+        let comp = managed_assault_comp(scenario);
+        let Some((outcome, _rec)) = run_managed_assault(scenario, obj, &comp) else {
+            return Verdict { pass: true, label: self.label().into(), detail: "could not field at the entry (excluded)".into() };
+        };
+        let reached_vicinity = outcome
+            .world
+            .creeps
+            .iter()
+            .any(|c| c.is_alive() && c.owner == scenario.attacker_owner && c.pos.room_name() == obj.room && c.pos.get_range_to(obj.pos) <= 8);
+        let pass = match outcome.stop {
+            StopReason::ObjectivesComplete | StopReason::SideWiped(_) => true,
+            StopReason::Timeout => reached_vicinity,
+        };
+        Verdict {
+            pass,
+            label: self.label().into(),
+            detail: format!("managed ranged assault → {:?} @ t{} (reached={reached_vicinity})", outcome.stop, outcome.ticks),
+        }
+    }
+}
+
+/// Render an interactive HTML replay of a MOVING managed assault on `scenario` — the real squad brain
+/// pathing from the entry to the objective + engaging (the movement-rich replay).
+pub fn render_managed_replay(scenario: &Scenario) -> String {
+    let obj = &scenario.objectives[0];
+    let comp = managed_assault_comp(scenario);
+    match run_managed_assault(scenario, obj, &comp) {
+        Some((outcome, rec)) => {
+            let result = match outcome.stop {
+                StopReason::ObjectivesComplete => "objective destroyed",
+                StopReason::SideWiped(_) => "attackers wiped",
+                StopReason::Timeout => "held (timed out)",
+            };
+            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("managed ranged assault → {result} @ t{}", outcome.ticks)));
+            replay_to_html(&rec, &meta)
+        }
+        None => {
+            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some("managed assault — could not field at the entry".into()));
+            replay_to_html(&screeps_combat_engine::CombatRecording::new(), &meta)
+        }
+    }
+}
+
+/// Render an interactive HTML replay of the oracle's decision on `scenario`: derive the profile,
+/// assess the fieldable ceiling, FIELD the force the validator would (the sized squad when winnable,
+/// else the ceiling falsifier), record the scripted siege, and render it with a verdict header. The
+/// full Generation → Evaluation(record) → Visualization chain in one call — for the operator's visual
+/// validation of outcomes + permutation variety.
+pub fn render_calibration_replay(scenario: &Scenario) -> String {
+    let obj = &scenario.objectives[0];
+    let (comp, decision) = choose_fielded_comp(scenario, obj);
 
     let mut world = scenario.world.clone();
     if !place_squad(&mut world, obj, &comp, scenario.attacker_owner, scenario.member_energy) {
