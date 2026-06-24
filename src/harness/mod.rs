@@ -10,7 +10,7 @@ pub mod scenario;
 pub mod validate;
 pub mod visualize;
 
-use generate::{Designed, Generator, Permutations, RandomDefendedBase};
+use generate::{Generator, RandomDefendedBase};
 use validate::{Calibration, OracleCalibration, Validator, Verdict};
 
 /// The aggregate of running a generator's scenarios through a validator.
@@ -56,6 +56,7 @@ pub fn calibration_replay(index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use generate::{Designed, Permutations};
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
     /// the force-sizing oracle is calibrated against the engine — winnable verdicts breach (fp ≤ 1%) and

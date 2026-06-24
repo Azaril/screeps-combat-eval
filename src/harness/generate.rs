@@ -155,9 +155,12 @@ pub enum Layout {
     Bunker,
 }
 
+/// A list of in-room tiles.
+type Tiles = Vec<(u8, u8)>;
+
 /// The terrain (natural wall + swamp tiles) for a layout around `core`, leaving the breach staging (NW
 /// of the core) and the western approach clear.
-fn layout_terrain(layout: Layout, core: (u8, u8)) -> (Vec<(u8, u8)>, Vec<(u8, u8)>) {
+fn layout_terrain(layout: Layout, core: (u8, u8)) -> (Tiles, Tiles) {
     let (cx, cy) = core;
     let mut walls = Vec::new();
     let mut swamps = Vec::new();
