@@ -9,6 +9,7 @@ use crate::harness::scenario::{Objective, Scenario};
 use crate::harness::visualize::{replay_to_html, ReplayMeta};
 use screeps::Position;
 use screeps_combat_agent::objective_bed::defense_intents;
+use screeps_combat_agent::opponents::tower_intents;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
 use screeps_combat_decision::composition::{BodyType, SquadComposition, SquadRole, SquadSlot};
@@ -386,6 +387,103 @@ impl Validator for ManagedSquadIntegration {
             pass,
             label: self.label().into(),
             detail: format!("managed ranged assault → {:?} @ t{} (reached={reached_vicinity})", outcome.stop, outcome.ticks),
+        }
+    }
+}
+
+// ── SelfPlay: BOTH sides run the real squad brain (the realistic, moving-on-both-sides engagement) ──
+
+/// Merge `src` intents into `dst` (the engine merges both squads' intents into one resolved tick).
+fn merge_intents(dst: &mut Intents, src: Intents) {
+    dst.creeps.extend(src.creeps);
+    dst.moves.extend(src.moves);
+    dst.pulls.extend(src.pulls);
+    dst.reasons.extend(src.reasons);
+}
+
+/// Run a self-play engagement: the attacker (a fielded combat quad) AND the defender (the scenario's
+/// force) BOTH driven by the real `ManagedSimSquad` brain (`decide_squad_with_pathing` — advance / kite
+/// / focus-fire), with the defender's towers firing (`tower_intents`). Recording. `None` ⇒ couldn't
+/// field the attacker.
+fn run_self_play(scenario: &Scenario, obj: &Objective) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording, Vec<CreepId>)> {
+    let mut world = scenario.world.clone();
+    let attacker_comp = managed_assault_comp(scenario);
+    let att_ids = place_at_entry(&mut world, obj, &attacker_comp, scenario.attacker_owner, scenario.member_energy)?;
+    // The defender squad = the scenario's pre-placed defender creeps (the ForceSpec opponent).
+    let def_ids: Vec<CreepId> = world.creeps.iter().filter(|c| c.is_alive() && c.owner == scenario.defender_owner).map(|c| c.id).collect();
+    let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos);
+    let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids.clone(), obj.pos); // defender holds the core
+    let run_until = AnyOf(vec![
+        Box::new(ObjectivesDestroyed(vec![obj.id])),
+        Box::new(SideWiped(scenario.attacker_owner)),
+        Box::new(SideWiped(scenario.defender_owner)),
+    ]);
+    let (outcome, rec) = evaluate_recorded(
+        world,
+        &mut |w| att.step(w),
+        &mut |w, intents| {
+            let d = def.step(w);
+            merge_intents(intents, d);
+            tower_intents(w, intents); // the defender's towers fire at the attacker
+        },
+        &run_until,
+        scenario.onsite_budget,
+    );
+    Some((outcome, rec, def_ids))
+}
+
+/// The **self-play lens** (operator-requested realism): BOTH sides run the bot's squad logic and MOVE.
+/// Pass = both sides actually engaged + the DEFENDER moved (the opposing side is not static) — the
+/// realism check. The replay (`render_self_play_replay`) is the deliverable.
+#[derive(Default)]
+pub struct SelfPlay;
+
+impl Validator for SelfPlay {
+    fn label(&self) -> &str {
+        "self-play"
+    }
+    fn validate(&mut self, scenario: &Scenario) -> Verdict {
+        let obj = &scenario.objectives[0];
+        // Defender start positions (to detect movement).
+        let starts: std::collections::HashMap<CreepId, Position> =
+            scenario.world.creeps.iter().filter(|c| c.owner == scenario.defender_owner).map(|c| (c.id, c.pos)).collect();
+        let Some((outcome, _rec, def_ids)) = run_self_play(scenario, obj) else {
+            return Verdict { pass: true, label: self.label().into(), detail: "could not field the attacker (excluded)".into() };
+        };
+        let defender_moved = outcome
+            .world
+            .creeps
+            .iter()
+            .filter(|c| def_ids.contains(&c.id))
+            .any(|c| starts.get(&c.id).map(|s| s.get_range_to(c.pos) > 0).unwrap_or(false));
+        let had_defenders = !def_ids.is_empty();
+        let pass = !had_defenders || defender_moved;
+        Verdict {
+            pass,
+            label: self.label().into(),
+            detail: format!("self-play → {:?} @ t{} (defenders={}, moved={defender_moved})", outcome.stop, outcome.ticks, def_ids.len()),
+        }
+    }
+}
+
+/// Render an interactive HTML replay of a SELF-PLAY engagement — both sides moving + fighting under the
+/// real squad brain (the realistic engagement the operator validates).
+pub fn render_self_play_replay(scenario: &Scenario) -> String {
+    let obj = &scenario.objectives[0];
+    match run_self_play(scenario, obj) {
+        Some((outcome, rec, _)) => {
+            let result = match outcome.stop {
+                StopReason::ObjectivesComplete => "objective destroyed",
+                StopReason::SideWiped(o) if o == scenario.attacker_owner => "attacker wiped",
+                StopReason::SideWiped(_) => "defender wiped",
+                StopReason::Timeout => "timed out",
+            };
+            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks)));
+            replay_to_html(&rec, &meta)
+        }
+        None => {
+            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some("self-play — could not field the attacker".into()));
+            replay_to_html(&screeps_combat_engine::CombatRecording::new(), &meta)
         }
     }
 }

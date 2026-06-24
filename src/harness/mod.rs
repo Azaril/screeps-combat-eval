@@ -58,7 +58,7 @@ pub fn calibration_replay(index: u32) -> String {
 mod tests {
     use super::*;
     use generate::{Designed, Permutations};
-    use validate::{ManagedSquadIntegration, SizingWins};
+    use validate::{ManagedSquadIntegration, SelfPlay, SizingWins};
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
     /// the force-sizing oracle is calibrated against the engine — winnable verdicts breach (fp ≤ 1%) and
@@ -156,6 +156,28 @@ mod tests {
         assert_eq!(report.verdicts.len(), 64);
         assert!(v.attempted > 0, "some scenarios are winnable+fielded sizing attempts");
         assert!(v.win_rate() >= 0.99, "the fielded sized force wins its attempts (win_rate {:.3})", v.win_rate());
+    }
+
+    /// Self-play realism (operator-requested): in the open no-tower skirmish (Designed#5) BOTH sides run
+    /// the squad brain, so the OPPOSING side actually MOVES (not a static defender). Guards against the
+    /// "opponent doesn't move" regression.
+    #[test]
+    fn self_play_makes_the_opposing_side_move() {
+        let scenario = Designed.generate(5);
+        let mut v = SelfPlay;
+        let verdict = v.validate(&scenario);
+        assert!(verdict.detail.contains("moved=true"), "the opposing (defender) squad never moved: {}", verdict.detail);
+    }
+
+    /// Multi-room cross-room movement (operator-flagged): the twin-room assault (Designed#4) must
+    /// actually CROSS W1N1→W2N1 and reach/engage the objective — guards the `ManagedSimSquad` travel
+    /// mode that fixes the room-scoped-view "no cross-room movement" bug.
+    #[test]
+    fn multi_room_assault_crosses_the_border() {
+        let scenario = Designed.generate(4);
+        let mut v = ManagedSquadIntegration;
+        let verdict = v.validate(&scenario);
+        assert!(verdict.pass, "the assault did not cross into the objective room + engage: {}", verdict.detail);
     }
 
     /// The dashboard writes per-scenario replays + a contact-sheet index (smoke).

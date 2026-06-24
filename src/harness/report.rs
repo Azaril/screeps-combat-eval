@@ -3,7 +3,7 @@
 //! validator verdict in one place. Host-only; writes to a directory the operator opens.
 
 use crate::harness::generate::{Designed, Generator, Permutations, RandomDefendedBase};
-use crate::harness::validate::{render_calibration_replay, render_managed_replay, ManagedSquadIntegration, OracleCalibration, Validator};
+use crate::harness::validate::{render_calibration_replay, render_self_play_replay, OracleCalibration, SelfPlay, Validator};
 use std::fmt::Write as _;
 
 fn esc(s: &str) -> String {
@@ -26,28 +26,28 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
     std::fs::create_dir_all(dir)?;
     let mut entries: Vec<Entry> = Vec::new();
 
-    // Designed fixtures — the movement/combat lens (terrain + forces + the real squad brain).
+    // Designed fixtures — SELF-PLAY (both sides run the squad brain → both move + fight) over terrain + forces.
     {
         let g = Designed;
-        let mut v = ManagedSquadIntegration;
+        let mut v = SelfPlay;
         for i in 0..g.count() {
             let s = g.generate(i);
-            let file = format!("managed-designed-{i}.html");
-            std::fs::write(format!("{dir}/{file}"), render_managed_replay(&s))?;
+            let file = format!("selfplay-designed-{i}.html");
+            std::fs::write(format!("{dir}/{file}"), render_self_play_replay(&s))?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file, title: s.label, lens: "managed", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry { file, title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
         }
     }
-    // A few permutations — the managed lens over the enumerated layout grid.
+    // A few permutations — self-play over the enumerated layout grid.
     {
         let g = Permutations;
-        let mut v = ManagedSquadIntegration;
+        let mut v = SelfPlay;
         for i in [0u32, 13, 40, 75] {
             let s = g.generate(i);
-            let file = format!("managed-perm-{i}.html");
-            std::fs::write(format!("{dir}/{file}"), render_managed_replay(&s))?;
+            let file = format!("selfplay-perm-{i}.html");
+            std::fs::write(format!("{dir}/{file}"), render_self_play_replay(&s))?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file, title: s.label, lens: "managed", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry { file, title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
         }
     }
     // RandomDefendedBase — the sizing-pure calibration lens.

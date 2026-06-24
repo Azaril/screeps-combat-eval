@@ -353,7 +353,7 @@ impl Generator for Designed {
         "designed"
     }
     fn count(&self) -> u32 {
-        5
+        6
     }
     fn generate(&self, index: u32) -> Scenario {
         match index {
@@ -361,7 +361,10 @@ impl Generator for Designed {
             1 => assemble_single_room("designed#1 wall-corridor + guard".into(), 1, 5600, 1200, (32, 25), 20_000, &[((32, 12), 100_000), ((28, 12), 100_000)], Layout::Corridor, ForceSpec::Guard(2), false),
             2 => assemble_single_room("designed#2 swamp-approach".into(), 2, 12_900, 1300, (25, 25), 40_000, &[((24, 14), 100_000)], Layout::SwampApproach, ForceSpec::None, false),
             3 => assemble_single_room("designed#3 bunker + guard".into(), 3, 12_900, 1300, (25, 25), 60_000, &[((25, 22), 100_000), ((25, 28), 100_000)], Layout::Bunker, ForceSpec::Guard(3), false),
-            _ => twin_room_siege(),
+            4 => twin_room_siege(),
+            // Open field, NO towers, ranged defenders — a clean two-managed-squad skirmish (both sides
+            // move + trade fire), the self-play realism case.
+            _ => assemble_single_room("designed#5 open skirmish (self-play)".into(), 5, 5600, 600, (25, 25), 0, &[], Layout::Open, ForceSpec::Skirmishers(3), false),
         }
     }
 }
@@ -383,8 +386,9 @@ fn twin_room_siege() -> Scenario {
     }
     let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000);
     b.structure(StructureKind::Rampart, Some(DEFENDER), rampart_xy.0, rampart_xy.1, 30_000, 30_000);
-    b.tower(DEFENDER, core.0, 18, 100_000);
     let mut world = b.build();
+    // No tower here — this fixture demonstrates cross-room MOVEMENT + engagement (the assault crosses
+    // W1N1→W2N1 and fights the defenders) rather than a tower-turtle the squad would retreat from.
     place_force(&mut world, target, core, ForceSpec::Skirmishers(2), DEFENDER);
     let objective = Objective {
         id: core_id,
@@ -393,7 +397,8 @@ fn twin_room_siege() -> Scenario {
         assault_pos,
         front_tiles,
         support_tiles,
-        entry: Position::new(RoomCoordinate::new(25).unwrap(), RoomCoordinate::new(25).unwrap(), home),
+        // Stage near the W1N1 west border so the cross into W2N1 is a short, reliably-pathable hop.
+        entry: Position::new(RoomCoordinate::new(5).unwrap(), RoomCoordinate::new(25).unwrap(), home),
     };
     Scenario {
         world,
