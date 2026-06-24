@@ -322,10 +322,21 @@ const RENDERER_JS: &str = r#"
 // structs[ri,x,y,kind,owner,hits,hmax]; towers[ri,x,y,owner,energy,hits].
 window.IbexRenderer = (function(){
   const CELL=11, ROOM=50, GAP=18, PAD=18;
-  function cols(meta){ return Math.min(2, Math.max(1, meta.rooms.length)); }
-  function dims(meta){ const c=cols(meta), rw=ROOM*CELL, rows=Math.ceil(Math.max(1,meta.rooms.length)/c);
-    return { w:PAD+c*(rw+GAP), h:PAD+rows*(rw+GAP+14), rw }; }
-  function origin(meta, ri){ const c=cols(meta), rw=ROOM*CELL, col=ri%c, row=(ri/c)|0;
+  // Place rooms by their TRUE world geometry, not array index: Screeps Wx INCREASES westward and Ny
+  // INCREASES northward, so a name-sorted index layout mirrors the map (W2N1 drawn right of W1N1). Parse
+  // WxNy/ExSy to a signed world cell — east=+col (right), west=-col (left); south=+row (down), north=
+  // -row (up) — so cross-border movement reads continuously.
+  function parseRoom(name){ const m=/^([WE])(\d+)([NS])(\d+)$/.exec(name||''); if(!m) return [0,0];
+    const c=(m[1]==='E')?(+m[2]):(-(+m[2])-1), r=(m[3]==='S')?(+m[4]):(-(+m[4])-1); return [c,r]; }
+  function layout(meta){ const cells=(meta.rooms||[]).map(function(rm){ return parseRoom(rm.name); });
+    let minc=0,minr=0,maxc=0,maxr=0;
+    cells.forEach(function(p,i){ if(i===0){minc=maxc=p[0];minr=maxr=p[1];} else {
+      if(p[0]<minc)minc=p[0]; if(p[0]>maxc)maxc=p[0]; if(p[1]<minr)minr=p[1]; if(p[1]>maxr)maxr=p[1]; } });
+    return { cells:cells, minc:minc, minr:minr, cols:(maxc-minc+1), rows:(maxr-minr+1) }; }
+  function dims(meta){ const L=layout(meta), rw=ROOM*CELL;
+    return { w:PAD+L.cols*(rw+GAP), h:PAD+L.rows*(rw+GAP+14), rw }; }
+  function origin(meta, ri){ const L=layout(meta), rw=ROOM*CELL, p=L.cells[ri]||[L.minc,L.minr];
+    const col=p[0]-L.minc, row=p[1]-L.minr;
     return [PAD+col*(rw+GAP), PAD+row*(rw+GAP+14)+14]; }
   function ownerColor(o){ return o===0?'#3b82f6':'#ef4444'; }
   function drawShape(ctx, prims, ox, oy, sx, sy, extraOp){
