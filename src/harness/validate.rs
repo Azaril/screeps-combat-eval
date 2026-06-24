@@ -390,6 +390,56 @@ impl Validator for ManagedSquadIntegration {
     }
 }
 
+/// A simpler swappable lens (ADR 0023a stage 3 — demonstrates generation ⊥ validation): "did the force
+/// the sizing system fields actually WIN?" Over a generator the pass-rate is the **win rate**. Pass = a
+/// winnable+fielded scenario breaches (the load-bearing claim) OR the scenario was a correct defer /
+/// unfieldable / drain (not a sizing failure). Distinct from `OracleCalibration` (which separates the
+/// FP and FN rates with asymmetric gates); this is the at-a-glance win rate.
+#[derive(Default)]
+pub struct SizingWins {
+    pub attempted: u32,
+    pub won: u32,
+}
+impl SizingWins {
+    pub fn win_rate(&self) -> f64 {
+        if self.attempted == 0 {
+            0.0
+        } else {
+            self.won as f64 / self.attempted as f64
+        }
+    }
+}
+impl Validator for SizingWins {
+    fn label(&self) -> &str {
+        "sizing-wins"
+    }
+    fn validate(&mut self, scenario: &Scenario) -> Verdict {
+        let obj = &scenario.objectives[0];
+        let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
+        let ceiling = siege_ceiling(scenario.member_energy);
+        let caps = ceiling.capabilities(scenario.member_energy);
+        let budget = ForceBudget {
+            max_heal_per_tick: caps.heal_per_tick as f32,
+            max_dismantle_dps: caps.structure_dps as f32,
+            tank_effective_hp: caps.tank_effective_hp as f32,
+            onsite_budget_ticks: scenario.onsite_budget,
+        };
+        let a = assess(&profile, &budget);
+        if a.winnable && a.mode == AssaultMode::Breach {
+            if let Some(sized) = SquadComposition::siege_quad().sized_for(RequiredForce::from_assessment(&a), scenario.member_energy) {
+                if let Some(breached) = breaches(scenario, obj, &sized) {
+                    self.attempted += 1;
+                    if breached {
+                        self.won += 1;
+                    }
+                    return Verdict { pass: breached, label: self.label().into(), detail: format!("fielded → {}", if breached { "WON" } else { "lost" }) };
+                }
+            }
+        }
+        Verdict { pass: true, label: self.label().into(), detail: "deferred / drain / unfieldable (not a sizing attempt)".into() }
+    }
+}
+
 /// Render an interactive HTML replay of a MOVING managed assault on `scenario` — the real squad brain
 /// pathing from the entry to the objective + engaging (the movement-rich replay).
 pub fn render_managed_replay(scenario: &Scenario) -> String {

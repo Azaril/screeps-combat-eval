@@ -6,6 +6,7 @@
 
 pub mod evaluate;
 pub mod generate;
+pub mod report;
 pub mod scenario;
 pub mod validate;
 pub mod visualize;
@@ -57,7 +58,7 @@ pub fn calibration_replay(index: u32) -> String {
 mod tests {
     use super::*;
     use generate::{Designed, Permutations};
-    use validate::ManagedSquadIntegration;
+    use validate::{ManagedSquadIntegration, SizingWins};
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
     /// the force-sizing oracle is calibrated against the engine — winnable verdicts breach (fp ≤ 1%) and
@@ -144,6 +145,27 @@ mod tests {
         let mut v = ManagedSquadIntegration;
         let verdict = v.validate(&scenario);
         assert!(verdict.pass, "the managed assault did not reach/engage the undefended objective: {}", verdict.detail);
+    }
+
+    /// Validator-swap (ADR 0023a): the SAME generator feeds a different validator (`SizingWins`) — the
+    /// win-rate lens runs over the calibration substrate and reports a sane rate.
+    #[test]
+    fn sizing_wins_is_a_swappable_lens_over_the_same_generator() {
+        let mut v = SizingWins::default();
+        let report = run_suite(&RandomDefendedBase { n: 64 }, &mut v);
+        assert_eq!(report.verdicts.len(), 64);
+        assert!(v.attempted > 0, "some scenarios are winnable+fielded sizing attempts");
+        assert!(v.win_rate() >= 0.99, "the fielded sized force wins its attempts (win_rate {:.3})", v.win_rate());
+    }
+
+    /// The dashboard writes per-scenario replays + a contact-sheet index (smoke).
+    #[test]
+    fn dashboard_writes_an_index() {
+        let dir = std::env::temp_dir().join("ibex-harness-dashboard-test");
+        let n = report::write_dashboard(dir.to_str().unwrap()).unwrap();
+        assert!(n > 0);
+        assert!(dir.join("index.html").exists(), "index.html written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// On-demand: write sample replays to `target/replays/` for eyeballing — the movement-rich MANAGED
