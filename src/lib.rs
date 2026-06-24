@@ -15,6 +15,7 @@
 
 pub mod bench;
 pub mod metrics;
+pub mod oracle_calibration;
 pub mod scoring;
 pub mod tournament;
 
