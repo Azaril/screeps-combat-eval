@@ -10,7 +10,7 @@ pub mod scenario;
 pub mod validate;
 pub mod visualize;
 
-use generate::{Generator, RandomDefendedBase};
+use generate::{Designed, Generator, Permutations, RandomDefendedBase};
 use validate::{Calibration, OracleCalibration, Validator, Verdict};
 
 /// The aggregate of running a generator's scenarios through a validator.
@@ -109,6 +109,26 @@ mod tests {
         assert!(html.starts_with("<!doctype html>") && html.trim_end().ends_with("</html>"));
         assert!(html.contains("const FRAMES=["));
         assert!(html.contains("\"verdict\":"));
+    }
+
+    /// Phase B: the terrain-rich generators produce assessable scenarios (every scenario has an
+    /// objective + valid staging; the oracle runs without panicking over the whole grid).
+    #[test]
+    fn terrain_generators_produce_assessable_scenarios() {
+        let cases: [(&dyn Generator, &str); 2] = [(&Permutations, "perm"), (&Designed, "designed")];
+        for (g, label) in cases {
+            assert!(g.count() > 0, "{label} offers scenarios");
+            let mut v = OracleCalibration::new();
+            let report = run_suite(g, &mut v);
+            assert_eq!(report.verdicts.len(), g.count() as usize, "{label}: a verdict per scenario");
+            // Every scenario has at least one objective with the staging tiles populated.
+            for i in 0..g.count() {
+                let s = g.generate(i);
+                assert!(!s.objectives.is_empty(), "{label}#{i} has an objective");
+                let o = &s.objectives[0];
+                assert!(!o.front_tiles.is_empty() && !o.support_tiles.is_empty(), "{label}#{i} staged");
+            }
+        }
     }
 
     /// On-demand: write a few sample replays (a winnable-breach + a deferred) to `target/replays/` for

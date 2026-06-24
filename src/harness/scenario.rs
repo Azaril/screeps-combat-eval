@@ -25,6 +25,11 @@ pub struct Objective {
     /// Tiles adjacent (range 1) to `assault_pos` and NOT the focus (where healers stand → full
     /// adjacent `HEAL_POWER`, never mistaken for the focus by the defense AI).
     pub support_tiles: Vec<Position>,
+    /// Where a MOVING assault stages from — a clear tile on the approach (room-edge-ish), distinct from
+    /// the in-range `front_tiles`. The `ManagedSquadIntegration` validator spawns the squad here and
+    /// lets it path to the objective (so the replay shows real movement); `OracleCalibration` ignores it
+    /// (it stages in-range for sizing-purity).
+    pub entry: Position,
 }
 
 /// A generated scenario: a world (terrain + structures + towers + DEFENDER creeps = the opponent force,
