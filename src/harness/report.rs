@@ -3,7 +3,8 @@
 //! validator verdict in one place. Host-only; writes to a directory the operator opens.
 
 use crate::harness::generate::{Designed, Generator, Permutations, RandomDefendedBase};
-use crate::harness::validate::{render_calibration_replay, render_self_play_replay, OracleCalibration, SelfPlay, Validator};
+use crate::harness::validate::{calibration_replay_data, self_play_replay_data, OracleCalibration, SelfPlay, Validator};
+use crate::harness::visualize::write_replay;
 use std::fmt::Write as _;
 
 fn esc(s: &str) -> String {
@@ -32,10 +33,11 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
         let mut v = SelfPlay;
         for i in 0..g.count() {
             let s = g.generate(i);
-            let file = format!("selfplay-designed-{i}.html");
-            std::fs::write(format!("{dir}/{file}"), render_self_play_replay(&s))?;
+            let name = format!("selfplay-designed-{i}");
+            let (rec, meta) = self_play_replay_data(&s);
+            write_replay(dir, &name, &rec, &meta)?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file, title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry { file: format!("{name}.html"), title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
         }
     }
     // A few permutations — self-play over the enumerated layout grid.
@@ -44,10 +46,11 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
         let mut v = SelfPlay;
         for i in [0u32, 13, 40, 75] {
             let s = g.generate(i);
-            let file = format!("selfplay-perm-{i}.html");
-            std::fs::write(format!("{dir}/{file}"), render_self_play_replay(&s))?;
+            let name = format!("selfplay-perm-{i}");
+            let (rec, meta) = self_play_replay_data(&s);
+            write_replay(dir, &name, &rec, &meta)?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file, title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry { file: format!("{name}.html"), title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
         }
     }
     // RandomDefendedBase — the sizing-pure calibration lens.
@@ -56,10 +59,11 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
         let mut v = OracleCalibration::new();
         for i in 0..8 {
             let s = g.generate(i);
-            let file = format!("calib-rdb-{i}.html");
-            std::fs::write(format!("{dir}/{file}"), render_calibration_replay(&s))?;
+            let name = format!("calib-rdb-{i}");
+            let (rec, meta) = calibration_replay_data(&s);
+            write_replay(dir, &name, &rec, &meta)?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file, title: s.label, lens: "calibration", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry { file: format!("{name}.html"), title: s.label, lens: "calibration", verdict: verdict.detail, pass: verdict.pass });
         }
     }
 

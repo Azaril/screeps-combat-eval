@@ -110,7 +110,8 @@ mod tests {
     fn calibration_replay_renders_html() {
         let html = calibration_replay(7);
         assert!(html.starts_with("<!doctype html>") && html.trim_end().ends_with("</html>"));
-        assert!(html.contains("const FRAMES=["));
+        assert!(html.contains("window.REPLAY=") && html.contains("IbexReplay.start"));
+        assert!(html.contains("\"frames\":[{"), "embeds a non-empty frame array");
         assert!(html.contains("\"verdict\":"));
     }
 
@@ -175,7 +176,8 @@ mod tests {
     #[test]
     fn self_play_records_frames_even_without_defenders() {
         let html = validate::render_self_play_replay(&Permutations.generate(0));
-        assert!(!html.contains("const FRAMES=[]"), "self-play recorded zero frames (the empty-recording bug)");
+        assert!(!html.contains("\"frames\":[]"), "self-play recorded zero frames (the empty-recording bug)");
+        assert!(html.contains("\"frames\":[{"), "non-empty frame array embedded");
     }
 
     /// Multi-room cross-room movement (operator-flagged): the twin-room assault (Designed#4) must

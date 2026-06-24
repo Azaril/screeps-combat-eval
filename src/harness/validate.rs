@@ -470,28 +470,6 @@ impl Validator for SelfPlay {
     }
 }
 
-/// Render an interactive HTML replay of a SELF-PLAY engagement — both sides moving + fighting under the
-/// real squad brain (the realistic engagement the operator validates).
-pub fn render_self_play_replay(scenario: &Scenario) -> String {
-    let obj = &scenario.objectives[0];
-    match run_self_play(scenario, obj) {
-        Some((outcome, rec, _)) => {
-            let result = match outcome.stop {
-                StopReason::ObjectivesComplete => "objective destroyed",
-                StopReason::SideWiped(o) if o == scenario.attacker_owner => "attacker wiped",
-                StopReason::SideWiped(_) => "defender wiped",
-                StopReason::Timeout => "timed out",
-            };
-            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks)));
-            replay_to_html(&rec, &meta)
-        }
-        None => {
-            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some("self-play — could not field the attacker".into()));
-            replay_to_html(&screeps_combat_engine::CombatRecording::new(), &meta)
-        }
-    }
-}
-
 /// A simpler swappable lens (ADR 0023a stage 3 — demonstrates generation ⊥ validation): "did the force
 /// the sizing system fields actually WIN?" Over a generator the pass-rate is the **win rate**. Pass = a
 /// winnable+fielded scenario breaches (the load-bearing claim) OR the scenario was a correct defer /
@@ -542,6 +520,33 @@ impl Validator for SizingWins {
     }
 }
 
+/// The recording + metadata for a SELF-PLAY engagement on `scenario` (both sides managed). Used by the
+/// single-file render + the split-file dashboard writer.
+pub fn self_play_replay_data(scenario: &Scenario) -> (screeps_combat_engine::CombatRecording, ReplayMeta) {
+    let obj = &scenario.objectives[0];
+    match run_self_play(scenario, obj) {
+        Some((outcome, rec, _)) => {
+            let result = match outcome.stop {
+                StopReason::ObjectivesComplete => "objective destroyed",
+                StopReason::SideWiped(o) if o == scenario.attacker_owner => "attacker wiped",
+                StopReason::SideWiped(_) => "defender wiped",
+                StopReason::Timeout => "timed out",
+            };
+            (rec, ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks))))
+        }
+        None => (
+            screeps_combat_engine::CombatRecording::new(),
+            ReplayMeta::from_world(&scenario.world, &scenario.label, Some("self-play — could not field the attacker".into())),
+        ),
+    }
+}
+
+/// Render an interactive single-file HTML replay of a self-play engagement.
+pub fn render_self_play_replay(scenario: &Scenario) -> String {
+    let (rec, meta) = self_play_replay_data(scenario);
+    replay_to_html(&rec, &meta)
+}
+
 /// Render an interactive HTML replay of a MOVING managed assault on `scenario` — the real squad brain
 /// pathing from the entry to the objective + engaging (the movement-rich replay).
 pub fn render_managed_replay(scenario: &Scenario) -> String {
@@ -569,14 +574,14 @@ pub fn render_managed_replay(scenario: &Scenario) -> String {
 /// else the ceiling falsifier), record the scripted siege, and render it with a verdict header. The
 /// full Generation → Evaluation(record) → Visualization chain in one call — for the operator's visual
 /// validation of outcomes + permutation variety.
-pub fn render_calibration_replay(scenario: &Scenario) -> String {
+pub fn calibration_replay_data(scenario: &Scenario) -> (screeps_combat_engine::CombatRecording, ReplayMeta) {
     let obj = &scenario.objectives[0];
     let (comp, decision) = choose_fielded_comp(scenario, obj);
 
     let mut world = scenario.world.clone();
     if !place_squad(&mut world, obj, &comp, scenario.attacker_owner, scenario.member_energy) {
         let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("{decision} — could not place on the bed")));
-        return replay_to_html(&screeps_combat_engine::CombatRecording::new(), &meta);
+        return (screeps_combat_engine::CombatRecording::new(), meta);
     }
     let attacker = scenario.attacker_owner;
     let defender = scenario.defender_owner;
@@ -595,6 +600,12 @@ pub fn render_calibration_replay(scenario: &Scenario) -> String {
         StopReason::Timeout => "held (timed out)",
     };
     let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("{decision} → {result} @ t{}", outcome.ticks)));
+    (rec, meta)
+}
+
+/// Render an interactive single-file HTML replay of the oracle's sizing-pure siege decision.
+pub fn render_calibration_replay(scenario: &Scenario) -> String {
+    let (rec, meta) = calibration_replay_data(scenario);
     replay_to_html(&rec, &meta)
 }
 
