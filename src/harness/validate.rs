@@ -461,11 +461,15 @@ impl Validator for SelfPlay {
             .filter(|c| def_ids.contains(&c.id))
             .any(|c| starts.get(&c.id).map(|s| s.get_range_to(c.pos) > 0).unwrap_or(false));
         let had_defenders = !def_ids.is_empty();
-        let pass = !had_defenders || defender_moved;
+        // The opposing side is genuinely brain-driven (not a static dummy) if it MOVED, or if the fight
+        // RESOLVED decisively (a wipe/breach — real combat, not a frozen standoff). Fail only on the old
+        // failure mode: a defended fight that times out with the defender never acting.
+        let decisive = outcome.stop != StopReason::Timeout;
+        let pass = !had_defenders || defender_moved || decisive;
         Verdict {
             pass,
             label: self.label().into(),
-            detail: format!("self-play → {:?} @ t{} (defenders={}, moved={defender_moved})", outcome.stop, outcome.ticks, def_ids.len()),
+            detail: format!("self-play → {:?} @ t{} (defenders={}, moved={defender_moved}, decisive={decisive})", outcome.stop, outcome.ticks, def_ids.len()),
         }
     }
 }

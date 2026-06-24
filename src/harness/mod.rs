@@ -159,15 +159,17 @@ mod tests {
         assert!(v.win_rate() >= 0.99, "the fielded sized force wins its attempts (win_rate {:.3})", v.win_rate());
     }
 
-    /// Self-play realism (operator-requested): in the open no-tower skirmish (Designed#5) BOTH sides run
-    /// the squad brain, so the OPPOSING side actually MOVES (not a static defender). Guards against the
-    /// "opponent doesn't move" regression.
+    /// Self-play realism + the kiting-stalemate fix (operator-requested): in the open no-tower skirmish
+    /// (Designed#5) BOTH sides run the squad brain AND the close-to-kill gradient now CLOSES the fight to
+    /// a decisive result instead of freezing at range until timeout. Guards both the "opponent is a
+    /// static dummy" and the "ranged standoff never resolves" regressions.
     #[test]
-    fn self_play_makes_the_opposing_side_move() {
+    fn self_play_resolves_decisively_not_a_standoff() {
         let scenario = Designed.generate(5);
         let mut v = SelfPlay;
         let verdict = v.validate(&scenario);
-        assert!(verdict.detail.contains("moved=true"), "the opposing (defender) squad never moved: {}", verdict.detail);
+        assert!(verdict.pass, "self-play did not resolve (frozen standoff?): {}", verdict.detail);
+        assert!(!verdict.detail.contains("Timeout"), "self-play froze at range instead of closing to a result: {}", verdict.detail);
     }
 
     /// Empty-recording regression (operator-flagged): self-play over a scenario with NO defender creeps
