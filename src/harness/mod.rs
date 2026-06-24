@@ -169,6 +169,15 @@ mod tests {
         assert!(verdict.detail.contains("moved=true"), "the opposing (defender) squad never moved: {}", verdict.detail);
     }
 
+    /// Empty-recording regression (operator-flagged): self-play over a scenario with NO defender creeps
+    /// (Permutations#0 = open / no towers / no force) must still record frames — not terminate at tick 0
+    /// on a vacuous "defender wiped". Guards the conditional `SideWiped(defender)` stop.
+    #[test]
+    fn self_play_records_frames_even_without_defenders() {
+        let html = validate::render_self_play_replay(&Permutations.generate(0));
+        assert!(!html.contains("const FRAMES=[]"), "self-play recorded zero frames (the empty-recording bug)");
+    }
+
     /// Multi-room cross-room movement (operator-flagged): the twin-room assault (Designed#4) must
     /// actually CROSS W1N1→W2N1 and reach/engage the objective — guards the `ManagedSimSquad` travel
     /// mode that fixes the room-scoped-view "no cross-room movement" bug.

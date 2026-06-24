@@ -413,11 +413,15 @@ fn run_self_play(scenario: &Scenario, obj: &Objective) -> Option<(crate::harness
     let def_ids: Vec<CreepId> = world.creeps.iter().filter(|c| c.is_alive() && c.owner == scenario.defender_owner).map(|c| c.id).collect();
     let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos);
     let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids.clone(), obj.pos); // defender holds the core
-    let run_until = AnyOf(vec![
-        Box::new(ObjectivesDestroyed(vec![obj.id])),
-        Box::new(SideWiped(scenario.attacker_owner)),
-        Box::new(SideWiped(scenario.defender_owner)),
-    ]);
+    // Stop on objective destroyed or the ATTACKER wiped; only stop on the DEFENDER wiped when there ARE
+    // defender creeps — else `SideWiped(defender)` is true at tick 0 (a tower-only / no-creep defense)
+    // and the engagement records ZERO frames (the empty-recording bug).
+    let mut conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> =
+        vec![Box::new(ObjectivesDestroyed(vec![obj.id])), Box::new(SideWiped(scenario.attacker_owner))];
+    if !def_ids.is_empty() {
+        conditions.push(Box::new(SideWiped(scenario.defender_owner)));
+    }
+    let run_until = AnyOf(conditions);
     let (outcome, rec) = evaluate_recorded(
         world,
         &mut |w| att.step(w),
