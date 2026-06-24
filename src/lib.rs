@@ -14,8 +14,8 @@
 //! register items (BREACH / DEF-2 / CTRL / PARITY) land as the sim grows ramparts/controllers.
 
 pub mod bench;
+pub mod harness;
 pub mod metrics;
-pub mod oracle_calibration;
 pub mod scoring;
 pub mod tournament;
 
