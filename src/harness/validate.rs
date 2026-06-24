@@ -4,8 +4,9 @@
 //! world, assess against the fieldable ceiling, size the REAL force, field it on the objective's
 //! staging tiles, evaluate the siege, and classify false-positive / false-negative.
 
-use crate::harness::evaluate::{evaluate, AnyOf, ObjectivesDestroyed, SideWiped, StopReason};
+use crate::harness::evaluate::{evaluate, evaluate_recorded, AnyOf, ObjectivesDestroyed, SideWiped, StopReason};
 use crate::harness::scenario::{Objective, Scenario};
+use crate::harness::visualize::{replay_to_html, ReplayMeta};
 use screeps::Position;
 use screeps_combat_agent::objective_bed::defense_intents;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
@@ -277,6 +278,59 @@ fn breaches(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Op
         scenario.onsite_budget,
     );
     Some(outcome.stop == StopReason::ObjectivesComplete)
+}
+
+/// Render an interactive HTML replay of the oracle's decision on `scenario`: derive the profile,
+/// assess the fieldable ceiling, FIELD the force the validator would (the sized squad when winnable,
+/// else the ceiling falsifier), record the scripted siege, and render it with a verdict header. The
+/// full Generation → Evaluation(record) → Visualization chain in one call — for the operator's visual
+/// validation of outcomes + permutation variety.
+pub fn render_calibration_replay(scenario: &Scenario) -> String {
+    let obj = &scenario.objectives[0];
+    let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
+    let ceiling = siege_ceiling(scenario.member_energy);
+    let caps = ceiling.capabilities(scenario.member_energy);
+    let budget = ForceBudget {
+        max_heal_per_tick: caps.heal_per_tick as f32,
+        max_dismantle_dps: caps.structure_dps as f32,
+        tank_effective_hp: caps.tank_effective_hp as f32,
+        onsite_budget_ticks: scenario.onsite_budget,
+    };
+    let a = assess(&profile, &budget);
+    let (comp, decision) = if a.winnable && a.mode == AssaultMode::Breach {
+        match SquadComposition::siege_quad().sized_for(RequiredForce::from_assessment(&a), scenario.member_energy) {
+            Some(sized) => (sized, "winnable → fielded the sized force".to_string()),
+            None => (ceiling.clone(), "winnable but the comp can't field the required force; showing the ceiling".to_string()),
+        }
+    } else if a.winnable {
+        (ceiling.clone(), "winnable (drain mode); showing the ceiling".to_string())
+    } else {
+        (ceiling.clone(), format!("deferred ({}); showing the ceiling falsifier", a.reason))
+    };
+
+    let mut world = scenario.world.clone();
+    if !place_squad(&mut world, obj, &comp, scenario.attacker_owner, scenario.member_energy) {
+        let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("{decision} — could not place on the bed")));
+        return replay_to_html(&screeps_combat_engine::CombatRecording::new(), &meta);
+    }
+    let attacker = scenario.attacker_owner;
+    let defender = scenario.defender_owner;
+    let (core_id, core_pos) = (obj.id, obj.pos);
+    let run_until = AnyOf(vec![Box::new(ObjectivesDestroyed(vec![core_id])), Box::new(SideWiped(attacker))]);
+    let (outcome, rec) = evaluate_recorded(
+        world,
+        &mut |w| siege_intents(w, attacker, core_id, core_pos),
+        &mut |w, intents| defense_intents(w, defender, core_pos, intents),
+        &run_until,
+        scenario.onsite_budget,
+    );
+    let result = match outcome.stop {
+        StopReason::ObjectivesComplete => "BREACHED",
+        StopReason::SideWiped(_) => "attackers wiped",
+        StopReason::Timeout => "held (timed out)",
+    };
+    let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("{decision} → {result} @ t{}", outcome.ticks)));
+    replay_to_html(&rec, &meta)
 }
 
 /// Largest single-role part count one member can carry at `energy` (reuses the real builder).

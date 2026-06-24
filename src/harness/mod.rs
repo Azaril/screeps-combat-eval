@@ -8,6 +8,7 @@ pub mod evaluate;
 pub mod generate;
 pub mod scenario;
 pub mod validate;
+pub mod visualize;
 
 use generate::{Generator, RandomDefendedBase};
 use validate::{Calibration, OracleCalibration, Validator, Verdict};
@@ -43,6 +44,13 @@ pub fn calibrate(n: u32) -> Calibration {
     let mut validator = OracleCalibration::new();
     run_suite(&generator, &mut validator);
     *validator.tally()
+}
+
+/// Convenience: render an interactive HTML replay of the oracle's decision on seeded scenario `index`
+/// (Generation → Evaluation+record → Visualization). Write it to a `.html` and open it.
+pub fn calibration_replay(index: u32) -> String {
+    let scenario = RandomDefendedBase { n: index + 1 }.generate(index);
+    validate::render_calibration_replay(&scenario)
 }
 
 #[cfg(test)]
@@ -91,5 +99,43 @@ mod tests {
         assert_eq!(report.verdicts.len(), 16);
         assert_eq!(report.scenarios, 16);
         assert_eq!(validator.tally().scenarios, 16);
+    }
+
+    /// Full chain smoke test: Generation → Evaluation(record) → Visualization yields a self-contained
+    /// HTML replay with the verdict + frames embedded.
+    #[test]
+    fn calibration_replay_renders_html() {
+        let html = calibration_replay(7);
+        assert!(html.starts_with("<!doctype html>") && html.trim_end().ends_with("</html>"));
+        assert!(html.contains("const FRAMES=["));
+        assert!(html.contains("\"verdict\":"));
+    }
+
+    /// On-demand: write a few sample replays (a winnable-breach + a deferred) to `target/replays/` for
+    /// eyeballing. `cargo test -p screeps-combat-eval --lib -- --ignored write_sample_replays`.
+    #[test]
+    #[ignore]
+    fn write_sample_replays() {
+        use crate::harness::validate::render_calibration_replay;
+        let _ = std::fs::create_dir_all("target/replays");
+        let gen = RandomDefendedBase { n: 200 };
+        let (mut wrote_breach, mut wrote_defer) = (false, false);
+        for i in 0..200 {
+            let s = gen.generate(i);
+            let html = render_calibration_replay(&s);
+            let breached = html.contains("→ BREACHED");
+            let deferred = html.contains("deferred (");
+            if breached && !wrote_breach {
+                std::fs::write(format!("target/replays/breach-seed{i}.html"), &html).unwrap();
+                wrote_breach = true;
+            } else if deferred && !wrote_defer {
+                std::fs::write(format!("target/replays/defer-seed{i}.html"), &html).unwrap();
+                wrote_defer = true;
+            }
+            if wrote_breach && wrote_defer {
+                break;
+            }
+        }
+        println!("wrote samples to target/replays/ (breach={wrote_breach}, defer={wrote_defer})");
     }
 }

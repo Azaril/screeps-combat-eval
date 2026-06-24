@@ -16,3 +16,6 @@ screeps-game-api = "0.23"
 screeps-combat-engine = { git = "https://github.com/Azaril/screeps-combat-engine" }
 screeps-combat-decision = { git = "https://github.com/Azaril/screeps-combat-decision" }
 screeps-combat-agent = { git = "https://github.com/Azaril/screeps-combat-agent" }
+# The bot's backend-agnostic structure-shape primitives, reused for the replay player's typed
+# buildings (host-only; the root [patch] redirects to the local working tree).
+screeps-visual = { git = "https://github.com/Azaril/screeps-visual" }
