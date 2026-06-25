@@ -20,12 +20,14 @@
 //! scripted archetypes vs the managed squad, PFSP opponent mixing + behavioral de-dup, and formal Elo
 //! (equivalent to the mean-payoff ranking for a complete round-robin, so omitted here).
 
-use screeps::{Position, RoomCoordinate, RoomName};
+use screeps::{Part, Position, RoomCoordinate, RoomName};
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::kernel::KernelParams;
 use screeps_combat_decision::kite::{KiteScoreParams, SquadTacticParams};
-use screeps_combat_engine::{CombatWorld, SimTower};
+use screeps_combat_engine::{CombatWorld, PlayerId, SimBody, SimCreep, SimTower};
 
+use crate::harness::generate::Rng;
+use crate::harness::roster::random_squad;
 use crate::{ranged_file, run_managed};
 
 fn room() -> RoomName {
@@ -77,11 +79,8 @@ pub enum Bed {
 /// The standard basket the tournament averages each match over.
 pub const BASKET: [Bed; 3] = [Bed::OpenField, Bed::Corridor, Bed::TowerCrossfire];
 
-/// Build a fresh symmetric world for `bed`: two identical 3×ranged squads at opposite ends.
-fn build_bed(bed: Bed) -> CombatWorld {
-    let mut creeps = ranged_file(0, 1, 8, 24, 3);
-    creeps.extend(ranged_file(1, 11, 41, 24, 3));
-    let mut world = CombatWorld { creeps, ..Default::default() };
+/// Apply a `bed`'s terrain + mirrored towers to a world (the symmetric battlefield, creeps aside).
+fn apply_bed_terrain(world: &mut CombatWorld, bed: Bed) {
     match bed {
         Bed::OpenField => {}
         Bed::Corridor => {
@@ -92,11 +91,36 @@ fn build_bed(bed: Bed) -> CombatWorld {
             }
         }
         Bed::TowerCrossfire => {
-            // One tower per side, mirrored, each firing at the other side's nearest creep (symmetric).
             world.towers.push(SimTower { id: 100, owner: 0, pos: pos(14, 25), energy: 1000, hits: 3000, hits_max: 3000 });
             world.towers.push(SimTower { id: 101, owner: 1, pos: pos(35, 25), energy: 1000, hits: 3000, hits_max: 3000 });
         }
     }
+}
+
+/// Build a fresh symmetric world for `bed`: two identical 3×ranged squads at opposite ends.
+fn build_bed(bed: Bed) -> CombatWorld {
+    let mut creeps = ranged_file(0, 1, 8, 24, 3);
+    creeps.extend(ranged_file(1, 11, 41, 24, 3));
+    let mut world = CombatWorld { creeps, ..Default::default() };
+    apply_bed_terrain(&mut world, bed);
+    world
+}
+
+/// Build a symmetric world where BOTH sides field the same `bodies` (a random composition), at opposite
+/// ends of `bed` — so a self-play match isolates the KernelParams difference while the *composition* is
+/// varied across the basket (ADR 0025 basket enrichment: tune against diverse comps, not mirror-of-ranged).
+fn build_bed_comp(bed: Bed, bodies: &[Vec<Part>]) -> CombatWorld {
+    let file = |owner: PlayerId, first: u32, x: u8| -> Vec<SimCreep> {
+        bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| SimCreep { id: first + i as u32, owner, pos: pos(x, 22 + i as u8), body: SimBody::unboosted(b), fatigue: 0 })
+            .collect()
+    };
+    let mut creeps = file(0, 1, 8);
+    creeps.extend(file(1, 1000, 41));
+    let mut world = CombatWorld { creeps, ..Default::default() };
+    apply_bed_terrain(&mut world, bed);
     world
 }
 
@@ -113,6 +137,63 @@ fn play_bed(bed: Bed, side0: SquadTacticParams, side1: SquadTacticParams, ticks:
     run_managed(&mut world, &mut squads, ticks);
     let kept = |owner| -> i64 { world.creeps.iter().filter(|c| c.owner == owner && c.is_alive()).map(|c| c.body.hits as i64).sum() };
     kept(0) - kept(1)
+}
+
+/// Like [`play_bed`] but both sides field the given (random) composition — the comp-varied match.
+fn play_bed_comp(bed: Bed, bodies: &[Vec<Part>], side0: SquadTacticParams, side1: SquadTacticParams, ticks: usize) -> i64 {
+    let mut world = build_bed_comp(bed, bodies);
+    let a_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 0).map(|c| c.id).collect();
+    let b_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 1).map(|c| c.id).collect();
+    let mut squads = [
+        ManagedSimSquad::new(0, a_ids, pos(41, 25)).with_tactics(side0),
+        ManagedSimSquad::new(1, b_ids, pos(8, 25)).with_tactics(side1),
+    ];
+    run_managed(&mut world, &mut squads, ticks);
+    let kept = |owner| -> i64 { world.creeps.iter().filter(|c| c.owner == owner && c.is_alive()).map(|c| c.body.hits as i64).sum() };
+    kept(0) - kept(1)
+}
+
+/// A **diverse, comp-varied basket**: each `Bed` × `n_comps` seeded random squad compositions (ADR 0025
+/// — tune the kernel against a population of compositions, not just mirror-of-ranged). Both sides field
+/// the same comp per entry, so a match isolates the KernelParams while the basket spans comps + terrain.
+pub fn comp_basket(n_comps: u32, energy: u32) -> Vec<(Bed, Vec<Vec<Part>>)> {
+    let mut out = Vec::new();
+    for &bed in &BASKET {
+        for s in 0..n_comps {
+            // Distinct seed per (bed, comp) so the population is varied + reproducible; 2–5 creeps a side.
+            let mut rng = Rng::seeded(s * BASKET.len() as u32 + bed as u32 + 1);
+            let n = rng.range(2, 5) as u8;
+            out.push((bed, random_squad(&mut rng, energy, n)));
+        }
+    }
+    out
+}
+
+/// Antisymmetric payoff of `a` vs `b` over a **comp-varied basket** (both side assignments, cancelling
+/// start-side bias). The diverse-opponent analogue of [`payoff`].
+pub fn payoff_over_comps(basket: &[(Bed, Vec<Vec<Part>>)], a: SquadTacticParams, b: SquadTacticParams, ticks: usize) -> i64 {
+    if basket.is_empty() {
+        return 0;
+    }
+    let sum: i64 = basket.iter().map(|(bed, bodies)| (play_bed_comp(*bed, bodies, a, b, ticks) - play_bed_comp(*bed, bodies, b, a, ticks)) / 2).sum();
+    sum / basket.len() as i64
+}
+
+/// Round-robin `strategies` over a comp-varied basket (the kernel-tuning analogue of [`run_tournament`]).
+pub fn run_tournament_over_comps(strategies: &[Strategy], basket: &[(Bed, Vec<Vec<Part>>)], ticks: usize) -> TournamentResult {
+    let n = strategies.len();
+    let mut matrix = vec![vec![0i64; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let p = payoff_over_comps(basket, strategies[i].tactics, strategies[j].tactics, ticks);
+            matrix[i][j] = p;
+            matrix[j][i] = -p;
+        }
+    }
+    let mut ranking: Vec<(usize, f64)> = (0..n).map(|i| (i, matrix[i].iter().sum::<i64>() as f64 / n.max(1) as f64)).collect();
+    ranking.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let nash = meta_nash(&matrix, 2000);
+    TournamentResult { names: strategies.iter().map(|s| s.name).collect(), matrix, ranking, nash }
 }
 
 /// Antisymmetric payoff of `a` vs `b`, **averaged over the bed basket** and over both side
@@ -282,11 +363,13 @@ mod tests {
     #[ignore]
     fn kernel_tournament() {
         let pop = kernel_population();
-        let r = run_tournament(&pop, TournamentBudget::Thorough);
+        // Comp-varied basket (ADR 0025): 4 random comps per bed × 3 beds = 12 diverse battlefields, so the
+        // ranking reflects which KernelParams wins across *compositions + terrain*, not one fixed comp.
+        let basket = comp_basket(4, 5600);
+        let r = run_tournament_over_comps(&pop, &basket, TournamentBudget::Thorough.ticks());
         println!("{}", report(&r));
-        let exploit = exploitability(SquadTacticParams::default(), &pop, TournamentBudget::Thorough);
         let best = r.ranking[0];
-        println!("[ADR0025 kernel tournament] shipped-seed exploitability = {exploit} net HP; field winner = {} ({:+.0})", r.names[best.0], best.1);
+        println!("[ADR0025 kernel tournament] {} beds × comps; field winner = {} ({:+.0} mean payoff, Nash {:.2})", basket.len(), r.names[best.0], best.1, r.nash[best.0]);
     }
 
     #[test]
