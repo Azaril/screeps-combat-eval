@@ -7,6 +7,7 @@
 pub mod evaluate;
 pub mod generate;
 pub mod report;
+pub mod roster;
 pub mod scenario;
 pub mod validate;
 pub mod visualize;
