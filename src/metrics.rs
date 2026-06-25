@@ -282,6 +282,37 @@ pub fn worst_cohesion(rec: &CombatRecording, side: PlayerId) -> u32 {
     cohesion_series(rec, side, 0).iter().map(|s| s.max_pairwise).max().unwrap_or(0)
 }
 
+/// **Period-2 positional oscillation rate** for `side` (ADR 0024 — the durable replacement for the
+/// ad-hoc node A-B-A script). Over each living creep's per-tick tile trajectory, the fraction of its
+/// *move-steps* (`p[t] != p[t-1]`) that return it to where it was two ticks earlier
+/// (`p[t] == p[t-2]`) — the A-B-A "ping-pong" limit cycle the hierarchical positioning fix targets.
+/// `0.0` = no oscillation. Denominator is move-steps (a deliberate hold is not oscillation), so a
+/// squad that reaches its goal and stands still scores 0, not "stable by inactivity".
+pub fn oscillation_rate(rec: &CombatRecording, side: PlayerId) -> f64 {
+    let mut traj: HashMap<CreepId, Vec<(RoomName, u8, u8)>> = HashMap::new();
+    for f in &rec.frames {
+        for c in f.creeps.iter().filter(|c| c.owner == side) {
+            traj.entry(c.id).or_default().push((c.room, c.x, c.y));
+        }
+    }
+    let (mut steps, mut aba) = (0u64, 0u64);
+    for path in traj.values() {
+        for t in 2..path.len() {
+            if path[t] != path[t - 1] {
+                steps += 1;
+                if path[t] == path[t - 2] {
+                    aba += 1;
+                }
+            }
+        }
+    }
+    if steps == 0 {
+        0.0
+    } else {
+        aba as f64 / steps as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

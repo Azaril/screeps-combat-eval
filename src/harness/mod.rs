@@ -193,6 +193,36 @@ mod tests {
         assert!(verdict.pass, "the assault did not cross into the objective room + engage: {}", verdict.detail);
     }
 
+    /// ADR 0024 regression gate: the hierarchical positioning fix drove period-2 ("A-B-A") movement
+    /// oscillation in the **single-room** assaults to near-zero (measured ≤1.6% across Designed#0-3,5).
+    /// This locks that in. The **cross-room** twin-room siege (Designed#4) is excluded from the strict
+    /// bound — it still oscillates heavily (~93%) in the engaged breach phase because the strategic path
+    /// isn't stitched across the room seam (the flagged "cross-room edge/flee / multi-room strategic
+    /// path" follow-up, ADR 0024 Open Questions + §Future-work); it is reported here as the tracked
+    /// baseline so a future fix is measurable and a catastrophic regression is still caught.
+    #[test]
+    fn positioning_oscillation_stays_low_across_designed() {
+        use crate::harness::validate::managed_oscillation_rate;
+        let mut single_room = Vec::new();
+        for i in 0..Designed.count() {
+            let s = Designed.generate(i);
+            let cross_room = s.objectives.iter().any(|o| o.entry.room_name() != o.room);
+            if let Some(r) = managed_oscillation_rate(&s) {
+                println!("designed#{i} oscillation {:.1}%{}", r * 100.0, if cross_room { " (cross-room, excluded)" } else { "" });
+                if cross_room {
+                    assert!(r <= 0.97, "cross-room oscillation must not fully regress ({:.1}%)", r * 100.0);
+                } else {
+                    single_room.push(r);
+                }
+            }
+        }
+        assert!(!single_room.is_empty(), "at least one single-room Designed assault fielded a squad");
+        let mean = single_room.iter().sum::<f64>() / single_room.len() as f64;
+        println!("mean single-room period-2 oscillation {:.2}%", mean * 100.0);
+        assert!(single_room.iter().all(|&r| r <= 0.10), "every single-room scenario stays ≤10% period-2 oscillation");
+        assert!(mean <= 0.05, "mean single-room period-2 oscillation stays low ({:.2}%)", mean * 100.0);
+    }
+
     /// The dashboard writes per-scenario replays + a contact-sheet index (smoke).
     #[test]
     fn dashboard_writes_an_index() {

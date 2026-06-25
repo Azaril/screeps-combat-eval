@@ -354,6 +354,16 @@ fn run_managed_assault(scenario: &Scenario, obj: &Objective, comp: &SquadComposi
     Some(out)
 }
 
+/// The managed ATTACKER's **period-2 oscillation rate** over a scenario's recorded assault — the
+/// durable ADR 0024 regression gate (replaces the ad-hoc node A-B-A script). `None` when the squad
+/// couldn't be fielded at the entry (excluded from the metric, like the integration lens).
+pub fn managed_oscillation_rate(scenario: &Scenario) -> Option<f64> {
+    let obj = &scenario.objectives[0];
+    let comp = managed_assault_comp(scenario);
+    let (_, rec) = run_managed_assault(scenario, obj, &comp)?;
+    Some(crate::metrics::oscillation_rate(&rec, scenario.attacker_owner))
+}
+
 /// The **traversal lens** (ADR 0023a stage 3): field the real moving squad and grade whether it
 /// NAVIGATES to + ENGAGES the objective (the movement/pathing the operator validates) — distinct from
 /// `OracleCalibration` (which is sizing-pure, in-range). Pass = the assault breached, was wiped engaging,
