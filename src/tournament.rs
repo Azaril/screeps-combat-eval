@@ -22,6 +22,7 @@
 
 use screeps::{Position, RoomCoordinate, RoomName};
 use screeps_combat_agent::squad::ManagedSimSquad;
+use screeps_combat_decision::kernel::KernelParams;
 use screeps_combat_decision::kite::{KiteScoreParams, SquadTacticParams};
 use screeps_combat_engine::{CombatWorld, SimTower};
 
@@ -129,12 +130,12 @@ pub fn strategy_population() -> Vec<Strategy> {
     let with_engage = |f: fn(&mut KiteScoreParams)| {
         let mut e = base.engage;
         f(&mut e);
-        SquadTacticParams { kite: base.kite, engage: e, healer: base.healer }
+        SquadTacticParams { kite: base.kite, engage: e, healer: base.healer, kernel: base.kernel }
     };
     let with_kite = |f: fn(&mut KiteScoreParams)| {
         let mut k = base.kite;
         f(&mut k);
-        SquadTacticParams { kite: k, engage: base.engage, healer: base.healer }
+        SquadTacticParams { kite: k, engage: base.engage, healer: base.healer, kernel: base.kernel }
     };
     vec![
         Strategy { name: "default", tactics: base },
@@ -142,6 +143,27 @@ pub fn strategy_population() -> Vec<Strategy> {
         Strategy { name: "cautious", tactics: with_engage(|e| { e.w_taken = 1.5; e.w_dmg = 1.0; }) },
         Strategy { name: "kite-heavy", tactics: with_kite(|k| { k.w_future = 2.0; k.w_prox = 1.0; }) },
         Strategy { name: "advance-heavy", tactics: with_engage(|e| { e.w_prox = 3.0; }) },
+    ]
+}
+
+/// The ADR-0025 EV-**kernel** tuning population: the shipped default plus deliberate variations of the
+/// kernel's position-shaping seam ([`KernelParams`]) — the tournament's verdict on which positioning
+/// constants win the self-play field (and whether the shipped seed is exploitable). This is what "tune
+/// the kernel" means now that engaged positioning is the kernel, not the kite weights.
+pub fn kernel_population() -> Vec<Strategy> {
+    let base = SquadTacticParams::default();
+    let with_kernel = |name: &'static str, f: fn(&mut KernelParams)| {
+        let mut k = base.kernel;
+        f(&mut k);
+        Strategy { name, tactics: SquadTacticParams { kernel: k, ..base } }
+    };
+    vec![
+        Strategy { name: "k-default", tactics: base }, // approach 2 / incumbency 3 / discoh 10 / K 3 / spacing 1
+        with_kernel("k-approach-hot", |k| k.approach_coef = 4), // close harder
+        with_kernel("k-sticky", |k| k.incumbency_coef = 6),     // stronger hold (less jitter, less responsive)
+        with_kernel("k-loose-coh", |k| { k.cohesion_k = 5; k.discohesion_coef = 4; }), // spread more (cover more tiles)
+        with_kernel("k-tight-coh", |k| { k.cohesion_k = 2; k.discohesion_coef = 20; }), // ball up tight
+        with_kernel("k-spread", |k| k.spacing_coef = 4),        // anti-stack harder
     ]
 }
 
@@ -250,6 +272,21 @@ mod tests {
         println!("[ADR0020 tournament] default exploitability = {exploit} net HP\n{}", report(&run_tournament(&pop, TournamentBudget::Quick)));
         const GROSS: i64 = 1500; // ~1.5 creeps' HP; a real hard-counter exceeds this
         assert!(exploit <= GROSS, "the shipped default has a hard counter in the population ({exploit} net HP) — needs adaptivity or a retune");
+    }
+
+    /// ADR 0025 — kick off self-play tuning of the EV kernel: round-robin the [`kernel_population`]
+    /// (variations of the kernel's position-shaping seam) over the bed basket, rank by mean payoff, solve
+    /// the meta-Nash mix, and report the shipped seed's exploitability. Run on demand (it is the tuning
+    /// dashboard, not a CI gate): `cargo test -p screeps-combat-eval --lib kernel_tournament -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn kernel_tournament() {
+        let pop = kernel_population();
+        let r = run_tournament(&pop, TournamentBudget::Thorough);
+        println!("{}", report(&r));
+        let exploit = exploitability(SquadTacticParams::default(), &pop, TournamentBudget::Thorough);
+        let best = r.ranking[0];
+        println!("[ADR0025 kernel tournament] shipped-seed exploitability = {exploit} net HP; field winner = {} ({:+.0})", r.names[best.0], best.1);
     }
 
     #[test]
