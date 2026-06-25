@@ -28,6 +28,7 @@ use screeps_combat_engine::{CombatWorld, PlayerId, SimBody, SimCreep, SimTower};
 
 use crate::harness::generate::Rng;
 use crate::harness::roster::random_squad;
+use crate::harness::validate::assault_score;
 use crate::{ranged_file, run_managed};
 
 fn room() -> RoomName {
@@ -310,6 +311,35 @@ pub fn exploitability(candidate: SquadTacticParams, population: &[Strategy], bud
     population.iter().map(|opp| payoff(opp.tactics, candidate, ticks)).max().unwrap_or(0)
 }
 
+/// **Base attack/defend tuning** (ADR 0025 — the asymmetric lens, vs the symmetric open-combat
+/// tournament). Each strategy's managed attacker squad assaults every defended base in `scenarios`; we
+/// rank by total objective-progress [`assault_score`] (raze the base + survive). No payoff matrix — the
+/// "opponent" is the base, so it's an absolute-score ranking, not self-play. Returns `(index, total
+/// score)`, best first.
+pub fn base_attack_ranking(strategies: &[Strategy], scenarios: &[crate::harness::scenario::Scenario]) -> Vec<(usize, i64)> {
+    let mut ranking: Vec<(usize, i64)> = strategies
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let total: i64 = scenarios.iter().filter_map(|sc| assault_score(sc, s.tactics)).map(|a| a.score).sum();
+            (i, total)
+        })
+        .collect();
+    ranking.sort_by_key(|&(_, s)| std::cmp::Reverse(s));
+    ranking
+}
+
+/// Render a base-attack ranking as a readable table.
+pub fn base_attack_report(strategies: &[Strategy], ranking: &[(usize, i64)]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "Base attack/defend ranking — total objective-progress over the base set:");
+    for &(i, score) in ranking {
+        let _ = writeln!(s, "  {:>14}  {:+}", strategies[i].name, score);
+    }
+    s
+}
+
 /// Render a tournament result as a readable table (the tuning-loop dashboard).
 pub fn report(result: &TournamentResult) -> String {
     use std::fmt::Write;
@@ -370,6 +400,23 @@ mod tests {
         println!("{}", report(&r));
         let best = r.ranking[0];
         println!("[ADR0025 kernel tournament] {} beds × comps; field winner = {} ({:+.0} mean payoff, Nash {:.2})", basket.len(), r.names[best.0], best.1, r.nash[best.0]);
+    }
+
+    /// ADR 0025 — the BASE attack/defend tuning lens (vs the symmetric open-combat `kernel_tournament`):
+    /// rank the kernel population by how well each assaults the realistic defended-base set (objective
+    /// progress + survival). Run:
+    /// `cargo test -p screeps-combat-eval --lib base_attack_tournament -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn base_attack_tournament() {
+        let pop = kernel_population();
+        let bases = crate::harness::generate::realistic_bases();
+        let ranking = base_attack_ranking(&pop, &bases);
+        println!("{}", base_attack_report(&pop, &ranking));
+        let (best, score) = ranking[0];
+        println!("[ADR0025 base-attack] {} bases; best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
+        // Sanity: the assault makes SOME objective progress across the set (not a total wall).
+        assert!(score > 0, "no kernel config made any base progress — investigate breach/siege");
     }
 
     #[test]

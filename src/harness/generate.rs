@@ -369,6 +369,31 @@ impl Generator for Designed {
     }
 }
 
+/// A varied set of **realistic defended bases** for the ADR 0025 base-attack/defend tuning lens —
+/// terrain + structures + defenders across the regimes a real attacker meets: an open base ringed by a
+/// tower nest, a corridor-choked guarded base, bunkers behind thick ramparts with tower crossfire and a
+/// guard+healer force, and a swamp-slowed turtle. Reuses [`assemble_single_room`] (so it shares the
+/// breach geometry + clear-entry + apply layer with the rest of the harness). Distinct from the symmetric
+/// open-combat basket: here the "opponent" is the base, scored by objective progress (`assault_score`).
+pub fn realistic_bases() -> Vec<Scenario> {
+    let nest = |cx: u8, cy: u8| -> Vec<((u8, u8), u32)> {
+        // a tight 3-tower nest around (cx,cy), all energized.
+        [(0i32, 0i32), (1, 0), (0, 1)].iter().map(|&(dx, dy)| (((cx as i32 + dx) as u8, (cy as i32 + dy) as u8), 100_000u32)).collect()
+    };
+    vec![
+        // Open base, full tower nest, no rampart — the attacker must close under heavy crossfire.
+        assemble_single_room("base#0 open tower-nest".into(), 100, 12_900, 1400, (25, 25), 0, &nest(24, 16), Layout::Open, ForceSpec::Skirmishers(3), false),
+        // Corridor-choked guarded base behind a moderate rampart + two towers.
+        assemble_single_room("base#1 corridor choke + guard".into(), 101, 12_900, 1400, (32, 25), 30_000, &[((32, 12), 100_000), ((28, 14), 100_000)], Layout::Corridor, ForceSpec::Guard(3), false),
+        // Bunker behind a THICK rampart, tower crossfire N+S, a strong guard+healer — the turtle.
+        assemble_single_room("base#2 bunker turtle (thick rampart)".into(), 102, 12_900, 1500, (25, 25), 120_000, &[((25, 21), 100_000), ((25, 29), 100_000), ((21, 25), 100_000)], Layout::Bunker, ForceSpec::Guard(4), false),
+        // Bunker, lighter rampart, 2 towers, melee guard — the common mid-RCL base.
+        assemble_single_room("base#3 bunker + 2 towers".into(), 103, 12_900, 1400, (25, 25), 50_000, &[((23, 23), 100_000), ((27, 27), 100_000)], Layout::Bunker, ForceSpec::Guard(2), false),
+        // Swamp-slowed approach to a ramparted core + a tower — terrain attrition before the wall.
+        assemble_single_room("base#4 swamp turtle".into(), 104, 12_900, 1500, (25, 25), 40_000, &[((24, 14), 100_000)], Layout::SwampApproach, ForceSpec::Guard(1), false),
+    ]
+}
+
 /// A multi-room fixture: the assault stages in `W1N1` and the objective core sits behind a corridor in
 /// the east neighbour `W2N1` — the managed assault paths across the room border to engage (visible
 /// cross-room movement).

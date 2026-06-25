@@ -338,9 +338,20 @@ fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposit
 /// Field `comp` as a MOVING managed squad at the entry and run the REAL `decide_squad_with_pathing`
 /// brain to the objective (recording each tick). `None` ⇒ couldn't field.
 fn run_managed_assault(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
+    run_managed_assault_with(scenario, obj, comp, screeps_combat_decision::kite::SquadTacticParams::default())
+}
+
+/// As [`run_managed_assault`] but with chosen squad tactics — the seam the base-attack tuning pass uses to
+/// field the assault under each `KernelParams` candidate (ADR 0025 basket enrichment: base attack/defend).
+fn run_managed_assault_with(
+    scenario: &Scenario,
+    obj: &Objective,
+    comp: &SquadComposition,
+    tactics: screeps_combat_decision::kite::SquadTacticParams,
+) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
     let mut world = scenario.world.clone();
     let members = place_at_entry(&mut world, obj, comp, scenario.attacker_owner, scenario.member_energy)?;
-    let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos);
+    let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos).with_tactics(tactics);
     let defender = scenario.defender_owner;
     let core_pos = obj.pos;
     let run_until = AnyOf(vec![Box::new(ObjectivesDestroyed(vec![obj.id])), Box::new(SideWiped(scenario.attacker_owner))]);
@@ -362,6 +373,33 @@ pub fn managed_oscillation_rate(scenario: &Scenario) -> Option<f64> {
     let comp = managed_assault_comp(scenario);
     let (_, rec) = run_managed_assault(scenario, obj, &comp)?;
     Some(crate::metrics::oscillation_rate(&rec, scenario.attacker_owner))
+}
+
+/// An attacker squad's assault outcome on a defended base (ADR 0025 base attack/defend lens).
+#[derive(Clone, Copy, Debug)]
+pub struct AssaultScore {
+    pub objective_hp_removed: u32,
+    pub objective_destroyed: bool,
+    pub attacker_hp_retained: u32,
+    /// The aggregate the base-attack tuner ranks on: objective progress dominates, razing it is a big
+    /// bonus, attacker survival is a modest secondary (so a squad presses the objective without suiciding).
+    pub score: i64,
+}
+
+/// Score the managed attacker squad's assault on `scenario`'s defended base under `tactics` — the
+/// objective-aware base-attack lens (cf. the symmetric open-combat tournament): how much of the objective
+/// it razed, whether it cracked it, and how much of itself it kept. `None` ⇒ couldn't field at the entry.
+pub fn assault_score(scenario: &Scenario, tactics: screeps_combat_decision::kite::SquadTacticParams) -> Option<AssaultScore> {
+    let obj = &scenario.objectives[0];
+    let comp = managed_assault_comp(scenario);
+    let obj_hits_0 = scenario.world.structures.iter().find(|s| s.id == obj.id).map(|s| s.hits).unwrap_or(0);
+    let (outcome, _) = run_managed_assault_with(scenario, obj, &comp, tactics)?;
+    let final_hits = outcome.world.structures.iter().find(|s| s.id == obj.id).map(|s| s.hits);
+    let destroyed = !matches!(final_hits, Some(h) if h > 0); // gone from the world OR at 0 hits
+    let removed = obj_hits_0.saturating_sub(final_hits.unwrap_or(0));
+    let attacker_hp: u32 = outcome.world.creeps.iter().filter(|c| c.owner == scenario.attacker_owner && c.is_alive()).map(|c| c.body.hits).sum();
+    let score = removed as i64 + if destroyed { 50_000 } else { 0 } + attacker_hp as i64 / 4;
+    Some(AssaultScore { objective_hp_removed: removed, objective_destroyed: destroyed, attacker_hp_retained: attacker_hp, score })
 }
 
 /// The **traversal lens** (ADR 0023a stage 3): field the real moving squad and grade whether it
