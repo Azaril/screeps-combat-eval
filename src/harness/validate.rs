@@ -381,8 +381,12 @@ pub struct AssaultScore {
     pub objective_hp_removed: u32,
     pub objective_destroyed: bool,
     pub attacker_hp_retained: u32,
-    /// The aggregate the base-attack tuner ranks on: objective progress dominates, razing it is a big
-    /// bonus, attacker survival is a modest secondary (so a squad presses the objective without suiciding).
+    /// Ticks the assault took to resolve (breach / wipe / budget) — fewer = a better-positioned breach.
+    pub ticks: u32,
+    /// The aggregate the base-attack tuner ranks on. With a WINNABLE-sized force every config breaches the
+    /// crackable bases identically, so a binary "did it breach" doesn't discriminate positioning; the
+    /// quality signal is EFFICIENCY — breach FAST with MANY survivors (good positioning takes less tower/
+    /// defender damage en route). So: objective razed + destroyed bonus + survival×2 − a per-tick penalty.
     pub score: i64,
 }
 
@@ -391,15 +395,23 @@ pub struct AssaultScore {
 /// it razed, whether it cracked it, and how much of itself it kept. `None` ⇒ couldn't field at the entry.
 pub fn assault_score(scenario: &Scenario, tactics: screeps_combat_decision::kite::SquadTacticParams) -> Option<AssaultScore> {
     let obj = &scenario.objectives[0];
-    let comp = managed_assault_comp(scenario);
+    // Field a WINNABLE-SIZED siege force (the force-sizing solver's breach comp) — not the weak
+    // `quad_ranged` — so the squad can actually crack the mid bases and POSITIONING discriminates the
+    // KernelParams (the quad only chipped → all configs tied). The turtle's required force exceeds a
+    // single placeable squad, so it stays hard (correctly). (place_at_entry fields up to 9 of the comp.)
+    let (comp, _) = choose_fielded_comp(scenario, obj);
     let obj_hits_0 = scenario.world.structures.iter().find(|s| s.id == obj.id).map(|s| s.hits).unwrap_or(0);
-    let (outcome, _) = run_managed_assault_with(scenario, obj, &comp, tactics)?;
+    let (outcome, rec) = run_managed_assault_with(scenario, obj, &comp, tactics)?;
     let final_hits = outcome.world.structures.iter().find(|s| s.id == obj.id).map(|s| s.hits);
     let destroyed = !matches!(final_hits, Some(h) if h > 0); // gone from the world OR at 0 hits
     let removed = obj_hits_0.saturating_sub(final_hits.unwrap_or(0));
     let attacker_hp: u32 = outcome.world.creeps.iter().filter(|c| c.owner == scenario.attacker_owner && c.is_alive()).map(|c| c.body.hits).sum();
-    let score = removed as i64 + if destroyed { 50_000 } else { 0 } + attacker_hp as i64 / 4;
-    Some(AssaultScore { objective_hp_removed: removed, objective_destroyed: destroyed, attacker_hp_retained: attacker_hp, score })
+    let ticks = rec.frames.len() as u32;
+    // Efficiency-weighted: razed HP + destroyed bonus + survival×2 (the position-sensitive term — a
+    // better-placed assault eats less tower/defender fire) − a per-tick penalty (faster breach is better).
+    // Seeds; the tournament tunes the kernel against this, not the score weights themselves.
+    let score = removed as i64 + if destroyed { 50_000 } else { 0 } + (attacker_hp as i64) * 2 - (ticks as i64) * 10;
+    Some(AssaultScore { objective_hp_removed: removed, objective_destroyed: destroyed, attacker_hp_retained: attacker_hp, ticks, score })
 }
 
 /// The **traversal lens** (ADR 0023a stage 3): field the real moving squad and grade whether it
