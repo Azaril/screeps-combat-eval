@@ -19,3 +19,7 @@ screeps-combat-agent = { git = "https://github.com/Azaril/screeps-combat-agent" 
 # The bot's backend-agnostic structure-shape primitives, reused for the replay player's typed
 # buildings (host-only; the root [patch] redirects to the local working tree).
 screeps-visual = { git = "https://github.com/Azaril/screeps-visual" }
+# Real-terrain fixtures (ADR 0025 §12 Stage 1): the committed `resources/real-terrain.json` (a handful
+# of real mmo:shard3 rooms) is parsed into `TerrainFixture`s. (Foreman is added in Stage 3.)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

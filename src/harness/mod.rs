@@ -9,6 +9,7 @@ pub mod generate;
 pub mod report;
 pub mod roster;
 pub mod scenario;
+pub mod terrain_import;
 pub mod validate;
 pub mod visualize;
 
