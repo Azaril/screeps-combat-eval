@@ -78,6 +78,10 @@ pub fn fixtures() -> Vec<TerrainFixture> {
 /// coordinate fix for the dump's wall-nudged object coords (every object is exactly distance 1 from open,
 /// so this returns the true adjacent tile). `taken` keeps co-snapped objects distinct (two sources never
 /// collapse onto one tile). Falls back to `(x,y)` if the room is fully walled (never, for real rooms).
+///
+/// This is a WORKAROUND for a suspect, not-yet-root-caused dump offset — see
+/// `docs/design/0025a-coordinate-offset-anomaly.md` (terrain decode is verified correct; the dump's
+/// object coords are the bug; revisit when the dump provenance / a live-API cross-check is available).
 pub fn snap_to_open(terrain: &CombatTerrain, x: u8, y: u8, taken: &std::collections::HashSet<(u8, u8)>) -> (u8, u8) {
     use std::collections::{HashSet, VecDeque};
     let mut seen: HashSet<(i32, i32)> = HashSet::new();
@@ -110,6 +114,32 @@ pub fn decode_terrain(encoded: &str) -> CombatTerrain {
             t.walls.insert((x, y));
         } else if v & 2 != 0 {
             t.swamps.insert((x, y));
+        }
+    }
+    t
+}
+
+/// Decode a 2500-char terrain string into the foreman planner's dense [`FastRoomTerrain`] buffer (the
+/// 2500-byte `TerrainFlags` form: bit 0 = wall, bit 1 = swamp — the same per-char hex value). The bridge
+/// the §12 Stage 3 capture tool feeds the planner. Row-major `y*50+x`, matching `FastRoomTerrain`'s
+/// `Location::to_index` (verified: both are `y*50+x`).
+pub fn decode_fast(encoded: &str) -> screeps_foreman::terrain::FastRoomTerrain {
+    let buffer: Vec<u8> = encoded.chars().take(2500).map(|c| c.to_digit(16).unwrap_or(0) as u8).collect();
+    screeps_foreman::terrain::FastRoomTerrain::new(buffer)
+}
+
+/// Bridge the foreman dense [`FastRoomTerrain`] to the engine sparse [`CombatTerrain`] (the inverse of
+/// what the planner consumes). Used where a plan was built over a `FastRoomTerrain` but the sim needs the
+/// `CombatTerrain` form. Walls dominate swamps (matching [`decode_terrain`]).
+pub fn fast_to_combat(fast: &screeps_foreman::terrain::FastRoomTerrain) -> CombatTerrain {
+    let mut t = CombatTerrain::default();
+    for y in 0..50u8 {
+        for x in 0..50u8 {
+            if fast.is_wall(x, y) {
+                t.walls.insert((x, y));
+            } else if fast.is_swamp(x, y) {
+                t.swamps.insert((x, y));
+            }
         }
     }
     t
@@ -223,6 +253,18 @@ mod tests {
             let distinct: std::collections::HashSet<_> = all.iter().collect();
             assert_eq!(distinct.len(), all.len(), "{} objects snap to distinct tiles", f.room);
         }
+    }
+
+    #[test]
+    fn fast_to_combat_matches_decode() {
+        // The two terrain bridges agree: decode_fast → fast_to_combat == decode_terrain (the planner
+        // path and the sim path see the same walls/swamps).
+        let fx = fixtures();
+        let f = &fx[0];
+        let via_fast = fast_to_combat(&decode_fast(&f.terrain));
+        let direct = decode_terrain(&f.terrain);
+        assert_eq!(via_fast.walls, direct.walls, "{}: fast/direct walls agree", f.room);
+        assert_eq!(via_fast.swamps, direct.swamps, "{}: fast/direct swamps agree", f.room);
     }
 
     #[test]

@@ -4,10 +4,11 @@
 //! calibration runs on (the Move B draws, now behind the seam). Phases B/C add permutation, designed,
 //! and multi-room generators + opponent force specs.
 
+use crate::harness::foreman_capture::CapturedBase;
 use crate::harness::scenario::{Objective, ObjectiveKind, Scenario};
 use crate::harness::terrain_import::{decode_terrain, fixtures, TerrainFixture};
 use screeps::{Part, Position, RoomCoordinate, RoomName};
-use screeps_combat_engine::{CombatTerrain, CombatWorld, PlayerId, SimBody, SimController, SimCreep, StructureKind};
+use screeps_combat_engine::{CombatTerrain, CombatWorld, PlayerId, SimBody, SimController, SimCreep, StructureId, StructureKind};
 use screeps_combat_agent::scenario::ScenarioBuilder;
 
 pub const ATTACKER: PlayerId = 0;
@@ -642,5 +643,184 @@ impl Generator for ImportedRoom {
         let kind = OBJECTIVE_KINDS[((index / n) % k) as usize];
         let comp_seed = index / (n * k);
         assemble_imported(fixture, kind, comp_seed, self.multi_room)
+    }
+}
+
+// ── ADR 0025 §12 Stage 3b: realistic FOREMAN-PLANNED bases over real terrain ────────────────────────
+
+/// The committed foreman-base cache (`resources/captured-bases.json`) — real terrain + the planner's
+/// structure placements, produced OFFLINE by the `capture_base` bin (the planner is SLOW; never run here).
+pub fn captured_bases() -> Vec<CapturedBase> {
+    #[derive(serde::Deserialize)]
+    struct Cache {
+        bases: Vec<CapturedBase>,
+    }
+    let cache: Cache = serde_json::from_str(include_str!("../../resources/captured-bases.json")).expect("embedded captured-bases.json parses");
+    cache.bases
+}
+
+/// Breach staging derived from a real rampart ring: `(assault_pos, front_tiles, support_tiles, entry,
+/// breach_rampart_pos)`.
+type BreachStaging = (Position, Vec<Position>, Vec<Position>, Position, Option<(u8, u8)>);
+
+/// Derive breach staging from the foreman base's REAL rampart ring (ADR 0025 §12 Stage 3b) — the adaptive
+/// replacement for the synthetic west-gate [`breach_geometry`]. Picks the rampart on the attacker's
+/// natural approach (nearest a navigable room-edge tile), stages range-1 to it, and enters from a clear
+/// border tile in the core's navigable component (so the squad can path in). `breach_pos` is the chosen
+/// rampart tile (if any).
+fn breach_from_ramparts(target: RoomName, core: (u8, u8), ramparts: &[(u8, u8)], terrain: &CombatTerrain) -> BreachStaging {
+    let p = |x: u8, y: u8| pos_in(target, x, y);
+    let component = open_component(terrain, core);
+    let comp_set: std::collections::HashSet<(u8, u8)> = component.iter().copied().collect();
+    let open_neigh = |c: (u8, u8)| -> Vec<(u8, u8)> {
+        [(-1i32, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+            .into_iter()
+            .filter_map(|(dx, dy)| {
+                let (nx, ny) = (c.0 as i32 + dx, c.1 as i32 + dy);
+                ((0..50).contains(&nx) && (0..50).contains(&ny) && comp_set.contains(&(nx as u8, ny as u8))).then_some((nx as u8, ny as u8))
+            })
+            .collect()
+    };
+    // Navigable border tiles = where a moving assault can enter the room + reach the core.
+    let border: Vec<(u8, u8)> = component.iter().copied().filter(|&(x, y)| x == 0 || y == 0 || x == 49 || y == 49).collect();
+    let cheby = |a: (u8, u8), b: (u8, u8)| (a.0 as i32 - b.0 as i32).abs().max((a.1 as i32 - b.1 as i32).abs());
+    // The breach rampart = the one nearest a navigable entry (the attacker's natural approach).
+    let breach = ramparts.iter().copied().min_by_key(|&r| border.iter().map(|&bd| cheby(r, bd)).min().unwrap_or(99));
+    let pivot = breach.unwrap_or(core);
+    let mut front: Vec<(u8, u8)> = open_neigh(pivot);
+    if front.is_empty() {
+        front = open_neigh(core);
+    }
+    if front.is_empty() {
+        front.push(core);
+    }
+    front.truncate(4);
+    let assault = front[0];
+    let mut support: Vec<(u8, u8)> = open_neigh(assault).into_iter().filter(|t| *t != core && !front.contains(t)).take(3).collect();
+    if support.is_empty() {
+        support.push(core); // never empty (the oracle's staging needs a support tile)
+    }
+    // Entry: navigable border tile nearest the breach (so the squad crosses toward it); else westmost.
+    let entry = border
+        .iter()
+        .copied()
+        .min_by_key(|&bd| cheby(bd, pivot))
+        .or_else(|| component.iter().copied().min_by_key(|&(x, _)| x))
+        .unwrap_or(core);
+    (
+        p(assault.0, assault.1),
+        front.iter().map(|&(x, y)| p(x, y)).collect(),
+        support.iter().map(|&(x, y)| p(x, y)).collect(),
+        p(entry.0, entry.1),
+        breach,
+    )
+}
+
+/// Realize a cached [`CapturedBase`] into a [`Scenario`]: decode the real terrain, place the foreman's
+/// spawn (the core) + energized towers + ramparts + walls, add a seeded random defender force on
+/// near-core open tiles, and derive the breach staging from the real rampart ring. The objective targets
+/// the breach rampart (Breach) or the spawn core (every other kind); Declaim adds a controller.
+fn realize_base(base: &CapturedBase, kind: ObjectiveKind, comp_seed: u32) -> Scenario {
+    let mut rng = Rng::seeded(comp_seed.wrapping_mul(37).wrapping_add(kind as u32 + 1));
+    let terrain = decode_terrain(&base.terrain);
+    let target: RoomName = base.room.parse().unwrap_or_else(|_| room());
+    let p = |x: u8, y: u8| pos_in(target, x, y);
+    let mut b = ScenarioBuilder::empty(target).in_room(target);
+    *b.world_mut().terrain_mut(target) = terrain.clone();
+    let rampart_hits = rng.range(15_000, 80_000);
+    let mut core_id: Option<StructureId> = None;
+    let mut core = base.controller;
+    let mut rampart_ids: Vec<((u8, u8), StructureId)> = Vec::new();
+    for s in &base.structures {
+        match s.kind.as_str() {
+            "spawn" => {
+                let id = b.structure(StructureKind::Spawn, Some(DEFENDER), s.x, s.y, 50_000, 50_000);
+                if core_id.is_none() {
+                    core_id = Some(id);
+                    core = (s.x, s.y);
+                }
+            }
+            "tower" => {
+                b.tower(DEFENDER, s.x, s.y, 100_000); // energized, ready to fire (foreman carries no energy)
+            }
+            "rampart" => {
+                let id = b.structure(StructureKind::Rampart, Some(DEFENDER), s.x, s.y, rampart_hits, rampart_hits);
+                rampart_ids.push(((s.x, s.y), id));
+            }
+            "wall" => {
+                let wh = rng.range(10_000, 50_000);
+                b.structure(StructureKind::Wall, None, s.x, s.y, wh, wh);
+            }
+            _ => {}
+        }
+    }
+    let core_id = core_id.unwrap_or_else(|| b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000));
+    let ramparts: Vec<(u8, u8)> = rampart_ids.iter().map(|(xy, _)| *xy).collect();
+    let mut world = b.build();
+
+    // Defenders: a seeded random force on near-core open tiles.
+    let n_def = rng.range(1, 3);
+    let bodies = crate::harness::roster::random_squad(&mut rng, 2300, n_def as u8);
+    let component = open_component(&terrain, core);
+    let mut def_tiles: Vec<(u8, u8)> = component.iter().copied().filter(|&t| t != core).collect();
+    def_tiles.sort_by_key(|&(x, y)| (x as i32 - core.0 as i32).abs().max((y as i32 - core.1 as i32).abs()));
+    for (i, body) in bodies.iter().enumerate() {
+        if let Some(&(dx, dy)) = def_tiles.get(i) {
+            world.creeps.push(SimCreep { id: 10_000 + i as u32, owner: DEFENDER, pos: p(dx, dy), body: SimBody::unboosted(body), fatigue: 0 });
+        }
+    }
+
+    let (assault_pos, front_tiles, support_tiles, entry, breach_pos) = breach_from_ramparts(target, core, &ramparts, &terrain);
+    if kind == ObjectiveKind::Declaim {
+        world.controllers.push(SimController { pos: p(core.0, core.1), owner: Some(DEFENDER), downgrade_ticks: 50_000 });
+    }
+    let obj_id = if kind == ObjectiveKind::Breach {
+        breach_pos.and_then(|bp| rampart_ids.iter().find(|(xy, _)| *xy == bp).map(|(_, id)| *id)).unwrap_or(core_id)
+    } else {
+        core_id
+    };
+    let objective = Objective {
+        id: obj_id,
+        room: target,
+        pos: p(core.0, core.1),
+        assault_pos,
+        front_tiles,
+        support_tiles,
+        entry,
+        kind,
+    };
+    Scenario {
+        world,
+        objectives: vec![objective],
+        attacker_owner: ATTACKER,
+        defender_owner: DEFENDER,
+        member_energy: 12_900,
+        onsite_budget: 1400,
+        label: format!("foreman-{}-{kind:?}#{comp_seed}", base.room),
+        seed: comp_seed as u64,
+    }
+}
+
+/// Realistic FOREMAN-PLANNED bases (ADR 0025 §12 Stage 3) over real terrain × objective kind × defender
+/// comp. Loads the committed cache at construction (NEVER plans — the foreman planner is offline-only).
+pub struct ForemanGenerator {
+    pub n_comps: u32,
+}
+
+impl Generator for ForemanGenerator {
+    fn label(&self) -> &str {
+        "foreman-base"
+    }
+    fn count(&self) -> u32 {
+        captured_bases().len() as u32 * OBJECTIVE_KINDS.len() as u32 * self.n_comps.max(1)
+    }
+    fn generate(&self, index: u32) -> Scenario {
+        let bases = captured_bases();
+        let n = bases.len() as u32;
+        let k = OBJECTIVE_KINDS.len() as u32;
+        let base = &bases[(index % n) as usize];
+        let kind = OBJECTIVE_KINDS[((index / n) % k) as usize];
+        let comp_seed = index / (n * k);
+        realize_base(base, kind, comp_seed)
     }
 }

@@ -5,6 +5,7 @@
 //! WIN is one `(generator, validator)` pair; [`calibrate`] is the convenience that runs it.
 
 pub mod evaluate;
+pub mod foreman_capture;
 pub mod generate;
 pub mod report;
 pub mod roster;
@@ -59,7 +60,7 @@ pub fn calibration_replay(index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generate::{Designed, ImportedRoom, Permutations};
+    use generate::{Designed, ForemanGenerator, ImportedRoom, Permutations};
     use scenario::ObjectiveKind;
     use validate::{ManagedSquadIntegration, SelfPlay, SizingWins};
 
@@ -267,6 +268,73 @@ mod tests {
             let s = g.generate(i);
             let o = &s.objectives[0];
             assert_ne!(o.entry.room_name(), o.room, "multi-room#{i} stages in a different room than the objective");
+        }
+    }
+
+    // ── ADR 0025 §12 Stage 3: realistic FOREMAN-PLANNED bases over real terrain ──
+
+    /// A cached foreman base realizes into a populated world: real terrain + the planner's spawn(s),
+    /// energized towers, and a rampart ring (a real base shape, not empty).
+    #[test]
+    fn foreman_cache_realizes() {
+        use screeps_combat_engine::StructureKind;
+        let g = ForemanGenerator { n_comps: 1 };
+        assert!(g.count() > 0, "the committed foreman cache is non-empty");
+        let s = g.generate(0); // base 0, kind Raze
+        let o = &s.objectives[0];
+        let spawns = s.world.structures.iter().filter(|st| st.kind == StructureKind::Spawn).count();
+        let ramparts = s.world.structures.iter().filter(|st| st.kind == StructureKind::Rampart).count();
+        assert!(spawns >= 1, "realized base has a spawn ({spawns})");
+        assert!(!s.world.towers.is_empty(), "realized base has energized towers ({})", s.world.towers.len());
+        assert!(ramparts >= 1, "realized base has a rampart ring ({ramparts})");
+        let walls = s.world.terrain_for(o.room).walls.len();
+        assert!(walls > 50, "real terrain decoded ({walls} walls)");
+    }
+
+    /// Every (foreman base × objective kind × comp) is assessable: valid staging on clear tiles, the
+    /// sizing oracle runs over the whole enumeration without panic, and all five kinds are exercised.
+    #[test]
+    fn foreman_base_is_assessable() {
+        let g = ForemanGenerator { n_comps: 1 };
+        let mut v = OracleCalibration::new();
+        let report = run_suite(&g, &mut v);
+        assert_eq!(report.verdicts.len(), g.count() as usize, "a verdict per scenario");
+        let mut kinds = std::collections::HashSet::new();
+        for i in 0..g.count() {
+            let s = g.generate(i);
+            let o = &s.objectives[0];
+            assert!(!o.front_tiles.is_empty() && !o.support_tiles.is_empty(), "foreman#{i} ({:?}) staged", o.kind);
+            let t = s.world.terrain_for(o.room);
+            for fp in &o.front_tiles {
+                assert!(!t.is_wall(fp.x().u8(), fp.y().u8()), "foreman#{i} front tile is on a clear tile");
+            }
+            kinds.insert(o.kind);
+        }
+        assert_eq!(kinds.len(), 5, "all five kinds over foreman bases, got {kinds:?}");
+    }
+
+    /// The breach objective targets a RAMPART (the real ring's breach point), proving the adaptive
+    /// breach geometry derived from the foreman ring (not the synthetic west gate).
+    #[test]
+    fn foreman_breach_targets_a_rampart() {
+        use screeps_combat_engine::StructureKind;
+        let g = ForemanGenerator { n_comps: 1 };
+        let breach = (0..g.count()).map(|i| g.generate(i)).find(|s| s.objectives[0].kind == ObjectiveKind::Breach).expect("a breach scenario exists");
+        let o = &breach.objectives[0];
+        let target = breach.world.structures.iter().find(|st| st.id == o.id).expect("breach objective id is a real structure");
+        assert_eq!(target.kind, StructureKind::Rampart, "breach targets a rampart gate from the real ring");
+    }
+
+    /// Eyeball hook (operator visual validation): render managed assaults on the real foreman bases.
+    #[test]
+    #[ignore]
+    fn write_foreman_replays() {
+        use crate::harness::validate::render_managed_replay;
+        let g = ForemanGenerator { n_comps: 1 };
+        for i in 0..g.count().min(5) {
+            let s = g.generate(i);
+            let html = render_managed_replay(&s);
+            std::fs::write(format!("foreman-replay-{}.html", s.label.replace(['#', ':'], "_")), html).unwrap();
         }
     }
 
