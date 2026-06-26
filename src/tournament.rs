@@ -562,13 +562,38 @@ mod tests {
         println!("[ADR0025 §12 realistic base-attack] {} real bases (foreman + imported, Raze/Breach); best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
     }
 
+    /// SIM DETERMINISM regression fence (ADR 0026 follow-on). The combat sim must give the SAME result
+    /// over many rounds — bit-identical, NOT a brittle golden value. std `HashMap`/`HashSet` seed their
+    /// hasher per-INSTANCE (an incrementing thread-local counter), so every round builds fresh maps with
+    /// different iteration orders; any result-affecting hash iteration shows up as a spread here. Two leaks
+    /// were fixed (both in `screeps-rover`'s resolver): (1) the per-tick pathfinding-ops budget consumed in
+    /// `topological_sort_follows`'s seed order on dense bases — fixed by sorting the topological move order
+    /// by `Handle`; (2) `current_pos_to_entity` last-write-wins when two creeps stack on a tile (a transient
+    /// cross-room border stack) — fixed by keeping the lowest `Handle` on collision. With both fixed the
+    /// spread is 0; a regression (a new seed-ordered iteration affecting results) makes it nonzero.
+    /// Run: `cargo test --release -p screeps-combat-eval --lib sim_is_deterministic -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sim_is_deterministic_over_rounds() {
+        use screeps_combat_decision::kite::SquadTacticParams;
+        let breach = SquadTacticParams::breach();
+        let bases = realistic_base_scenarios();
+        let rounds: Vec<i64> = (0..5)
+            .map(|_| bases.iter().filter_map(|s| assault_score(s, breach)).map(|a| a.score).sum())
+            .collect();
+        let (min, max) = (*rounds.iter().min().unwrap(), *rounds.iter().max().unwrap());
+        println!("[sim determinism] base-attack sum over 5 rounds: {rounds:?} (spread {})", max - min);
+        assert_eq!(max - min, 0, "sim nondeterminism regressed: base-attack sum varies over 5 rounds {rounds:?}");
+    }
+
     /// ADR 0026 — the **per-objective regression fence**. The ROBUST signal is open-combat self-play (it
-    /// is symmetric + side-averaged, so the sim's per-process noise cancels): the `open_combat()` profile
-    /// must win it vs `breach()`. Base-attack absolute scores carry a ~0.1% cross-process noise floor (the
-    /// sim's `HashMap` iteration) that EXCEEDS the low-approach profile gap, so base-attack cannot robustly
-    /// SEPARATE these profiles — we assert `breach()` is CO-BEST (no regression) on base, not a lead. (The
-    /// breach profile's distinct weights rest on the open-combat win + the principle that breaching a ring
-    /// needs closing to range-1 to dismantle, where open combat kites; not on a base-attack lead.)
+    /// is symmetric + side-averaged): the `open_combat()` profile must win it vs `breach()`. Base-attack
+    /// absolute scores are now bit-deterministic (the two seed-ordered rover hash iterations were fixed —
+    /// see `sim_is_deterministic_over_rounds`), but the two low-approach profiles still TIE on base (the
+    /// breach distinction is move-in-to-dismantle, not a base-score gap), so we assert `breach()` is CO-BEST
+    /// (no regression) on base, not a lead. (The breach profile's distinct weights rest on the open-combat
+    /// win + the principle that breaching a ring needs closing to range-1 to dismantle, where open combat
+    /// kites; not on a base-attack lead.)
     /// Run: `cargo test --release -p screeps-combat-eval --lib per_objective_profiles -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -581,10 +606,11 @@ mod tests {
         let bases = realistic_base_scenarios();
         let score = |t| bases.par_iter().filter_map(|s| assault_score(s, t)).map(|a| a.score).sum::<i64>();
         let (breach_base, open_base) = (score(breach), score(open));
-        println!("[ADR0026 per-objective gate] open beats breach in OPEN: {open_margin:+} | breach vs open on BASE: {breach_base} vs {open_base} (base ~1% cross-process noise — not a tuning signal)");
+        println!("[ADR0026 per-objective gate] open beats breach in OPEN: {open_margin:+} | breach vs open on BASE: {breach_base} vs {open_base} (deterministic; the two low-approach profiles tie on base)");
         // ROBUST: open-combat self-play is symmetric + side-averaged, so it reproduces (open_combat wins).
         assert!(open_margin > 0, "open_combat() must win open combat vs breach() ({open_margin:+})");
-        // Base-attack absolute scores are noise-dominated; assert only NO CATASTROPHIC regression (>3%).
+        // Base-attack is now deterministic but the profiles tie; assert only NO regression (>3% would flag a
+        // profile that breaks the breach geometry — kept as a floor even though base no longer carries noise).
         assert!(breach_base as f64 >= open_base as f64 * 0.97, "breach() catastrophically regresses base ({breach_base} vs {open_base})");
     }
 
