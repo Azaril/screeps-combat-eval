@@ -237,11 +237,13 @@ pub fn realistic_comp_basket(n_comps: u32, energy: u32) -> Vec<(Bed, Vec<Vec<Par
 pub fn realistic_base_scenarios() -> Vec<crate::harness::scenario::Scenario> {
     use crate::harness::generate::{ForemanGenerator, Generator, ImportedRoom};
     use crate::harness::scenario::ObjectiveKind;
-    let raze = |s: &crate::harness::scenario::Scenario| s.objectives[0].kind == ObjectiveKind::Raze;
+    // Raze (destroy the core) + Breach (crack the rampart ring) — the two breach-relevant objectives that
+    // put positioning under fire; Farm/Secure/Declaim exercise plumbing, not assault positioning.
+    let attack = |s: &crate::harness::scenario::Scenario| matches!(s.objectives[0].kind, ObjectiveKind::Raze | ObjectiveKind::Breach);
     let fg = ForemanGenerator { n_comps: 1 };
     let ir = ImportedRoom { multi_room: false, n_comps: 1 };
-    let mut out: Vec<_> = (0..fg.count()).map(|i| fg.generate(i)).filter(raze).collect();
-    out.extend((0..ir.count()).map(|i| ir.generate(i)).filter(raze));
+    let mut out: Vec<_> = (0..fg.count()).map(|i| fg.generate(i)).filter(attack).collect();
+    out.extend((0..ir.count()).map(|i| ir.generate(i)).filter(attack));
     out
 }
 
@@ -326,6 +328,29 @@ pub fn kernel_population() -> Vec<Strategy> {
         with_kernel("k-tight-coh", |k| { k.cohesion_k = 2; k.discohesion_coef = 20; }), // ball up tight
         with_kernel("k-spread", |k| k.spacing_coef = 4),        // anti-stack harder
     ]
+}
+
+/// A FINE grid sweep of the kernel's position-shaping seam for the §12 Stage 4 **thorough** re-tune
+/// (`approach × incumbency × cohesion` = 48 configs) — the many-minutes population the rayon-parallel
+/// tournament explores to map the open-combat ↔ base-attack tradeoff surface. Names are leaked
+/// (`a{approach}-i{incumbency}-{cohesion}`); acceptable for an on-demand dashboard.
+pub fn kernel_population_grid() -> Vec<Strategy> {
+    let base = SquadTacticParams::default();
+    let mut out = Vec::new();
+    for approach in [1i64, 2, 3, 4] {
+        for incumbency in [2i64, 3, 4, 6] {
+            for (ck, dc, tag) in [(2u32, 20i64, "tight"), (3, 10, "def"), (5, 4, "loose")] {
+                let mut k = base.kernel;
+                k.approach_coef = approach;
+                k.incumbency_coef = incumbency;
+                k.cohesion_k = ck;
+                k.discohesion_coef = dc;
+                let name: &'static str = Box::leak(format!("a{approach}-i{incumbency}-{tag}").into_boxed_str());
+                out.push(Strategy { name, tactics: SquadTacticParams { kernel: k, ..base } });
+            }
+        }
+    }
+    out
 }
 
 /// The result of a tournament: the antisymmetric payoff matrix, each strategy's mean payoff (the
@@ -534,7 +559,60 @@ mod tests {
         let ranking = base_attack_ranking(&pop, &bases);
         println!("{}", base_attack_report(&pop, &ranking));
         let (best, score) = ranking[0];
-        println!("[ADR0025 §12 realistic base-attack] {} real bases (foreman + imported, Raze); best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
+        println!("[ADR0025 §12 realistic base-attack] {} real bases (foreman + imported, Raze/Breach); best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
+    }
+
+    /// ADR 0025 §12 Stage 4 — the **THOROUGH** re-tune (operator-requested many-minutes run): sweep the
+    /// 48-config [`kernel_population_grid`] over BOTH lenses — the realistic open-combat tournament (large
+    /// comp-varied basket + imported real terrain) AND the realistic base-attack set — fully rayon-
+    /// parallel, then report the open↔base tradeoff surface + the best-open / best-base / best-BALANCED
+    /// (rank-sum) configs. Run:
+    /// `cargo test --release -p screeps-combat-eval --lib realistic_full_retune -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn realistic_full_retune() {
+        let grid = kernel_population_grid();
+        let basket = realistic_comp_basket(8, 5600);
+        let bases = realistic_base_scenarios();
+        let n = grid.len();
+        println!("[realistic full re-tune] {n} kernel configs × {} self-play beds + {} base scenarios (rayon-parallel)…", basket.len(), bases.len());
+
+        let t = run_tournament_over_comps(&grid, &basket, TournamentBudget::Thorough.ticks());
+        let base = base_attack_ranking(&grid, &bases);
+
+        // Per-config metrics. exploitability_i = the largest margin any opponent beats i by = -min(row i).
+        let mean: Vec<f64> = (0..n).map(|i| t.matrix[i].iter().sum::<i64>() as f64 / n as f64).collect();
+        let exploit: Vec<i64> = (0..n).map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0)).collect();
+        let mut base_score = vec![0i64; n];
+        for &(i, s) in &base {
+            base_score[i] = s;
+        }
+        // Rank each lens (0 = best); the balanced pick minimizes the rank-sum.
+        let mut open_order: Vec<usize> = (0..n).collect();
+        open_order.sort_by(|&a, &b| mean[b].partial_cmp(&mean[a]).unwrap());
+        let mut base_order: Vec<usize> = (0..n).collect();
+        base_order.sort_by_key(|&i| std::cmp::Reverse(base_score[i]));
+        let mut open_rank = vec![0usize; n];
+        let mut base_rank = vec![0usize; n];
+        for (r, &i) in open_order.iter().enumerate() {
+            open_rank[i] = r;
+        }
+        for (r, &i) in base_order.iter().enumerate() {
+            base_rank[i] = r;
+        }
+        let mut balanced: Vec<usize> = (0..n).collect();
+        balanced.sort_by_key(|&i| open_rank[i] + base_rank[i]);
+
+        println!("\n{:>14} | {:>9} | {:>7} | {:>9} | open#  base#", "config", "open-mean", "exploit", "base");
+        for &i in &balanced {
+            println!("{:>14} | {:>+9.0} | {:>7} | {:>+9} |  {:>3}   {:>3}", grid[i].name, mean[i], exploit[i], base_score[i], open_rank[i], base_rank[i]);
+        }
+        let (bo, bb, bal) = (open_order[0], base_order[0], balanced[0]);
+        println!(
+            "\n[ADR0025 §12 THOROUGH re-tune] {n} configs\n  best OPEN-combat = {} ({:+.0} mean, exploit {})\n  best BASE-attack = {} ({:+})\n  best BALANCED    = {} (open#{} base#{}, mean {:+.0}, exploit {}, base {:+})",
+            grid[bo].name, mean[bo], exploit[bo], grid[bb].name, base_score[bb],
+            grid[bal].name, open_rank[bal], base_rank[bal], mean[bal], exploit[bal], base_score[bal],
+        );
     }
 
     #[test]
