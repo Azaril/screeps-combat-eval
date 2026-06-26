@@ -15,12 +15,11 @@ use screeps_combat_engine::CombatTerrain;
 /// positions the foreman planner needs in Stage 3 (controller / sources / mineral). Owned (parsed from
 /// the embedded JSON), not `&'static`, so the fixture data stays a single source of truth in the JSON.
 ///
-/// The object positions are **terrain-aligned** (on clear tiles): the raw dump coords are systematically
-/// nudged one tile into wall-edges (a dump-tool bug — every object is exactly Chebyshev-distance 1 from an
-/// open tile under the verified row-major `y*50+x` terrain decode, confirmed across 3000 rooms vs the
-/// `screeps-game-api` `LocalRoomTerrain` convention), so [`fixtures`] snaps each to its nearest open tile
-/// at load (the coordinate fix). This preserves the room's real source/controller LAYOUT (the snapped
-/// tile is adjacent to the dump tile) while guaranteeing the foreman planner gets valid, non-wall inputs.
+/// The object positions are **terrain-aligned** (on clear tiles). With the COLUMN-MAJOR terrain decode
+/// (`x*50+y`, verified against the official server — ADR 0025a) the real coords land on clear tiles
+/// directly for the large majority; [`fixtures`] still runs [`snap_to_open`] as a safety net for the
+/// residual few that read wall (the "other anomaly" under investigation in ADR 0025a), so the foreman
+/// planner always gets valid, non-wall inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerrainFixture {
     pub room: String,
@@ -101,15 +100,17 @@ pub fn snap_to_open(terrain: &CombatTerrain, x: u8, y: u8, taken: &std::collecti
     (x, y)
 }
 
-/// Decode a 2500-char shard terrain string (row-major `index = y*50 + x`; each char a hex digit whose
-/// bits are `1`=wall, `2`=swamp — `3` is wall+swamp ⇒ wall wins) into the engine's sparse
-/// [`CombatTerrain`]. The inverse of the `screeps-foreman-bench` terrain visitor. Out-of-spec chars
-/// decode as plain. A non-2500 string decodes what it has (callers should pass full rooms).
+/// Decode a 2500-char shard terrain string into the engine's sparse [`CombatTerrain`]. The screeps
+/// `/api/game/room-terrain?encoded=1` string is **COLUMN-MAJOR** (`index = x*50 + y`, matching the
+/// bindings' `LocalCostMatrix` `xy_to_linear_index`), verified empirically against the official server
+/// (ADR 0025a): under this convention room objects land on clear tiles and rooms render coherently;
+/// row-major puts 100% of objects on walls. Each char is a hex digit: bit `1`=wall, `2`=swamp (`3` ⇒
+/// wall wins). Out-of-spec chars decode as plain.
 pub fn decode_terrain(encoded: &str) -> CombatTerrain {
     let mut t = CombatTerrain::default();
     for (i, ch) in encoded.chars().enumerate().take(2500) {
         let v = ch.to_digit(16).unwrap_or(0) as u8;
-        let (x, y) = ((i % 50) as u8, (i / 50) as u8);
+        let (x, y) = ((i / 50) as u8, (i % 50) as u8); // column-major: i = x*50 + y
         if v & 1 != 0 {
             t.walls.insert((x, y));
         } else if v & 2 != 0 {
@@ -119,12 +120,19 @@ pub fn decode_terrain(encoded: &str) -> CombatTerrain {
     t
 }
 
-/// Decode a 2500-char terrain string into the foreman planner's dense [`FastRoomTerrain`] buffer (the
-/// 2500-byte `TerrainFlags` form: bit 0 = wall, bit 1 = swamp — the same per-char hex value). The bridge
-/// the §12 Stage 3 capture tool feeds the planner. Row-major `y*50+x`, matching `FastRoomTerrain`'s
-/// `Location::to_index` (verified: both are `y*50+x`).
+/// Decode a 2500-char terrain string into the foreman planner's dense [`FastRoomTerrain`] buffer. The API
+/// string is COLUMN-MAJOR (`x*50+y`), but `FastRoomTerrain` indexes its buffer ROW-MAJOR
+/// (`Location::to_index = y*50+x`), so we TRANSPOSE the string into the buffer: `buffer[y*50+x] =
+/// string[x*50+y]`. Then `fast.is_wall(x,y)` (reading `buffer[y*50+x]`) returns tile `(x,y)`'s value —
+/// agreeing with [`decode_terrain`]. (bit 0 = wall, bit 1 = swamp.)
 pub fn decode_fast(encoded: &str) -> screeps_foreman::terrain::FastRoomTerrain {
-    let buffer: Vec<u8> = encoded.chars().take(2500).map(|c| c.to_digit(16).unwrap_or(0) as u8).collect();
+    let chars: Vec<u8> = encoded.chars().take(2500).map(|c| c.to_digit(16).unwrap_or(0) as u8).collect();
+    let mut buffer = vec![0u8; 2500];
+    for x in 0..50usize {
+        for y in 0..50usize {
+            buffer[y * 50 + x] = chars.get(x * 50 + y).copied().unwrap_or(0);
+        }
+    }
     screeps_foreman::terrain::FastRoomTerrain::new(buffer)
 }
 
@@ -145,12 +153,12 @@ pub fn fast_to_combat(fast: &screeps_foreman::terrain::FastRoomTerrain) -> Comba
     t
 }
 
-/// Encode a [`CombatTerrain`] back to the 2500-char form (walls→`'1'`, swamps→`'2'`, plain→`'0'`). The
-/// inverse of [`decode_terrain`] — used only by the round-trip test (and handy for capturing fixtures).
+/// Encode a [`CombatTerrain`] back to the 2500-char COLUMN-MAJOR form (walls→`'1'`, swamps→`'2'`,
+/// plain→`'0'`). The inverse of [`decode_terrain`] — used by the round-trip test (and handy for fixtures).
 pub fn encode_terrain(t: &CombatTerrain) -> String {
     (0..2500)
         .map(|i| {
-            let (x, y) = ((i % 50) as u8, (i / 50) as u8);
+            let (x, y) = ((i / 50) as u8, (i % 50) as u8); // column-major: i = x*50 + y
             if t.is_wall(x, y) {
                 '1'
             } else if t.swamps.contains(&(x, y)) {
@@ -181,13 +189,13 @@ mod tests {
 
     #[test]
     fn decode_places_tiles_at_the_right_coords() {
-        // A single wall at index 160 = (x=10, y=3); a single swamp at index 2 = (x=2, y=0).
+        // COLUMN-MAJOR (i = x*50+y): index 160 = (x=3, y=10); index 2 = (x=0, y=2).
         let mut s = vec!['0'; 2500];
         s[160] = '1';
         s[2] = '2';
         let t = decode_terrain(&s.into_iter().collect::<String>());
-        assert!(t.is_wall(10, 3) && t.walls.len() == 1, "wall at (10,3)");
-        assert!(t.swamps.contains(&(2, 0)) && t.swamps.len() == 1, "swamp at (2,0)");
+        assert!(t.is_wall(3, 10) && t.walls.len() == 1, "wall at (3,10)");
+        assert!(t.swamps.contains(&(0, 2)) && t.swamps.len() == 1, "swamp at (0,2)");
         // '3' (wall+swamp bits) is a WALL, not a swamp.
         let mut s2 = vec!['0'; 2500];
         s2[0] = '3';
@@ -268,16 +276,22 @@ mod tests {
     }
 
     #[test]
-    fn snap_recovers_objects_within_one_tile() {
-        // The dump's wall-nudged coords are exactly distance 1 from open, so the snapped tile is adjacent
-        // to (i.e., recovers) the real object position — not a far-off guess.
+    fn column_major_places_most_objects_open() {
+        // Under the corrected COLUMN-MAJOR decode, real object coords land on open tiles DIRECTLY for the
+        // large majority (snap is then a no-op). The residual few that still read wall are the "other
+        // anomaly" tracked in ADR 0025a; `snap_to_open` mops them up. (Under the old row-major decode this
+        // was 0% — the regression guard for the transpose fix.)
         let raw: FixtureFile = serde_json::from_str(include_str!("../../resources/real-terrain.json")).unwrap();
+        let (mut open, mut total) = (0, 0);
         for r in &raw.rooms {
             let terrain = decode_terrain(&r.terrain);
-            let taken = std::collections::HashSet::new();
-            let snapped = snap_to_open(&terrain, r.controller[0], r.controller[1], &taken);
-            let cheby = (snapped.0 as i32 - r.controller[0] as i32).abs().max((snapped.1 as i32 - r.controller[1] as i32).abs());
-            assert!(cheby <= 1, "{} controller snap moved {cheby} tiles (expected <=1)", r.room);
+            for &[x, y] in std::iter::once(&r.controller).chain(r.sources.iter()) {
+                total += 1;
+                if !terrain.is_wall(x, y) {
+                    open += 1;
+                }
+            }
         }
+        assert!(open * 4 >= total * 3, "column-major places most objects open directly ({open}/{total}); transpose regression?");
     }
 }
