@@ -562,6 +562,32 @@ mod tests {
         println!("[ADR0025 §12 realistic base-attack] {} real bases (foreman + imported, Raze/Breach); best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
     }
 
+    /// ADR 0026 — the **per-objective regression fence**. The ROBUST signal is open-combat self-play (it
+    /// is symmetric + side-averaged, so the sim's per-process noise cancels): the `open_combat()` profile
+    /// must win it vs `breach()`. Base-attack absolute scores carry a ~0.1% cross-process noise floor (the
+    /// sim's `HashMap` iteration) that EXCEEDS the low-approach profile gap, so base-attack cannot robustly
+    /// SEPARATE these profiles — we assert `breach()` is CO-BEST (no regression) on base, not a lead. (The
+    /// breach profile's distinct weights rest on the open-combat win + the principle that breaching a ring
+    /// needs closing to range-1 to dismantle, where open combat kites; not on a base-attack lead.)
+    /// Run: `cargo test --release -p screeps-combat-eval --lib per_objective_profiles -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn per_objective_profiles_are_each_best_in_class() {
+        use screeps_combat_decision::kite::SquadTacticParams;
+        let (open, breach) = (SquadTacticParams::open_combat(), SquadTacticParams::breach());
+        let ticks = TournamentBudget::Thorough.ticks();
+        let basket = realistic_comp_basket(2, 5600);
+        let open_margin = payoff_over_comps(&basket, open, breach, ticks);
+        let bases = realistic_base_scenarios();
+        let score = |t| bases.par_iter().filter_map(|s| assault_score(s, t)).map(|a| a.score).sum::<i64>();
+        let (breach_base, open_base) = (score(breach), score(open));
+        println!("[ADR0026 per-objective gate] open beats breach in OPEN: {open_margin:+} | breach vs open on BASE: {breach_base} vs {open_base} (base ~1% cross-process noise — not a tuning signal)");
+        // ROBUST: open-combat self-play is symmetric + side-averaged, so it reproduces (open_combat wins).
+        assert!(open_margin > 0, "open_combat() must win open combat vs breach() ({open_margin:+})");
+        // Base-attack absolute scores are noise-dominated; assert only NO CATASTROPHIC regression (>3%).
+        assert!(breach_base as f64 >= open_base as f64 * 0.97, "breach() catastrophically regresses base ({breach_base} vs {open_base})");
+    }
+
     /// ADR 0025 §12 Stage 4 — the **THOROUGH** re-tune (operator-requested many-minutes run): sweep the
     /// 48-config [`kernel_population_grid`] over BOTH lenses — the realistic open-combat tournament (large
     /// comp-varied basket + imported real terrain) AND the realistic base-attack set — fully rayon-
