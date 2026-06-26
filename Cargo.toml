@@ -28,3 +28,6 @@ serde_json = "1"
 # the committed cache. screeps-common supplies PlanLocation/Location. Root [patch] redirects to local.
 screeps-foreman = { git = "https://github.com/Azaril/screeps-foreman" }
 screeps-common = { git = "https://github.com/Azaril/screeps-common" }
+# ADR 0025 §12 Stage 4: parallelize the heavy host sims (the kernel tournament + base-attack ranking are
+# embarrassingly parallel over independent matches). Host-only crate, so rayon never reaches the bot wasm.
+rayon = "1"

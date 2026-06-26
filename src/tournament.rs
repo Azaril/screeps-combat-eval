@@ -26,8 +26,11 @@ use screeps_combat_decision::kernel::KernelParams;
 use screeps_combat_decision::kite::{KiteScoreParams, SquadTacticParams};
 use screeps_combat_engine::{CombatWorld, PlayerId, SimBody, SimCreep, SimTower};
 
+use rayon::prelude::*;
+
 use crate::harness::generate::Rng;
 use crate::harness::roster::random_squad;
+use crate::harness::terrain_import::{decode_terrain, fixtures};
 use crate::harness::validate::assault_score;
 use crate::{ranged_file, run_managed};
 
@@ -75,15 +78,57 @@ pub enum Bed {
     /// Each side has a tower covering the centre — fighting under mutual crossfire (the safety term +
     /// Lanchester heal/tower calc bite).
     TowerCrossfire,
+    /// REAL imported terrain (fixture `idx`), **mirror-symmetrized** (left half reflected to the right) so
+    /// the self-play payoff stays meaningful — both sides fight across identical real walls/swamps (ADR
+    /// 0025 §12 Stage 4). Deployment zones are forced clear so squads always field.
+    Imported(usize),
 }
 
-/// The standard basket the tournament averages each match over.
+/// The standard synthetic basket the tournament averages each match over.
 pub const BASKET: [Bed; 3] = [Bed::OpenField, Bed::Corridor, Bed::TowerCrossfire];
+
+impl Bed {
+    /// A distinct per-bed seed key (the enum carries data now, so it is not `as u32`-castable).
+    fn key(&self) -> u32 {
+        match self {
+            Bed::OpenField => 0,
+            Bed::Corridor => 1,
+            Bed::TowerCrossfire => 2,
+            Bed::Imported(i) => 100 + *i as u32,
+        }
+    }
+}
 
 /// Apply a `bed`'s terrain + mirrored towers to a world (the symmetric battlefield, creeps aside).
 fn apply_bed_terrain(world: &mut CombatWorld, bed: Bed) {
     match bed {
         Bed::OpenField => {}
+        Bed::Imported(idx) => {
+            let fx = fixtures();
+            let real = decode_terrain(&fx[idx % fx.len()].terrain);
+            // Mirror the left half (x<25) onto the right (49-x) → a symmetric battlefield from real terrain.
+            for x in 0..25u8 {
+                for y in 0..50u8 {
+                    let (wall, swamp) = (real.is_wall(x, y), real.swamps.contains(&(x, y)));
+                    for tx in [x, 49 - x] {
+                        if wall {
+                            world.terrain.walls.insert((tx, y));
+                        } else if swamp {
+                            world.terrain.swamps.insert((tx, y));
+                        }
+                    }
+                }
+            }
+            // Clear the two deployment zones (start files + a move-out margin) so both squads always field.
+            for x in 0..12u8 {
+                for y in 18..32u8 {
+                    for tx in [x, 49 - x] {
+                        world.terrain.walls.remove(&(tx, y));
+                        world.terrain.swamps.remove(&(tx, y));
+                    }
+                }
+            }
+        }
         Bed::Corridor => {
             for y in 0..=49u8 {
                 if !(24..=26).contains(&y) {
@@ -162,11 +207,41 @@ pub fn comp_basket(n_comps: u32, energy: u32) -> Vec<(Bed, Vec<Vec<Part>>)> {
     for &bed in &BASKET {
         for s in 0..n_comps {
             // Distinct seed per (bed, comp) so the population is varied + reproducible; 2–5 creeps a side.
-            let mut rng = Rng::seeded(s * BASKET.len() as u32 + bed as u32 + 1);
+            let mut rng = Rng::seeded(s * BASKET.len() as u32 + bed.key() + 1);
             let n = rng.range(2, 5) as u8;
             out.push((bed, random_squad(&mut rng, energy, n)));
         }
     }
+    out
+}
+
+/// The §12 Stage 4 **realistic open-combat basket**: the synthetic [`comp_basket`] PLUS a few imported
+/// real-terrain beds (mirror-symmetrized), each with seeded random comps — so the kernel tournament tunes
+/// over real walls/swamps, not only hand-authored terrain.
+pub fn realistic_comp_basket(n_comps: u32, energy: u32) -> Vec<(Bed, Vec<Vec<Part>>)> {
+    let mut out = comp_basket(n_comps, energy);
+    let n_fix = fixtures().len().min(4); // a bounded handful of real beds (keeps `Thorough` in minutes)
+    for i in 0..n_fix {
+        for s in 0..n_comps {
+            let mut rng = Rng::seeded(s.wrapping_mul(97).wrapping_add(i as u32).wrapping_add(500));
+            let n = rng.range(2, 5) as u8;
+            out.push((Bed::Imported(i), random_squad(&mut rng, energy, n)));
+        }
+    }
+    out
+}
+
+/// The §12 Stage 4 **realistic base-attack set**: the `Raze` scenarios from the foreman-planned bases +
+/// the imported rooms (the "destroy the base" lens over real terrain + real foreman layouts). `Raze` is
+/// the breach-relevant objective; the other kinds exercise plumbing, not positioning under fire.
+pub fn realistic_base_scenarios() -> Vec<crate::harness::scenario::Scenario> {
+    use crate::harness::generate::{ForemanGenerator, Generator, ImportedRoom};
+    use crate::harness::scenario::ObjectiveKind;
+    let raze = |s: &crate::harness::scenario::Scenario| s.objectives[0].kind == ObjectiveKind::Raze;
+    let fg = ForemanGenerator { n_comps: 1 };
+    let ir = ImportedRoom { multi_room: false, n_comps: 1 };
+    let mut out: Vec<_> = (0..fg.count()).map(|i| fg.generate(i)).filter(raze).collect();
+    out.extend((0..ir.count()).map(|i| ir.generate(i)).filter(raze));
     out
 }
 
@@ -184,12 +259,16 @@ pub fn payoff_over_comps(basket: &[(Bed, Vec<Vec<Part>>)], a: SquadTacticParams,
 pub fn run_tournament_over_comps(strategies: &[Strategy], basket: &[(Bed, Vec<Vec<Part>>)], ticks: usize) -> TournamentResult {
     let n = strategies.len();
     let mut matrix = vec![vec![0i64; n]; n];
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let p = payoff_over_comps(basket, strategies[i].tactics, strategies[j].tactics, ticks);
-            matrix[i][j] = p;
-            matrix[j][i] = -p;
-        }
+    // Each upper-triangle cell is an independent round-robin sum — run them in PARALLEL (rayon). Matches
+    // are pure (fresh world per call), so this is deterministic regardless of completion order.
+    let pairs: Vec<(usize, usize)> = (0..n).flat_map(|i| ((i + 1)..n).map(move |j| (i, j))).collect();
+    let cells: Vec<(usize, usize, i64)> = pairs
+        .par_iter()
+        .map(|&(i, j)| (i, j, payoff_over_comps(basket, strategies[i].tactics, strategies[j].tactics, ticks)))
+        .collect();
+    for (i, j, p) in cells {
+        matrix[i][j] = p;
+        matrix[j][i] = -p;
     }
     let mut ranking: Vec<(usize, f64)> = (0..n).map(|i| (i, matrix[i].iter().sum::<i64>() as f64 / n.max(1) as f64)).collect();
     ranking.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -308,7 +387,7 @@ pub fn run_tournament(strategies: &[Strategy], budget: TournamentBudget) -> Tour
 /// strategy beats it by. ≤ 0 ⇒ unexploitable by the field (a robust strategy). The ship-gate.
 pub fn exploitability(candidate: SquadTacticParams, population: &[Strategy], budget: TournamentBudget) -> i64 {
     let ticks = budget.ticks();
-    population.iter().map(|opp| payoff(opp.tactics, candidate, ticks)).max().unwrap_or(0)
+    population.par_iter().map(|opp| payoff(opp.tactics, candidate, ticks)).max().unwrap_or(0)
 }
 
 /// **Base attack/defend tuning** (ADR 0025 — the asymmetric lens, vs the symmetric open-combat
@@ -317,14 +396,19 @@ pub fn exploitability(candidate: SquadTacticParams, population: &[Strategy], bud
 /// "opponent" is the base, so it's an absolute-score ranking, not self-play. Returns `(index, total
 /// score)`, best first.
 pub fn base_attack_ranking(strategies: &[Strategy], scenarios: &[crate::harness::scenario::Scenario]) -> Vec<(usize, i64)> {
-    let mut ranking: Vec<(usize, i64)> = strategies
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let total: i64 = scenarios.iter().filter_map(|sc| assault_score(sc, s.tactics)).map(|a| a.score).sum();
-            (i, total)
-        })
+    // Score every (strategy × base) assault in PARALLEL (rayon) — each is an independent managed sim — then
+    // reduce per strategy. This is the heaviest Stage-4 computation (winnable siege forces over real bases).
+    let pairs: Vec<(usize, &crate::harness::scenario::Scenario)> =
+        strategies.iter().enumerate().flat_map(|(i, _)| scenarios.iter().map(move |sc| (i, sc))).collect();
+    let scored: Vec<(usize, i64)> = pairs
+        .par_iter()
+        .filter_map(|&(i, sc)| assault_score(sc, strategies[i].tactics).map(|a| (i, a.score)))
         .collect();
+    let mut totals = vec![0i64; strategies.len()];
+    for (i, s) in scored {
+        totals[i] += s;
+    }
+    let mut ranking: Vec<(usize, i64)> = totals.into_iter().enumerate().collect();
     ranking.sort_by_key(|&(_, s)| std::cmp::Reverse(s));
     ranking
 }
@@ -417,6 +501,40 @@ mod tests {
         println!("[ADR0025 base-attack] {} bases; best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
         // Sanity: the assault makes SOME objective progress across the set (not a total wall).
         assert!(score > 0, "no kernel config made any base progress — investigate breach/siege");
+    }
+
+    /// ADR 0025 §12 Stage 4 — the **realistic** open-combat re-tune: round-robin the kernel population over
+    /// the synthetic basket PLUS imported real-terrain beds (rayon-parallel). Reports the field winner, the
+    /// Nash-heaviest (robust) config, and the shipped default's exploitability. Run:
+    /// `cargo test -p screeps-combat-eval --lib realistic_kernel_tournament -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn realistic_kernel_tournament() {
+        let pop = kernel_population();
+        let basket = realistic_comp_basket(3, 5600);
+        let r = run_tournament_over_comps(&pop, &basket, TournamentBudget::Thorough.ticks());
+        println!("{}", report(&r));
+        let best = r.ranking[0];
+        let nash_best = (0..r.nash.len()).max_by(|&a, &b| r.nash[a].partial_cmp(&r.nash[b]).unwrap()).unwrap();
+        let exploit = exploitability(SquadTacticParams::default(), &pop, TournamentBudget::Thorough);
+        println!(
+            "[ADR0025 §12 realistic kernel tournament] {} beds (synthetic + imported real terrain)\n  field winner = {} ({:+.0} mean payoff)\n  Nash-heaviest (robust) = {} ({:.2})\n  shipped-default exploitability = {} net HP",
+            basket.len(), r.names[best.0], best.1, r.names[nash_best], r.nash[nash_best], exploit
+        );
+    }
+
+    /// ADR 0025 §12 Stage 4 — the **realistic** base-attack re-tune: rank the kernel population by how well
+    /// each razes the foreman-planned + imported real bases (rayon-parallel managed sims). Run:
+    /// `cargo test -p screeps-combat-eval --lib realistic_base_attack -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn realistic_base_attack() {
+        let pop = kernel_population();
+        let bases = realistic_base_scenarios();
+        let ranking = base_attack_ranking(&pop, &bases);
+        println!("{}", base_attack_report(&pop, &ranking));
+        let (best, score) = ranking[0];
+        println!("[ADR0025 §12 realistic base-attack] {} real bases (foreman + imported, Raze); best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
     }
 
     #[test]
