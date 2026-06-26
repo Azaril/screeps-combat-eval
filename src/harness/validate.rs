@@ -14,7 +14,8 @@ use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
 use screeps_combat_decision::composition::{BodyType, SquadComposition, SquadRole, SquadSlot};
 use screeps_combat_decision::damage::tower_repair_at_range;
-use screeps_combat_decision::force_sizing::{assess, AssaultMode, DefenseProfile, ForceBudget, RequiredForce, TowerThreat};
+use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EngagementContext, ForcePlan};
+use screeps_combat_decision::force_sizing::{AssaultMode, DefenseProfile, ForceBudget, TowerThreat};
 use screeps_combat_engine::constants::TOWER_ENERGY_COST;
 use screeps_combat_engine::{CombatAction, CombatWorld, CreepId, Intents, PlayerId, SimBody, SimCreep, StructureId};
 
@@ -100,23 +101,18 @@ impl Validator for OracleCalibration {
         let objective = &scenario.objectives[0]; // single-objective for now (multi-room: Phase C)
         let profile = derive_profile(&scenario.world, scenario.defender_owner, objective);
 
-        // Assess what the sizing SYSTEM can field (the ceiling), not the bare template.
+        // Select + size VIA THE DOCTRINE REGISTRY (parity with the bot). Assess against what the sizing
+        // SYSTEM can field (the ceiling), not the bare template.
         let ceiling = siege_ceiling(scenario.member_energy);
-        let caps = ceiling.capabilities(scenario.member_energy);
-        let budget = ForceBudget {
-            max_heal_per_tick: caps.heal_per_tick as f32,
-            max_dismantle_dps: caps.structure_dps as f32,
-            tank_effective_hp: caps.tank_effective_hp as f32,
-            onsite_budget_ticks: scenario.onsite_budget,
-        };
-        let a = assess(&profile, &budget);
+        let budget = ceiling.force_budget(scenario.member_energy, scenario.onsite_budget);
+        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy);
 
-        if a.winnable {
-            if a.mode == AssaultMode::Drain {
+        if plan.winnable() {
+            if plan.assessment.mode == AssaultMode::Drain {
                 self.tally.drain_winnable += 1;
                 return Verdict { pass: true, label: self.label().into(), detail: "winnable (drain) — diagnostic, not breach-graded".into() };
             }
-            match SquadComposition::siege_quad().sized_for(RequiredForce::from_assessment(&a), scenario.member_energy) {
+            match plan.composition {
                 Some(sized) => match breaches(scenario, objective, &sized) {
                     Some(true) => {
                         self.tally.fielded += 1;
@@ -187,6 +183,28 @@ fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Objective) -> D
         repair_per_tick,
         safe_mode: world.safe_mode_owner == Some(defender),
     }
+}
+
+/// Decide + size the siege force for a structure-breach scenario VIA THE DOCTRINE REGISTRY (ADR 0026 §9)
+/// — the SAME selection + sizing path the bot's offense runs (parity; no divergent inline `assess` +
+/// `siege_quad().sized_for` in the eval). A bed objective is a dismantle-able structure breach →
+/// `DoctrineObjective::DismantleStructure` → the `SiegeBreach` doctrine sizes a `siege_quad` to the
+/// oracle's required force against `budget` (the siege ceiling's, the calibration lens). The returned
+/// `ForcePlan` carries the verdict (`assessment`) + the sized `composition` (`None` = defer / drain /
+/// unfieldable). `importance: 0.0` matches the eval's base-force sizing (`importance_margin(0)` = 1×).
+fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32) -> ForcePlan {
+    let ctx = EngagementContext {
+        objective: DoctrineObjective::DismantleStructure,
+        coordination: EnemyCoordination::Individual,
+        defense: profile,
+        worst_single: None,
+        importance: 0.0,
+        member_energy,
+    };
+    let doctrines = default_doctrines();
+    decide_doctrine(&ctx, &doctrines)
+        .expect("DismantleStructure routes to the siege-breach doctrine")
+        .plan(&ctx, Some(budget))
 }
 
 /// Place `comp`'s members as attacker creeps on the objective's staging tiles (dismantlers → front,
@@ -289,23 +307,17 @@ fn breaches(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Op
 fn choose_fielded_comp(scenario: &Scenario, obj: &Objective) -> (SquadComposition, String) {
     let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
     let ceiling = siege_ceiling(scenario.member_energy);
-    let caps = ceiling.capabilities(scenario.member_energy);
-    let budget = ForceBudget {
-        max_heal_per_tick: caps.heal_per_tick as f32,
-        max_dismantle_dps: caps.structure_dps as f32,
-        tank_effective_hp: caps.tank_effective_hp as f32,
-        onsite_budget_ticks: scenario.onsite_budget,
-    };
-    let a = assess(&profile, &budget);
-    if a.winnable && a.mode == AssaultMode::Breach {
-        match SquadComposition::siege_quad().sized_for(RequiredForce::from_assessment(&a), scenario.member_energy) {
+    let budget = ceiling.force_budget(scenario.member_energy, scenario.onsite_budget);
+    let plan = siege_doctrine_plan(profile, budget, scenario.member_energy);
+    if plan.winnable() && plan.assessment.mode == AssaultMode::Breach {
+        match plan.composition {
             Some(sized) => (sized, "winnable → fielded the sized force".to_string()),
             None => (ceiling, "winnable but the comp can't field the required force; showing the ceiling".to_string()),
         }
-    } else if a.winnable {
+    } else if plan.winnable() {
         (ceiling, "winnable (drain mode); showing the ceiling".to_string())
     } else {
-        (ceiling, format!("deferred ({}); showing the ceiling", a.reason))
+        (ceiling, format!("deferred ({}); showing the ceiling", plan.assessment.reason))
     }
 }
 
@@ -618,17 +630,10 @@ impl Validator for SizingWins {
     fn validate(&mut self, scenario: &Scenario) -> Verdict {
         let obj = &scenario.objectives[0];
         let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
-        let ceiling = siege_ceiling(scenario.member_energy);
-        let caps = ceiling.capabilities(scenario.member_energy);
-        let budget = ForceBudget {
-            max_heal_per_tick: caps.heal_per_tick as f32,
-            max_dismantle_dps: caps.structure_dps as f32,
-            tank_effective_hp: caps.tank_effective_hp as f32,
-            onsite_budget_ticks: scenario.onsite_budget,
-        };
-        let a = assess(&profile, &budget);
-        if a.winnable && a.mode == AssaultMode::Breach {
-            if let Some(sized) = SquadComposition::siege_quad().sized_for(RequiredForce::from_assessment(&a), scenario.member_energy) {
+        let budget = siege_ceiling(scenario.member_energy).force_budget(scenario.member_energy, scenario.onsite_budget);
+        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy);
+        if plan.winnable() && plan.assessment.mode == AssaultMode::Breach {
+            if let Some(sized) = plan.composition {
                 if let Some(breached) = breaches(scenario, obj, &sized) {
                     self.attempted += 1;
                     if breached {
