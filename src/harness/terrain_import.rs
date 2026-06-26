@@ -14,6 +14,13 @@ use screeps_combat_engine::CombatTerrain;
 /// A committed real-terrain fixture: room name + the 2500-char encoded terrain + the source-object
 /// positions the foreman planner needs in Stage 3 (controller / sources / mineral). Owned (parsed from
 /// the embedded JSON), not `&'static`, so the fixture data stays a single source of truth in the JSON.
+///
+/// The object positions are **terrain-aligned** (on clear tiles): the raw dump coords are systematically
+/// nudged one tile into wall-edges (a dump-tool bug — every object is exactly Chebyshev-distance 1 from an
+/// open tile under the verified row-major `y*50+x` terrain decode, confirmed across 3000 rooms vs the
+/// `screeps-game-api` `LocalRoomTerrain` convention), so [`fixtures`] snaps each to its nearest open tile
+/// at load (the coordinate fix). This preserves the room's real source/controller LAYOUT (the snapped
+/// tile is adjacent to the dump tile) while guaranteeing the foreman planner gets valid, non-wall inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerrainFixture {
     pub room: String,
@@ -36,22 +43,58 @@ struct RawFixture {
     mineral: Option<[u8; 2]>,
 }
 
-/// The committed real-terrain fixtures (parsed from the embedded `resources/real-terrain.json`). A few
-/// varied real rooms (mixed wall/swamp density, controller + sources) — the substrate for the Stage 2
-/// `ImportedRoom` generator + the Stage 4 realistic tournament basket.
+/// The committed real-terrain fixtures (parsed from the embedded `resources/real-terrain.json`). Varied
+/// real rooms (mixed wall/swamp density, controller + sources) — the substrate for the Stage 2
+/// `ImportedRoom` generator + the Stage 4 realistic tournament basket. Object coords are snapped to clear
+/// tiles at load ([`snap_to_open`]; see [`TerrainFixture`] — the coordinate fix).
 pub fn fixtures() -> Vec<TerrainFixture> {
     let raw: FixtureFile = serde_json::from_str(include_str!("../../resources/real-terrain.json"))
         .expect("embedded resources/real-terrain.json parses");
     raw.rooms
         .into_iter()
-        .map(|r| TerrainFixture {
-            room: r.room,
-            terrain: r.terrain,
-            controller: (r.controller[0], r.controller[1]),
-            sources: r.sources.into_iter().map(|s| (s[0], s[1])).collect(),
-            mineral: r.mineral.map(|m| (m[0], m[1])),
+        .map(|r| {
+            let terrain = decode_terrain(&r.terrain);
+            // Snap each object to its nearest open tile (the dump-coord fix), keeping them distinct.
+            let mut taken = std::collections::HashSet::new();
+            let controller = snap_to_open(&terrain, r.controller[0], r.controller[1], &taken);
+            taken.insert(controller);
+            let mut sources = Vec::with_capacity(r.sources.len());
+            for s in &r.sources {
+                let snapped = snap_to_open(&terrain, s[0], s[1], &taken);
+                taken.insert(snapped);
+                sources.push(snapped);
+            }
+            let mineral = r.mineral.map(|m| {
+                let snapped = snap_to_open(&terrain, m[0], m[1], &taken);
+                taken.insert(snapped);
+                snapped
+            });
+            TerrainFixture { room: r.room, terrain: r.terrain, controller, sources, mineral }
         })
         .collect()
+}
+
+/// The nearest open (non-wall) tile to `(x,y)` not already in `taken`, by 8-connected BFS — the
+/// coordinate fix for the dump's wall-nudged object coords (every object is exactly distance 1 from open,
+/// so this returns the true adjacent tile). `taken` keeps co-snapped objects distinct (two sources never
+/// collapse onto one tile). Falls back to `(x,y)` if the room is fully walled (never, for real rooms).
+pub fn snap_to_open(terrain: &CombatTerrain, x: u8, y: u8, taken: &std::collections::HashSet<(u8, u8)>) -> (u8, u8) {
+    use std::collections::{HashSet, VecDeque};
+    let mut seen: HashSet<(i32, i32)> = HashSet::new();
+    let mut q = VecDeque::from([(x as i32, y as i32)]);
+    while let Some((cx, cy)) = q.pop_front() {
+        if !(0..50).contains(&cx) || !(0..50).contains(&cy) || !seen.insert((cx, cy)) {
+            continue;
+        }
+        let t = (cx as u8, cy as u8);
+        if !terrain.is_wall(t.0, t.1) && !taken.contains(&t) {
+            return t;
+        }
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)] {
+            q.push_back((cx + dx, cy + dy));
+        }
+    }
+    (x, y)
 }
 
 /// Decode a 2500-char shard terrain string (row-major `index = y*50 + x`; each char a hex digit whose
@@ -154,11 +197,6 @@ mod tests {
 
     #[test]
     fn fixtures_are_real_navigable_rooms() {
-        // NOTE (Stage 3 caveat): the bench map dump's OBJECT coords (controller/sources) are not cleanly
-        // alignable with its terrain-string index convention (no single transform puts all objects on
-        // clear tiles), so Stage 1 validates only the TERRAIN (the real wall/swamp map a squad navigates).
-        // The controller/source ALIGNMENT must be resolved when Stage 3 feeds them to the foreman planner
-        // (re-derive from the terrain, or snap to the nearest clear tile).
         let fx = fixtures();
         assert!(fx.len() >= 3, "a handful of real-terrain fixtures ({} found)", fx.len());
         for f in &fx {
@@ -171,6 +209,33 @@ mod tests {
             // Navigable: the open interior is one big connected component (a squad can traverse it).
             let frac = largest_open_fraction(&terrain);
             assert!(frac > 0.6, "{} interior is navigable (largest open component {:.0}% of open tiles)", f.room, frac * 100.0);
+            // The COORDINATE FIX: snapped object positions are on clear tiles + distinct.
+            assert!(!terrain.is_wall(f.controller.0, f.controller.1), "{} controller snapped to a clear tile", f.room);
+            for &(sx, sy) in &f.sources {
+                assert!(!terrain.is_wall(sx, sy), "{} source ({sx},{sy}) snapped to a clear tile", f.room);
+            }
+            let mut all: Vec<(u8, u8)> = vec![f.controller];
+            all.extend(&f.sources);
+            if let Some(m) = f.mineral {
+                assert!(!terrain.is_wall(m.0, m.1), "{} mineral snapped to a clear tile", f.room);
+                all.push(m);
+            }
+            let distinct: std::collections::HashSet<_> = all.iter().collect();
+            assert_eq!(distinct.len(), all.len(), "{} objects snap to distinct tiles", f.room);
+        }
+    }
+
+    #[test]
+    fn snap_recovers_objects_within_one_tile() {
+        // The dump's wall-nudged coords are exactly distance 1 from open, so the snapped tile is adjacent
+        // to (i.e., recovers) the real object position — not a far-off guess.
+        let raw: FixtureFile = serde_json::from_str(include_str!("../../resources/real-terrain.json")).unwrap();
+        for r in &raw.rooms {
+            let terrain = decode_terrain(&r.terrain);
+            let taken = std::collections::HashSet::new();
+            let snapped = snap_to_open(&terrain, r.controller[0], r.controller[1], &taken);
+            let cheby = (snapped.0 as i32 - r.controller[0] as i32).abs().max((snapped.1 as i32 - r.controller[1] as i32).abs());
+            assert!(cheby <= 1, "{} controller snap moved {cheby} tiles (expected <=1)", r.room);
         }
     }
 }
