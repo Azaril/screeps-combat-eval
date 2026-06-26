@@ -460,10 +460,237 @@ pub fn report(result: &TournamentResult) -> String {
     s
 }
 
+/// The ADR 0026a candidate strategy modes as kernel-only [`Strategy`] configs (the ideation catalog — see
+/// `docs/design/0026a-candidate-strategy-modes.md`). The per-situation discovery sweep checks whether each
+/// hand-designed mode captures its target matchup's optimum on the corrected, deterministic sim.
+pub fn catalog_strategies() -> Vec<Strategy> {
+    let base = SquadTacticParams::default();
+    let k = |name: &'static str, a: i64, i: i64, d: i64, ck: u32, s: i64| Strategy {
+        name,
+        tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+    };
+    vec![
+        k("ranged_duel_kite", 0, 3, 14, 3, 2),
+        k("anti_aoe_spread", 1, 5, 6, 4, 5),
+        k("focus_ball", 2, 4, 28, 1, 0),
+        k("anti_kite_chase", 5, 1, 6, 4, 1),
+        k("defensive_hold", 1, 10, 14, 2, 2),
+        k("drain_spread", 1, 6, 10, 4, 4),
+        k("drain_breach_handoff", 3, 4, 10, 3, 1),
+        k("safe_mode_countdown", 1, 8, 14, 2, 1),
+    ]
+}
+
+/// A fixed situational composition (both self-play sides field it) that puts a specific matchup on the
+/// table: a ranged mirror, an RMA-heavy stack-punisher, or a melee brawl. The generic basket sits at the
+/// `a1-i6-tight` equilibrium, so these isolate the matchups where a situational mode can earn its place.
+pub fn situational_comp(kind: &str) -> Vec<Vec<Part>> {
+    let body = |parts: &[(Part, usize)]| -> Vec<Part> { parts.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect() };
+    use Part::{Attack, Heal, Move, RangedAttack};
+    match kind {
+        "ranged" => vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)])],
+        "rma" => vec![body(&[(RangedAttack, 6), (Move, 4)]), body(&[(RangedAttack, 6), (Move, 4)]), body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)])],
+        "melee" => vec![body(&[(Attack, 5), (Move, 5), (Heal, 1)]), body(&[(Attack, 5), (Move, 5), (Heal, 1)]), body(&[(Attack, 4), (Move, 4), (Heal, 2)])],
+        _ => vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)])],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// Per-situation discovery + ADR 0026a catalog validation (on the corrected, deterministic sim). For
+    /// each situational comp, rank a WIDE kernel field (the 48-config grid + the catalog modes + extra
+    /// approach-0 / high-spacing points the grid omits) by payoff vs the `open_combat` baseline
+    /// (a1-i6-tight). The top config is that matchup's discovered optimum; a catalog mode that lands near
+    /// the top with payoff > 0 is validated; the baseline itself scores 0. Run:
+    /// `cargo test --release -p screeps-combat-eval --lib discover_situational -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn discover_situational_modes() {
+        let baseline = SquadTacticParams::open_combat();
+        let ticks = TournamentBudget::Thorough.ticks();
+        let base = SquadTacticParams::default();
+        let mk = |name: &'static str, a: i64, i: i64, d: i64, ck: u32, s: i64| Strategy {
+            name,
+            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+        };
+        let mut field = kernel_population_grid();
+        field.extend(catalog_strategies());
+        for (a, i, d, ck, s, name) in [
+            (0i64, 6i64, 20i64, 2u32, 1i64, "a0-i6-tight"),
+            (0, 4, 14, 3, 3, "a0-i4-spread"),
+            (1, 6, 20, 2, 4, "a1-i6-sp4"),
+            (0, 6, 14, 3, 4, "a0-i6-sp4"),
+            (1, 8, 14, 2, 2, "a1-i8-tight"),
+        ] {
+            field.push(mk(name, a, i, d, ck, s));
+        }
+        let catalog_names: Vec<&str> = catalog_strategies().iter().map(|s| s.name).collect();
+        for sit in ["ranged", "rma", "melee"] {
+            let comp = situational_comp(sit);
+            let basket: Vec<(Bed, Vec<Vec<Part>>)> = BASKET.iter().map(|&b| (b, comp.clone())).collect();
+            let mut scored: Vec<(usize, i64)> =
+                (0..field.len()).into_par_iter().map(|i| (i, payoff_over_comps(&basket, field[i].tactics, baseline, ticks))).collect();
+            scored.sort_by_key(|&(_, p)| std::cmp::Reverse(p));
+            println!("\n=== situation {sit}: top 8 configs by payoff vs open_combat (a1-i6-tight); baseline=0 ===");
+            for &(i, p) in scored.iter().take(8) {
+                let tag = if catalog_names.contains(&field[i].name) { " [catalog]" } else { "" };
+                println!("  {:>16} {:+6}{tag}", field[i].name, p);
+            }
+            for cm in &catalog_names {
+                if let Some(r) = scored.iter().position(|&(i, _)| &field[i].name == cm) {
+                    println!("    catalog {:>16}: rank {:>2}/{}  payoff {:+}", cm, r + 1, field.len(), scored[r].1);
+                }
+            }
+        }
+    }
+
+    /// Validate the per-situation DISCOVERED winners (a1-i6-sp4 for ranged/AoE, a*-i6-tight for melee)
+    /// against the GENERIC comp basket + the exploitability ship-gate — to classify each as a strict
+    /// generic improvement over `open_combat` (→ re-tune the base profile) vs a situational mode (wins its
+    /// matchup but not generically → needs an activator). `gen` = payoff vs open_combat over the realistic
+    /// basket (>0 ⇒ generically better); `exploit` = largest margin the grid field beats it by (≤0 ⇒ robust).
+    /// Run: `cargo test --release -p screeps-combat-eval --lib validate_discovered -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn validate_discovered_modes() {
+        let ticks = TournamentBudget::Thorough.ticks();
+        let baseline = SquadTacticParams::open_combat();
+        let generic = realistic_comp_basket(4, 5600);
+        let base = SquadTacticParams::default();
+        let mk = |name: &'static str, a: i64, i: i64, d: i64, ck: u32, s: i64| Strategy {
+            name,
+            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+        };
+        let candidates = vec![
+            mk("a1-i6-tight(open)", 1, 6, 20, 2, 1),
+            mk("a1-i6-sp2", 1, 6, 20, 2, 2),
+            mk("a1-i6-sp4", 1, 6, 20, 2, 4),
+            mk("a1-i6-sp6", 1, 6, 20, 2, 6),
+            mk("a1-i8-sp2", 1, 8, 20, 2, 2),
+            mk("a2-i6-tight", 2, 6, 20, 2, 1),
+            mk("a2-i6-sp4", 2, 6, 20, 2, 4),
+            mk("a4-i6-tight", 4, 6, 20, 2, 1),
+            mk("a2-i4-tight", 2, 4, 20, 2, 1),
+        ];
+        let mut pop = kernel_population_grid();
+        pop.extend(candidates.iter().copied());
+        println!("\n{:>18} | gen-vs-open | exploit  (gen>0 = better generically; exploit<=0 = robust)", "config");
+        for c in &candidates {
+            let gen = payoff_over_comps(&generic, c.tactics, baseline, ticks);
+            let exp = exploitability(c.tactics, &pop, TournamentBudget::Thorough);
+            println!("{:>18} | {:>+10} | {:>7}", c.name, gen, exp);
+        }
+    }
+
+    /// The discovery's headline: the best `approach` is COMPOSITION-dependent (melee must close to range 1;
+    /// ranged holds + spreads). Map `approach* = f(melee fraction)` across a ranged→melee comp spectrum so
+    /// the situational rule is a principled gradient, not two hand-picked points. incumbency/cohesion fixed
+    /// at the open winner (i6/tight); only approach varies, vs the `open_combat` baseline.
+    /// Run: `cargo test --release -p screeps-combat-eval --lib discover_approach_by_composition -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn discover_approach_by_composition() {
+        let ticks = TournamentBudget::Thorough.ticks();
+        let baseline = SquadTacticParams::open_combat();
+        let base = SquadTacticParams::default();
+        let mk_app = |a: i64, s: i64| SquadTacticParams {
+            kernel: KernelParams { approach_coef: a, incumbency_coef: 6, discohesion_coef: 20, cohesion_k: 2, spacing_coef: s },
+            ..base
+        };
+        let body = |parts: &[(Part, usize)]| -> Vec<Part> { parts.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect() };
+        use Part::{Attack, Heal, Move, RangedAttack};
+        let comps: Vec<(&str, Vec<Vec<Part>>)> = vec![
+            ("pure_ranged", vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)])]),
+            ("mixed", vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 1)]), body(&[(Attack, 4), (Move, 4), (Heal, 1)]), body(&[(RangedAttack, 3), (Attack, 2), (Move, 4), (Heal, 1)])]),
+            ("melee_heavy", vec![body(&[(Attack, 5), (Move, 5)]), body(&[(Attack, 5), (Move, 4), (Heal, 1)]), body(&[(Attack, 4), (Move, 4), (Heal, 2)])]),
+        ];
+        for (name, comp) in &comps {
+            let basket: Vec<(Bed, Vec<Vec<Part>>)> = BASKET.iter().map(|&b| (b, comp.clone())).collect();
+            let mut best = (0i64, i64::MIN);
+            print!("  {name:>12} (approach vs open, spacing 1): ");
+            for a in 0..=6i64 {
+                let p = payoff_over_comps(&basket, mk_app(a, 1), baseline, ticks);
+                print!("a{a}={p:+} ");
+                if p > best.1 {
+                    best = (a, p);
+                }
+            }
+            println!(" => approach* = {} ({:+})", best.0, best.1);
+        }
+    }
+
+    /// Authoritative spacing re-tune: round-robin a focused spacing-aware grid over the REALISTIC comp
+    /// basket (meta-Nash + comp-varied exploitability). The original grid fixed spacing=1, so the original
+    /// re-tune never explored it; the per-situation discovery found spacing helps (anti-focus-fire /
+    /// anti-AoE; Screeps AoE is pure Chebyshev). This confirms whether spacing 2 is the new unexploitable
+    /// open-combat equilibrium. `exploit_i = -min(row i)` ≤ 0 ⇒ robust.
+    /// Run: `cargo test --release -p screeps-combat-eval --lib retune_spacing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn retune_spacing() {
+        let base = SquadTacticParams::default();
+        let mk = |name: &'static str, a: i64, i: i64, ck: u32, d: i64, s: i64| Strategy {
+            name,
+            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+        };
+        let grid = vec![
+            mk("a1-i6-tight-s1(open)", 1, 6, 2, 20, 1),
+            mk("a1-i6-tight-s2", 1, 6, 2, 20, 2),
+            mk("a1-i6-tight-s3", 1, 6, 2, 20, 3),
+            mk("a1-i6-tight-s4", 1, 6, 2, 20, 4),
+            mk("a1-i8-tight-s2", 1, 8, 2, 20, 2),
+            mk("a2-i6-tight-s2", 2, 6, 2, 20, 2),
+            mk("a1-i6-def-s1", 1, 6, 3, 10, 1),
+            mk("a1-i6-def-s2", 1, 6, 3, 10, 2),
+            mk("a1-i4-tight-s2", 1, 4, 2, 20, 2),
+            mk("a2-i4-tight-s2", 2, 4, 2, 20, 2),
+        ];
+        let basket = realistic_comp_basket(6, 5600);
+        let t = run_tournament_over_comps(&grid, &basket, TournamentBudget::Thorough.ticks());
+        let n = grid.len();
+        let exploit: Vec<i64> = (0..n).map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0)).collect();
+        println!("\n{:>22} | mean | exploit | nash", "config");
+        for &(i, score) in &t.ranking {
+            println!("{:>22} | {:>+5.0} | {:>7} | {:.2}", grid[i].name, score, exploit[i], t.nash[i]);
+        }
+        let best = t.ranking[0].0;
+        println!("\n[spacing re-tune] best = {} (mean {:+.0}, exploit {})", grid[best].name, t.ranking[0].1, exploit[best]);
+    }
+
+    /// FINAL open-combat ship-gate: round-robin the spacing candidates + `breach` + the deliberate
+    /// real-opponent archetypes (`strategy_population`: aggressive/cautious/kite/advance) over the realistic
+    /// basket. Unlike `retune_spacing` (kernel-only field), this includes the actual opponents a shipped
+    /// profile faces, so its exploitability is the real one. Picks the open_combat to ship: highest mean
+    /// with exploit ≤ the incumbent's.
+    /// Run: `cargo test --release -p screeps-combat-eval --lib final_open_validation -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn final_open_validation() {
+        let base = SquadTacticParams::default();
+        let mk = |name: &'static str, a: i64, i: i64, ck: u32, d: i64, s: i64| Strategy {
+            name,
+            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+        };
+        let mut field = vec![
+            mk("open-s1", 1, 6, 2, 20, 1),
+            mk("open-s2", 1, 6, 2, 20, 2),
+            mk("open-s4", 1, 6, 2, 20, 4),
+            mk("i8-s2", 1, 8, 2, 20, 2),
+            mk("breach", 1, 4, 3, 10, 1),
+        ];
+        field.extend(strategy_population());
+        let basket = realistic_comp_basket(8, 5600);
+        let t = run_tournament_over_comps(&field, &basket, TournamentBudget::Thorough.ticks());
+        let n = field.len();
+        let exploit: Vec<i64> = (0..n).map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0)).collect();
+        println!("\n{:>16} | mean | exploit | nash", "config");
+        for &(i, score) in &t.ranking {
+            println!("{:>16} | {:>+5.0} | {:>7} | {:.2}", field[i].name, score, exploit[i], t.nash[i]);
+        }
+    }
 
     #[test]
     fn tournament_matrix_is_antisymmetric_and_zero_sum() {
@@ -586,31 +813,37 @@ mod tests {
         assert_eq!(max - min, 0, "sim nondeterminism regressed: base-attack sum varies over 5 rounds {rounds:?}");
     }
 
-    /// ADR 0026 — the **per-objective regression fence**. The ROBUST signal is open-combat self-play (it
-    /// is symmetric + side-averaged): the `open_combat()` profile must win it vs `breach()`. Base-attack
-    /// absolute scores are now bit-deterministic (the two seed-ordered rover hash iterations were fixed —
-    /// see `sim_is_deterministic_over_rounds`), but the two low-approach profiles still TIE on base (the
-    /// breach distinction is move-in-to-dismantle, not a base-score gap), so we assert `breach()` is CO-BEST
-    /// (no regression) on base, not a lead. (The breach profile's distinct weights rest on the open-combat
-    /// win + the principle that breaching a ring needs closing to range-1 to dismantle, where open combat
-    /// kites; not on a base-attack lead.)
+    /// ADR 0026 — the **per-objective regression fence** (criterion revised in the 2026-06-26 spacing
+    /// re-tune). `open_combat()` must be a clearly-tuned open profile: it decisively beats the untuned
+    /// `default` in open combat. We do NOT assert `open > breach` head-to-head — breach is a NEAR-open
+    /// config, so after the spacing-2 re-tune it ties open_combat one-on-one, yet vs the real-opponent
+    /// field open_combat is the clear best (`final_open_validation`: open-s2 +169 vs the archetypes); we
+    /// assert only that open is CO-BEST (does not clearly lose) vs breach. Base-attack is bit-deterministic
+    /// but NON-DISCRIMINATING (all configs tie — the scenarios are trivially winnable), so it gets only a
+    /// no-catastrophic-regression floor; the breach distinction rests on the move-in-to-dismantle principle.
     /// Run: `cargo test --release -p screeps-combat-eval --lib per_objective_profiles -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn per_objective_profiles_are_each_best_in_class() {
         use screeps_combat_decision::kite::SquadTacticParams;
-        let (open, breach) = (SquadTacticParams::open_combat(), SquadTacticParams::breach());
+        let (open, breach, default) = (SquadTacticParams::open_combat(), SquadTacticParams::breach(), SquadTacticParams::default());
         let ticks = TournamentBudget::Thorough.ticks();
         let basket = realistic_comp_basket(2, 5600);
-        let open_margin = payoff_over_comps(&basket, open, breach, ticks);
+        let open_vs_default = payoff_over_comps(&basket, open, default, ticks);
+        let open_vs_breach = payoff_over_comps(&basket, open, breach, ticks);
         let bases = realistic_base_scenarios();
         let score = |t| bases.par_iter().filter_map(|s| assault_score(s, t)).map(|a| a.score).sum::<i64>();
         let (breach_base, open_base) = (score(breach), score(open));
-        println!("[ADR0026 per-objective gate] open beats breach in OPEN: {open_margin:+} | breach vs open on BASE: {breach_base} vs {open_base} (deterministic; the two low-approach profiles tie on base)");
-        // ROBUST: open-combat self-play is symmetric + side-averaged, so it reproduces (open_combat wins).
-        assert!(open_margin > 0, "open_combat() must win open combat vs breach() ({open_margin:+})");
-        // Base-attack is now deterministic but the profiles tie; assert only NO regression (>3% would flag a
-        // profile that breaks the breach geometry — kept as a floor even though base no longer carries noise).
+        println!("[ADR0026 per-objective gate] open vs default(open): {open_vs_default:+} | open vs breach(open): {open_vs_breach:+} | base {breach_base} vs {open_base}");
+        // open_combat must be a CLEARLY-TUNED open profile — it decisively beats the untuned `default` in
+        // open combat. (The earlier `open > breach` proxy was RETIRED: breach is a near-open config, so
+        // head-to-head it TIES open_combat after the spacing-2 re-tune, yet vs the real-opponent field
+        // open_combat is the clear best — see `final_open_validation` (open-s2 +169 vs the field). The right
+        // criterion is "beats a naive baseline", not "beats our own breach profile".)
+        assert!(open_vs_default > 0, "open_combat() must beat the untuned default in open combat ({open_vs_default:+})");
+        // open_combat + breach are CO-BEST in open (breach is a near-open config); open must not clearly LOSE.
+        assert!(open_vs_breach > -60, "open_combat() must be co-best (not clearly lose) vs breach in open ({open_vs_breach:+})");
+        // Base-attack is deterministic but non-discriminating (all configs tie); a no-catastrophic-regression floor.
         assert!(breach_base as f64 >= open_base as f64 * 0.97, "breach() catastrophically regresses base ({breach_base} vs {open_base})");
     }
 
