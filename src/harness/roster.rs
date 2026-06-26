@@ -267,7 +267,7 @@ mod tests {
                 body.iter().any(|&p| matches!(p, Part::Attack | Part::RangedAttack | Part::Heal | Part::Work)),
                 "body has a useful part (not inert): {body:?}"
             );
-            assert!(body.iter().any(|&p| p == Part::Move), "body has MOVE for mobility");
+            assert!(body.contains(&Part::Move), "body has MOVE for mobility");
         }
     }
 

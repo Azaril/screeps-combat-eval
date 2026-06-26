@@ -16,6 +16,8 @@ pub enum StopReason {
     ObjectivesComplete,
     /// The given side has no living creeps left.
     SideWiped(PlayerId),
+    /// The targeted controller became unowned (a declaim objective was achieved).
+    ControllerNeutralized,
     /// The tick budget elapsed with no terminal condition.
     Timeout,
 }
@@ -56,6 +58,20 @@ impl RunUntil for SideWiped {
             None
         } else {
             Some(StopReason::SideWiped(self.0))
+        }
+    }
+}
+
+/// Stop when the controller at `pos` is unowned (a declaim objective — ADR 0025 §12 Stage 2). A missing
+/// controller counts as neutralized (nothing left to de-claim).
+pub struct ControllerNeutralized(pub screeps::Position);
+impl RunUntil for ControllerNeutralized {
+    fn check(&self, world: &CombatWorld, _tick: u32) -> Option<StopReason> {
+        let still_owned = world.controllers.iter().any(|c| c.pos == self.0 && c.owner.is_some());
+        if still_owned {
+            None
+        } else {
+            Some(StopReason::ControllerNeutralized)
         }
     }
 }

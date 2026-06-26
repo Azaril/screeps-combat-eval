@@ -335,6 +335,22 @@ fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposit
     Some(ids)
 }
 
+/// The run-until stop condition for an objective, BY KIND (ADR 0025 §12 Stage 2). Always wrapped with
+/// the attacker-wiped guard (a destroyed attacker ends the run). `Raze`/`Breach` destroy the target
+/// structure (`Breach`'s `id` is the rampart gate); `Secure` clears the defender side; `Declaim`
+/// neutralizes the controller at the objective tile; `Farm` has no terminal (holds to the on-site budget).
+fn run_until_for(scenario: &Scenario, obj: &Objective) -> AnyOf {
+    use crate::harness::scenario::ObjectiveKind;
+    let mut conds: Vec<Box<dyn crate::harness::evaluate::RunUntil>> = vec![Box::new(SideWiped(scenario.attacker_owner))];
+    match obj.kind {
+        ObjectiveKind::Raze | ObjectiveKind::Breach => conds.push(Box::new(ObjectivesDestroyed(vec![obj.id]))),
+        ObjectiveKind::Secure => conds.push(Box::new(SideWiped(scenario.defender_owner))),
+        ObjectiveKind::Declaim => conds.push(Box::new(crate::harness::evaluate::ControllerNeutralized(obj.pos))),
+        ObjectiveKind::Farm => {}
+    }
+    AnyOf(conds)
+}
+
 /// Field `comp` as a MOVING managed squad at the entry and run the REAL `decide_squad_with_pathing`
 /// brain to the objective (recording each tick). `None` ⇒ couldn't field.
 fn run_managed_assault(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
@@ -354,7 +370,7 @@ fn run_managed_assault_with(
     let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos).with_tactics(tactics);
     let defender = scenario.defender_owner;
     let core_pos = obj.pos;
-    let run_until = AnyOf(vec![Box::new(ObjectivesDestroyed(vec![obj.id])), Box::new(SideWiped(scenario.attacker_owner))]);
+    let run_until = run_until_for(scenario, obj);
     let out = evaluate_recorded(
         world,
         &mut |w| squad.step(w),
@@ -440,7 +456,7 @@ impl Validator for ManagedSquadIntegration {
             .iter()
             .any(|c| c.is_alive() && c.owner == scenario.attacker_owner && c.pos.room_name() == obj.room && c.pos.get_range_to(obj.pos) <= 8);
         let pass = match outcome.stop {
-            StopReason::ObjectivesComplete | StopReason::SideWiped(_) => true,
+            StopReason::ObjectivesComplete | StopReason::ControllerNeutralized | StopReason::SideWiped(_) => true,
             StopReason::Timeout => reached_vicinity,
         };
         Verdict {
@@ -592,6 +608,7 @@ pub fn self_play_replay_data(scenario: &Scenario) -> (screeps_combat_engine::Com
         Some((outcome, rec, _)) => {
             let result = match outcome.stop {
                 StopReason::ObjectivesComplete => "objective destroyed",
+                StopReason::ControllerNeutralized => "controller neutralized",
                 StopReason::SideWiped(o) if o == scenario.attacker_owner => "attacker wiped",
                 StopReason::SideWiped(_) => "defender wiped",
                 StopReason::Timeout => "timed out",
@@ -620,6 +637,7 @@ pub fn render_managed_replay(scenario: &Scenario) -> String {
         Some((outcome, rec)) => {
             let result = match outcome.stop {
                 StopReason::ObjectivesComplete => "objective destroyed",
+                StopReason::ControllerNeutralized => "controller neutralized",
                 StopReason::SideWiped(_) => "attackers wiped",
                 StopReason::Timeout => "held (timed out)",
             };
@@ -660,6 +678,7 @@ pub fn calibration_replay_data(scenario: &Scenario) -> (screeps_combat_engine::C
     );
     let result = match outcome.stop {
         StopReason::ObjectivesComplete => "BREACHED",
+        StopReason::ControllerNeutralized => "controller neutralized",
         StopReason::SideWiped(_) => "attackers wiped",
         StopReason::Timeout => "held (timed out)",
     };

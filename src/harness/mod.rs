@@ -59,7 +59,8 @@ pub fn calibration_replay(index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generate::{Designed, Permutations};
+    use generate::{Designed, ImportedRoom, Permutations};
+    use scenario::ObjectiveKind;
     use validate::{ManagedSquadIntegration, SelfPlay, SizingWins};
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
@@ -193,6 +194,80 @@ mod tests {
         let mut v = ManagedSquadIntegration;
         let verdict = v.validate(&scenario);
         assert!(verdict.pass, "the assault did not cross into the objective room + engage: {}", verdict.detail);
+    }
+
+    // ── ADR 0025 §12 Stage 2: imported-terrain scenarios (single + multi-room × objectives × comps) ──
+
+    /// Every (real-terrain fixture × objective kind × comp seed) produces an ASSESSABLE scenario — valid
+    /// staging + the sizing oracle runs over the whole enumeration without panicking (mirrors
+    /// `terrain_generators_produce_assessable_scenarios` for the real-terrain generator).
+    #[test]
+    fn imported_room_every_kind_is_assessable() {
+        let g = ImportedRoom { multi_room: false, n_comps: 2 };
+        assert!(g.count() > 0, "imported-room offers scenarios");
+        let mut v = OracleCalibration::new();
+        let report = run_suite(&g, &mut v);
+        assert_eq!(report.verdicts.len(), g.count() as usize, "a verdict per scenario");
+        let mut kinds_seen = std::collections::HashSet::new();
+        for i in 0..g.count() {
+            let s = g.generate(i);
+            assert!(!s.objectives.is_empty(), "imported#{i} has an objective");
+            let o = &s.objectives[0];
+            assert!(!o.front_tiles.is_empty() && !o.support_tiles.is_empty(), "imported#{i} ({:?}) is staged", o.kind);
+            // The objective + staging sit on the navigable interior (not in a wall).
+            let t = s.world.terrain_for(o.room);
+            assert!(!t.is_wall(o.pos.x().u8(), o.pos.y().u8()), "imported#{i} objective is on a clear tile");
+            kinds_seen.insert(o.kind);
+        }
+        assert_eq!(kinds_seen.len(), 5, "all five objective kinds are exercised, got {kinds_seen:?}");
+    }
+
+    /// A `Declaim` scenario carries a defender-owned controller at the objective (the world plumbing the
+    /// declaim stop-condition reads — even though the attacker's kernel does not yet target controllers,
+    /// ADR 0025 §11 #11 / §12 fallback #4).
+    #[test]
+    fn imported_declaim_has_a_controller() {
+        let g = ImportedRoom { multi_room: false, n_comps: 1 };
+        let declaim = (0..g.count()).map(|i| g.generate(i)).find(|s| s.objectives[0].kind == ObjectiveKind::Declaim).expect("a declaim scenario exists");
+        let ctrl = &declaim.world.controllers;
+        assert!(!ctrl.is_empty(), "declaim scenario has a controller");
+        assert!(ctrl.iter().any(|c| c.owner == Some(generate::DEFENDER) && c.pos == declaim.objectives[0].pos), "the controller is defender-owned at the objective tile");
+    }
+
+    /// The traversal lens over REAL terrain: a moving managed squad navigates an imported single-room
+    /// `Raze` base + reaches/engages the objective (or is wiped trying). Gates on REACH across the real
+    /// fixtures — the operator's "terrain renders + a squad navigates it" Stage 1/2 smoke test.
+    #[test]
+    fn imported_room_navigable() {
+        let g = ImportedRoom { multi_room: false, n_comps: 1 };
+        // The Raze fixtures are indices 0..fixtures (kind index 0). Field the moving squad on each.
+        let raze: Vec<_> = (0..g.count()).map(|i| g.generate(i)).filter(|s| s.objectives[0].kind == ObjectiveKind::Raze).collect();
+        assert!(!raze.is_empty(), "there are single-room Raze fixtures");
+        let mut passed = 0;
+        for s in &raze {
+            let mut v = ManagedSquadIntegration;
+            if v.validate(s).pass {
+                passed += 1;
+            }
+        }
+        assert!(passed * 5 >= raze.len() * 3, "the managed squad navigates most real-terrain bases ({passed}/{} reached/engaged)", raze.len());
+    }
+
+    /// The multi-room imported variant is well-formed: it stages the assault in a DIFFERENT room than the
+    /// objective and stays assessable (the cross-border REACH on real terrain is the standing §11 #10
+    /// caveat, so this gates on well-formedness + oracle-assessability, not strict crossing).
+    #[test]
+    fn multi_room_imported_is_assessable() {
+        let g = ImportedRoom { multi_room: true, n_comps: 1 };
+        assert!(g.count() > 0, "multi-room imported offers scenarios");
+        let mut v = OracleCalibration::new();
+        let report = run_suite(&g, &mut v);
+        assert_eq!(report.verdicts.len(), g.count() as usize, "a verdict per scenario");
+        for i in 0..g.count() {
+            let s = g.generate(i);
+            let o = &s.objectives[0];
+            assert_ne!(o.entry.room_name(), o.room, "multi-room#{i} stages in a different room than the objective");
+        }
     }
 
     /// ADR 0024 regression gate: the hierarchical positioning fix drove period-2 ("A-B-A") movement

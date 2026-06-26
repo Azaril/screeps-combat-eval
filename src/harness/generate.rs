@@ -4,9 +4,10 @@
 //! calibration runs on (the Move B draws, now behind the seam). Phases B/C add permutation, designed,
 //! and multi-room generators + opponent force specs.
 
-use crate::harness::scenario::{Objective, Scenario};
+use crate::harness::scenario::{Objective, ObjectiveKind, Scenario};
+use crate::harness::terrain_import::{decode_terrain, fixtures, TerrainFixture};
 use screeps::{Part, Position, RoomCoordinate, RoomName};
-use screeps_combat_engine::{CombatWorld, PlayerId, SimBody, SimCreep, StructureKind};
+use screeps_combat_engine::{CombatTerrain, CombatWorld, PlayerId, SimBody, SimController, SimCreep, StructureKind};
 use screeps_combat_agent::scenario::ScenarioBuilder;
 
 pub const ATTACKER: PlayerId = 0;
@@ -124,6 +125,7 @@ impl Generator for RandomDefendedBase {
             front_tiles,
             support_tiles,
             entry: pos_in(rm, CORE.0 - 10, CORE.1), // a clear western approach for a moving assault
+            kind: ObjectiveKind::Raze,
         };
 
         Scenario {
@@ -292,6 +294,7 @@ fn assemble_single_room(
         front_tiles,
         support_tiles,
         entry: pos_in(rm, core.0 - 11, core.1),
+        kind: ObjectiveKind::Raze,
     };
     Scenario {
         world,
@@ -424,6 +427,7 @@ fn twin_room_siege() -> Scenario {
         support_tiles,
         // Stage near the W1N1 west border so the cross into W2N1 is a short, reliably-pathable hop.
         entry: Position::new(RoomCoordinate::new(5).unwrap(), RoomCoordinate::new(25).unwrap(), home),
+        kind: ObjectiveKind::Raze,
     };
     Scenario {
         world,
@@ -434,5 +438,209 @@ fn twin_room_siege() -> Scenario {
         onsite_budget: 1400,
         label: "designed#4 twin-room-siege".into(),
         seed: 4,
+    }
+}
+
+// ── ADR 0025 §12 Stage 2: scenarios over REAL imported terrain ──────────────────────────────────────
+
+/// The objective kinds the imported-room generator enumerates — a VARIETY of attacker goals over real
+/// terrain (ADR 0025 §12 Stage 2).
+const OBJECTIVE_KINDS: [ObjectiveKind; 5] =
+    [ObjectiveKind::Raze, ObjectiveKind::Breach, ObjectiveKind::Secure, ObjectiveKind::Farm, ObjectiveKind::Declaim];
+
+/// Nearest non-wall interior tile (1..=48) to `(tx,ty)` by 8-connected BFS — anchors a base on real
+/// terrain. (The fixture's own object coords are not reliably aligned to the terrain index — the Stage 1
+/// caveat — so placement is derived from the decoded terrain itself.)
+fn nearest_open(terrain: &CombatTerrain, tx: u8, ty: u8) -> (u8, u8) {
+    use std::collections::{HashSet, VecDeque};
+    let open = |x: i32, y: i32| (1..=48).contains(&x) && (1..=48).contains(&y) && !terrain.is_wall(x as u8, y as u8);
+    let mut seen: HashSet<(i32, i32)> = HashSet::new();
+    let mut q = VecDeque::from([(tx as i32, ty as i32)]);
+    while let Some((x, y)) = q.pop_front() {
+        if !seen.insert((x, y)) {
+            continue;
+        }
+        if open(x, y) {
+            return (x as u8, y as u8);
+        }
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)] {
+            let (nx, ny) = (x + dx, y + dy);
+            if (0..50).contains(&nx) && (0..50).contains(&ny) {
+                q.push_back((nx, ny));
+            }
+        }
+    }
+    (25, 25)
+}
+
+/// The 4-connected open component reachable from `start` — the navigable region the squad shares with the
+/// objective (guarantees a chosen entry can path to the core).
+fn open_component(terrain: &CombatTerrain, start: (u8, u8)) -> Vec<(u8, u8)> {
+    use std::collections::HashSet;
+    let open = |x: i32, y: i32| (0..50).contains(&x) && (0..50).contains(&y) && !terrain.is_wall(x as u8, y as u8);
+    let mut seen: HashSet<(u8, u8)> = HashSet::new();
+    let mut stack = vec![(start.0 as i32, start.1 as i32)];
+    let mut out = Vec::new();
+    while let Some((x, y)) = stack.pop() {
+        if !open(x, y) {
+            continue;
+        }
+        let t = (x as u8, y as u8);
+        if !seen.insert(t) {
+            continue;
+        }
+        out.push(t);
+        stack.extend([(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]);
+    }
+    out
+}
+
+/// The room one step WEST of `room` (the multi-room staging room): `E{n}`->`E{n-1}` (`E0`->`W0`),
+/// `W{n}`->`W{n+1}`. Falls back to the synthetic home if parsing fails.
+fn west_neighbor(room: RoomName) -> RoomName {
+    let s = room.to_string();
+    let parse = || -> Option<RoomName> {
+        let ew = s.chars().next()?;
+        let n_split = s[1..].find(['N', 'S'])? + 1;
+        let x: i32 = s[1..n_split].parse().ok()?;
+        let ns_and_y = &s[n_split..];
+        let (new_ew, new_x) = match ew {
+            'E' if x > 0 => ('E', x - 1),
+            'E' => ('W', 0),
+            'W' => ('W', x + 1),
+            _ => return None,
+        };
+        format!("{new_ew}{new_x}{ns_and_y}").parse().ok()
+    };
+    parse().unwrap_or_else(|| "W1N1".parse().unwrap())
+}
+
+/// Realize a fixture's REAL terrain + a kind-appropriate objective + a seeded random DEFENDER force into a
+/// [`Scenario`] (ADR 0025 §12 Stage 2). Base placement is derived from the decoded terrain (clear,
+/// navigable tiles), not the fixture's object coords. `multi_room` stages the moving assault in the
+/// western-neighbour room so it crosses the border to engage.
+fn assemble_imported(fixture: &TerrainFixture, kind: ObjectiveKind, comp_seed: u32, multi_room: bool) -> Scenario {
+    let mut rng = Rng::seeded(comp_seed.wrapping_mul(31).wrapping_add(kind as u32 + 1));
+    let terrain = decode_terrain(&fixture.terrain);
+    let target: RoomName = fixture.room.parse().unwrap_or_else(|_| room());
+    let p = |x: u8, y: u8| pos_in(target, x, y);
+
+    // Anchor the base in the navigable interior near room centre; derive the breach staging from clear tiles.
+    let core = nearest_open(&terrain, 25, 25);
+    let component = open_component(&terrain, core);
+    let comp_set: std::collections::HashSet<(u8, u8)> = component.iter().copied().collect();
+    let neigh = |c: (u8, u8)| {
+        [(-1i32, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)].into_iter().filter_map(move |(dx, dy)| {
+            let (nx, ny) = (c.0 as i32 + dx, c.1 as i32 + dy);
+            ((0..50).contains(&nx) && (0..50).contains(&ny)).then_some((nx as u8, ny as u8))
+        })
+    };
+    let mut front: Vec<(u8, u8)> = neigh(core).filter(|t| comp_set.contains(t)).take(4).collect();
+    if front.is_empty() {
+        front.push(core);
+    }
+    let assault = front[0];
+    let support: Vec<(u8, u8)> = neigh(assault).filter(|t| comp_set.contains(t) && *t != core && !front.contains(t)).take(3).collect();
+    let entry_xy = component.iter().copied().min_by_key(|&(x, _)| x).unwrap_or(core);
+
+    // ── world: real terrain + a realistic base in the target room ──
+    let mut b = ScenarioBuilder::empty(target).in_room(target);
+    *b.world_mut().terrain_mut(target) = terrain;
+    let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000);
+    let rampart_hits = rng.range(15_000, 70_000); // the breach gate shielding the core
+    let breach_id = b.structure(StructureKind::Rampart, Some(DEFENDER), core.0, core.1, rampart_hits, rampart_hits);
+    // 1-3 energized towers spread over open tiles a few rings out from the core.
+    let tower_tiles: Vec<(u8, u8)> = component
+        .iter()
+        .copied()
+        .filter(|&t| {
+            let d = (t.0 as i32 - core.0 as i32).abs().max((t.1 as i32 - core.1 as i32).abs());
+            (3..=8).contains(&d)
+        })
+        .collect();
+    let n_towers = rng.range(1, 3).min(tower_tiles.len() as u32);
+    let stride = (tower_tiles.len() / n_towers.max(1) as usize).max(1);
+    for i in 0..n_towers as usize {
+        if let Some(&(tx, ty)) = tower_tiles.get(i * stride) {
+            b.tower(DEFENDER, tx, ty, 100_000);
+        }
+    }
+    let mut world = b.build();
+
+    // ── defenders: a seeded random force on near-core open tiles ──
+    let n_def = rng.range(1, 3);
+    let bodies = crate::harness::roster::random_squad(&mut rng, 2300, n_def as u8);
+    let mut def_tiles: Vec<(u8, u8)> = component.iter().copied().filter(|&t| t != core && !front.contains(&t)).collect();
+    def_tiles.sort_by_key(|&(x, y)| (x as i32 - core.0 as i32).abs().max((y as i32 - core.1 as i32).abs()));
+    for (i, body) in bodies.iter().enumerate() {
+        if let Some(&(dx, dy)) = def_tiles.get(i) {
+            world.creeps.push(SimCreep { id: 10_000 + i as u32, owner: DEFENDER, pos: pos_in(target, dx, dy), body: SimBody::unboosted(body), fatigue: 0 });
+        }
+    }
+
+    // ── declaim: a controller at the core ──
+    if kind == ObjectiveKind::Declaim {
+        world.controllers.push(SimController { pos: p(core.0, core.1), owner: Some(DEFENDER), downgrade_ticks: 50_000 });
+    }
+
+    // Breach targets the rampart gate; every other kind targets the spawn core. Declaim's stop condition
+    // reads the controller at `pos` (= the core tile).
+    let obj_id = if kind == ObjectiveKind::Breach { breach_id } else { core_id };
+    let entry = if multi_room {
+        // Stage at the western-neighbour room's EAST border so the cross into the target is a short hop.
+        pos_in(west_neighbor(target), 48, entry_xy.1.clamp(1, 48))
+    } else {
+        p(entry_xy.0, entry_xy.1)
+    };
+
+    let objective = Objective {
+        id: obj_id,
+        room: target,
+        pos: p(core.0, core.1),
+        assault_pos: p(assault.0, assault.1),
+        front_tiles: front.iter().map(|&(x, y)| p(x, y)).collect(),
+        support_tiles: support.iter().map(|&(x, y)| p(x, y)).collect(),
+        entry,
+        kind,
+    };
+    Scenario {
+        world,
+        objectives: vec![objective],
+        attacker_owner: ATTACKER,
+        defender_owner: DEFENDER,
+        member_energy: 12_900,
+        onsite_budget: 1400,
+        label: format!("imported-{}{}-{kind:?}#{comp_seed}", fixture.room, if multi_room { "-multi" } else { "" }),
+        seed: comp_seed as u64,
+    }
+}
+
+/// Scenarios over committed REAL terrain (Stage 1 fixtures) × objective kind × defender-comp seed (ADR
+/// 0025 §12 Stage 2). Single-room by default; `multi_room` stages the assault in the western neighbour and
+/// crosses the border. `count = fixtures × OBJECTIVE_KINDS × n_comps`.
+pub struct ImportedRoom {
+    pub multi_room: bool,
+    pub n_comps: u32,
+}
+
+impl Generator for ImportedRoom {
+    fn label(&self) -> &str {
+        if self.multi_room {
+            "imported-room-multi"
+        } else {
+            "imported-room"
+        }
+    }
+    fn count(&self) -> u32 {
+        fixtures().len() as u32 * OBJECTIVE_KINDS.len() as u32 * self.n_comps.max(1)
+    }
+    fn generate(&self, index: u32) -> Scenario {
+        let fx = fixtures();
+        let n = fx.len() as u32;
+        let k = OBJECTIVE_KINDS.len() as u32;
+        let fixture = &fx[(index % n) as usize];
+        let kind = OBJECTIVE_KINDS[((index / n) % k) as usize];
+        let comp_seed = index / (n * k);
+        assemble_imported(fixture, kind, comp_seed, self.multi_room)
     }
 }
