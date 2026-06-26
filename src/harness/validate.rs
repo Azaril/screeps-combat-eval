@@ -319,14 +319,56 @@ fn managed_assault_comp(_scenario: &Scenario) -> SquadComposition {
 /// Place `comp`'s members as attacker creeps clustered at the objective's ENTRY (a MOVING assault),
 /// returning their ids in slot order (the `ManagedSimSquad` roster). `None` ⇒ a body wouldn't build.
 fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposition, attacker: PlayerId, energy: u32) -> Option<Vec<CreepId>> {
-    const OFF: [(i32, i32); 9] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
     let (ex, ey, rm) = (obj.entry.x().u8() as i32, obj.entry.y().u8() as i32, obj.entry.room_name());
+    let need = comp.slots.len();
+    // DISTINCT in-bounds, non-wall, unoccupied tiles — one creep per tile, ALWAYS. The previous version
+    // spread the original 9 offsets then `.clamp(0,49)`'d them, which COLLAPSED out-of-bounds offsets onto
+    // the edge whenever the entry sat on a room boundary (the multi-room base scenarios stage the squad on
+    // the border tile) — spawning two creeps on one tile. That illegal start state (a creep stack the real
+    // server can never produce) was then transported across the border by the occupancy-blind edge-exit
+    // relocation; it is the true source of the sim's "two creeps on a tile". Fix: keep the legacy 9-offset
+    // SHAPE first (so a normal in-bounds entry is placed byte-identically — no dynamics change for the
+    // single-room beds), but SKIP (never clamp) any out-of-bounds / wall / already-taken tile and fall back
+    // to expanding rings only when an edge entry leaves the 9 short. Collision-free either way.
+    const OFF: [(i32, i32); 9] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+    let tiles: Vec<(u8, u8)> = {
+        let terrain = world.terrain_for(rm);
+        let mut taken: std::collections::HashSet<(u8, u8)> =
+            world.creeps.iter().filter(|c| c.pos.room_name() == rm).map(|c| (c.pos.x().u8(), c.pos.y().u8())).collect();
+        let mut offsets: Vec<(i32, i32)> = OFF.to_vec();
+        for r in 2..=10i32 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs().max(dy.abs()) == r {
+                        offsets.push((dx, dy));
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(u8, u8)> = Vec::with_capacity(need);
+        for (dx, dy) in offsets {
+            if out.len() == need {
+                break;
+            }
+            let (x, y) = (ex + dx, ey + dy);
+            if !(0..=49).contains(&x) || !(0..=49).contains(&y) {
+                continue; // SKIP off-room (never clamp — clamping is what stacked creeps)
+            }
+            let (x, y) = (x as u8, y as u8);
+            if terrain.is_wall(x, y) || !taken.insert((x, y)) {
+                continue; // wall or already taken → skip (never reuse a tile)
+            }
+            out.push((x, y));
+        }
+        out
+    };
+    if tiles.len() < need {
+        return None; // not enough free tiles near the entry to field the whole squad
+    }
     let mut ids = Vec::new();
-    for (i, slot) in comp.slots.iter().enumerate().take(OFF.len()) {
+    for (i, slot) in comp.slots.iter().enumerate() {
         let body = slot.body_type.build_body(energy, MoveProfile::Plains)?;
-        let (dx, dy) = OFF[i];
-        let x = (ex + dx).clamp(0, 49) as u8;
-        let y = (ey + dy).clamp(0, 49) as u8;
+        let (x, y) = tiles[i];
         let id = i as u32 + 1;
         let pos = Position::new(screeps::RoomCoordinate::new(x).unwrap(), screeps::RoomCoordinate::new(y).unwrap(), rm);
         world.creeps.push(SimCreep { id, owner: attacker, pos, body: SimBody::unboosted(&body), fatigue: 0 });
@@ -718,4 +760,37 @@ fn siege_ceiling(energy: u32) -> SquadComposition {
         }
     }
     SquadComposition { label: "Siege Ceiling".into(), slots, formation_shape: Default::default(), formation_mode: Default::default(), retreat_threshold: 0.3 }
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    /// INVARIANT (operator): no two creeps ever occupy the same tile. The cross-room relocation is
+    /// occupancy-blind (faithful to the engine), but each exit tile maps to a UNIQUE mirror and every tile
+    /// holds ≤1 creep, so the cross is a PERMUTATION — a stack can't form from movement. The only historical
+    /// source was a harness placement bug (`place_at_entry`'s clamp-collapse onto an edge), now fixed. This
+    /// scans every recorded tick of a representative set of base assaults (which all cross rooms to reach
+    /// the objective) for a same-tile pair.
+    #[test]
+    fn sim_maintains_one_creep_per_tile() {
+        let scenarios = crate::tournament::realistic_base_scenarios();
+        let tactics = screeps_combat_decision::kite::SquadTacticParams::breach();
+        for scenario in scenarios.iter().take(12) {
+            let obj = &scenario.objectives[0];
+            let (comp, _) = choose_fielded_comp(scenario, obj);
+            if let Some((_, rec)) = run_managed_assault_with(scenario, obj, &comp, tactics) {
+                for (t, frame) in rec.frames.iter().enumerate() {
+                    let mut seen = std::collections::HashSet::new();
+                    for c in &frame.creeps {
+                        assert!(
+                            seen.insert((format!("{}", c.room), c.x, c.y)),
+                            "stack in {} at tick {t}: two creeps on ({},{},{})",
+                            scenario.label, c.x, c.y, c.room
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
