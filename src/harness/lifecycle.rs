@@ -270,6 +270,22 @@ pub fn run_defended_lifecycle_with(
     layout: crate::harness::generate::Layout,
     force: crate::harness::generate::ForceSpec,
 ) -> LifecycleOutcome {
+    // The Default-knob regime (the seed): the acceptance gate routes through here unchanged.
+    run_defended_lifecycle_with_params(s, rampart_hits, towers, layout, force, &screeps_combat_decision::composition::CompositionParams::default())
+}
+
+/// As [`run_defended_lifecycle_with`] but driven by a [`CompositionParams`] knob set (the param-sweep seam,
+/// ADR 0031 D16/D17 / 0031a §4): the breach force is emitted with `params.hold_margin`/`over_power_margin`
+/// and assembled at `min(params.member_energy, bed capacity)`. `Default` params reproduce the seed exactly
+/// (HOLD_MARGIN / COORDINATED_DPS_MARGIN / PREFERRED_MEMBER_ENERGY), so the acceptance gate is unchanged.
+pub fn run_defended_lifecycle_with_params(
+    s: &ColonyFormingScenario,
+    rampart_hits: u32,
+    towers: &[((u8, u8), u32)],
+    layout: crate::harness::generate::Layout,
+    force: crate::harness::generate::ForceSpec,
+    params: &screeps_combat_decision::composition::CompositionParams,
+) -> LifecycleOutcome {
     use crate::harness::evaluate::StopReason;
     use crate::harness::generate::assemble_single_room;
     use crate::harness::validate::{derive_profile, run_managed_assault_with, siege_ceiling};
@@ -312,6 +328,8 @@ pub fn run_defended_lifecycle_with(
         Some(ef) if ef.count > 1 || ef.heal > 0.0 => EnemyCoordination::Coordinated,
         _ => EnemyCoordination::Individual,
     };
+    // The swept per-member cap never exceeds the home capacity (the bed's `member_energy`).
+    let sizing_energy = params.member_energy.min(engage.member_energy);
     let (assessment, required) = emit_requirement(
         DoctrineObjective::DismantleStructure,
         &profile,
@@ -319,13 +337,15 @@ pub fn run_defended_lifecycle_with(
         Some(&budget),
         coordination,
         0.0,
-        screeps_combat_decision::force_sizing::HOLD_MARGIN,
-        screeps_combat_decision::force_sizing::COORDINATED_DPS_MARGIN,
+        params.hold_margin,
+        params.over_power_margin,
     );
-    let comp = match (assessment.winnable && assessment.mode == AssaultMode::Breach, assemble_force(&required, engage.member_energy)) {
+    let comp = match (assessment.winnable && assessment.mode == AssaultMode::Breach, assemble_force(&required, sizing_energy)) {
         (true, Some(assembled)) => assembled,
         // The oracle deferred / drained / the assembler couldn't field the required force at this energy —
         // field the ceiling so the chain still runs (the test then surfaces whether even the ceiling kills).
+        // The ceiling fallback uses the HOME capacity (not the swept per-member cap) so the Default path is
+        // byte-identical to the pre-sweep behaviour (which sized the fallback at `engage.member_energy`).
         _ => siege_ceiling(engage.member_energy),
     };
 

@@ -76,15 +76,22 @@ impl Calibration {
 }
 
 /// The oracle-calibration validator. Holds the cross-scenario [`Calibration`] tally (read via
-/// [`OracleCalibration::tally`] after a suite run); each [`Validator::validate`] updates it.
+/// [`OracleCalibration::tally`] after a suite run); each [`Validator::validate`] updates it. The
+/// `params` field is the TUNING SEAM (ADR 0031 D16/D17): a sweep injects a non-Default `CompositionParams`
+/// to grade alternative knob sets; `Default`/`new()` reproduce the shipped fielding seeds.
 #[derive(Default)]
 pub struct OracleCalibration {
     tally: Calibration,
+    params: screeps_combat_decision::composition::CompositionParams,
 }
 
 impl OracleCalibration {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Build a calibration validator that grades against the given knob set (the sweep injector).
+    pub fn with_params(params: screeps_combat_decision::composition::CompositionParams) -> Self {
+        Self { tally: Calibration::default(), params }
     }
     pub fn tally(&self) -> &Calibration {
         &self.tally
@@ -105,7 +112,7 @@ impl Validator for OracleCalibration {
         // SYSTEM can field (the ceiling), not the bare template.
         let ceiling = siege_ceiling(scenario.member_energy);
         let budget = ceiling.force_budget(scenario.member_energy, scenario.onsite_budget);
-        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy, defender_force(scenario));
+        let plan = siege_doctrine_plan_with(profile, budget, scenario.member_energy, defender_force(scenario), &self.params);
 
         if plan.winnable() {
             if plan.assessment.mode == AssaultMode::Drain {
@@ -198,6 +205,24 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
 const CALIBRATION_TARGET_VALUE: f32 = 1_000_000.0;
 
 pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32, enemy_force: Option<EnemyForce>) -> ForcePlan {
+    // The Default-knob plan (the seed): the calibration gates + every existing caller route through here, so
+    // Default must reproduce the shipped fielding seeds (ADR 0031 D16 — Default is behavior-preserving).
+    siege_doctrine_plan_with(profile, budget, member_energy, enemy_force, &screeps_combat_decision::composition::CompositionParams::default())
+}
+
+/// As [`siege_doctrine_plan`] but with chosen [`CompositionParams`] — the TUNING SEAM the param sweep
+/// injects through (ADR 0031 D16/D17 / 0031a §4). `params.member_energy` is clamped to the bed's home
+/// capacity (`member_energy`) — the swept per-member cap can never exceed what the home affords (matching
+/// `optimize_composition`'s `min(member_energy, …)` probe). The rest of `params` (hold/over-power/dynamic/
+/// commit-EV/cost weights) is threaded verbatim into the doctrine's `EngagementContext` → `plan_engagement`
+/// → `optimize_composition`/`emit_requirement` (already param-driven since ADR 0031 P2/P3).
+pub(crate) fn siege_doctrine_plan_with(
+    profile: DefenseProfile,
+    budget: ForceBudget,
+    member_energy: u32,
+    enemy_force: Option<EnemyForce>,
+    params: &screeps_combat_decision::composition::CompositionParams,
+) -> ForcePlan {
     // Coordination from the OBSERVED defenders: grouped (count > 1) or self-healing → Coordinated over-match;
     // none → Individual. (ADR 0031 P1b: feeding `enemy_force` is what triggers the SiegeBreach anti-creep
     // fusion on a defended bed; a creep-free bed passes `None` → the structure path is unperturbed.)
@@ -205,20 +230,21 @@ pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, 
         Some(ef) if ef.count > 1 || ef.heal > 0.0 => EnemyCoordination::Coordinated,
         _ => EnemyCoordination::Individual,
     };
+    // The swept per-member cap never exceeds the home's capacity (the bed's `member_energy`).
+    let effective_member_energy = params.member_energy.min(member_energy);
     let ctx = EngagementContext {
         objective: DoctrineObjective::DismantleStructure,
         coordination,
         defense: profile,
         enemy_force,
         importance: 0.0,
-        member_energy,
+        member_energy: effective_member_energy,
         // ADR 0031 D16: target_value high enough that "EV > commit" ⇔ "winnable", so the OracleCalibration
         // FP/FN semantics (winnable→fielded→breached) are PRESERVED — a low value must NOT turn winnable
-        // beds into defers. window = the scenario's on-site budget (carried on `budget`); Default knobs +
-        // the eval's member energy.
+        // beds into defers. window = the scenario's on-site budget (carried on `budget`).
         target_value: CALIBRATION_TARGET_VALUE,
         onsite_window: budget.onsite_budget_ticks,
-        params: screeps_combat_decision::composition::CompositionParams { member_energy, ..Default::default() },
+        params: screeps_combat_decision::composition::CompositionParams { member_energy: effective_member_energy, ..*params },
     };
     let doctrines = default_doctrines();
     let doctrine = decide_doctrine(&ctx, &doctrines).expect("DismantleStructure routes to the siege-breach doctrine");
@@ -650,6 +676,11 @@ impl Validator for SelfPlay {
 pub struct SizingWins {
     pub attempted: u32,
     pub won: u32,
+    /// Total spawn cost of the WINNING fielded forces — the efficiency signal the sweep ranks on (cheapest
+    /// force that still wins). Summed only over wins (a lost force's cost is not a "cost per win").
+    pub winning_spawn_cost: u64,
+    /// The TUNING SEAM (ADR 0031 D16/D17): the knob set the sized force is built with. `Default` = the seed.
+    pub params: screeps_combat_decision::composition::CompositionParams,
 }
 impl SizingWins {
     pub fn win_rate(&self) -> f64 {
@@ -657,6 +688,19 @@ impl SizingWins {
             0.0
         } else {
             self.won as f64 / self.attempted as f64
+        }
+    }
+    /// Build a sizing validator that fields against the given knob set (the sweep injector).
+    pub fn with_params(params: screeps_combat_decision::composition::CompositionParams) -> Self {
+        Self { params, ..Default::default() }
+    }
+    /// Mean spawn cost per WIN — the efficiency metric (cheapest winning force; lower is better). 0 when
+    /// nothing won.
+    pub fn mean_cost_per_win(&self) -> f64 {
+        if self.won == 0 {
+            0.0
+        } else {
+            self.winning_spawn_cost as f64 / self.won as f64
         }
     }
 }
@@ -668,13 +712,17 @@ impl Validator for SizingWins {
         let obj = &scenario.objectives[0];
         let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
         let budget = siege_ceiling(scenario.member_energy).force_budget(scenario.member_energy, scenario.onsite_budget);
-        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy, defender_force(scenario));
+        let plan = siege_doctrine_plan_with(profile, budget, scenario.member_energy, defender_force(scenario), &self.params);
         if plan.winnable() && plan.assessment.mode == AssaultMode::Breach {
             if let Some(sized) = plan.composition {
                 if let Some(breached) = breaches(scenario, obj, &sized) {
                     self.attempted += 1;
                     if breached {
                         self.won += 1;
+                        // Efficiency: the spawn cost of the winning force (per-member energy capped like the
+                        // sizing probe) — the "cheapest force that still wins" signal the sweep ranks on.
+                        let probe = self.params.member_energy.min(scenario.member_energy);
+                        self.winning_spawn_cost += sized.estimated_cost(probe) as u64;
                     }
                     return Verdict { pass: breached, label: self.label().into(), detail: format!("fielded → {}", if breached { "WON" } else { "lost" }) };
                 }
@@ -738,6 +786,32 @@ pub fn clear_outcome_at(scenario: &Scenario, dps_margin: f32) -> Option<ClearOut
     })
 }
 
+/// As [`clear_outcome_at`] but driven by a [`CompositionParams`] knob set (the sweep seam, ADR 0031 D16/D17):
+/// the over-match `dps_margin` is `params.over_power_margin` (when the bed's force is coordinated; a lone
+/// enemy still uses `1.0`), and the per-member cap is `min(params.member_energy, bed capacity)` — so the
+/// member_energy + over_power knobs drive the creep-clear bed exactly as they drive the structure bed.
+pub fn clear_outcome_with(scenario: &Scenario, params: &screeps_combat_decision::composition::CompositionParams) -> Option<ClearOutcome> {
+    let obj = &scenario.objectives[0];
+    let (enemy_dps, enemy_hits, enemy_heal, coordinated) = enemy_force_of(scenario);
+    let dps_margin = if coordinated { params.over_power_margin } else { 1.0 };
+    let probe = params.member_energy.min(scenario.member_energy);
+    let budget = optimizer_ceiling_budget(DoctrineObjective::ClearCreeps, probe, scenario.onsite_budget);
+    let (assessment, required) = clear_force(vec![], enemy_dps, enemy_hits, enemy_heal, &budget, dps_margin, scenario.world.safe_mode_owner.is_some());
+    if !assessment.winnable {
+        return None;
+    }
+    let comp = assemble_force(&required, probe)?;
+    let spawn_cost = comp.estimated_cost(probe);
+    let (outcome, _) = run_managed_assault_with(scenario, obj, &comp, screeps_combat_decision::kite::SquadTacticParams::open_combat())?;
+    Some(ClearOutcome {
+        cleared: outcome.stop == StopReason::SideWiped(scenario.defender_owner),
+        ticks: outcome.ticks,
+        spawn_cost,
+        ranged: required.anti_creep_parts,
+        heal: required.heal_parts,
+    })
+}
+
 /// CREEP-CLEAR sizing GATE (ADR 0026 §9.8/§9.10 L6a): does `force_sizing::clear_force` size a squad that
 /// actually CLEARS the defender creep force it was sized against? Picks the coordination margin from the
 /// observed force ([`enemy_force_of`]) and fields it ([`clear_outcome_at`]); `SideWiped(defender)` = cleared.
@@ -746,6 +820,10 @@ pub fn clear_outcome_at(scenario: &Scenario, dps_margin: f32) -> Option<ClearOut
 pub struct CreepClearWins {
     pub attempted: u32,
     pub won: u32,
+    /// Total spawn cost of the WINNING fielded forces (the efficiency signal — cheapest force that clears).
+    pub winning_spawn_cost: u64,
+    /// The TUNING SEAM (ADR 0031 D16/D17): `Default` = the seed (`COORDINATED_DPS_MARGIN`), else the swept knobs.
+    pub params: screeps_combat_decision::composition::CompositionParams,
 }
 
 impl CreepClearWins {
@@ -756,6 +834,18 @@ impl CreepClearWins {
             self.won as f64 / self.attempted as f64
         }
     }
+    /// Build a creep-clear validator that sizes against the given knob set (the sweep injector).
+    pub fn with_params(params: screeps_combat_decision::composition::CompositionParams) -> Self {
+        Self { params, ..Default::default() }
+    }
+    /// Mean spawn cost per cleared bed (cheapest winning force; lower is better). 0 when nothing cleared.
+    pub fn mean_cost_per_win(&self) -> f64 {
+        if self.won == 0 {
+            0.0
+        } else {
+            self.winning_spawn_cost as f64 / self.won as f64
+        }
+    }
 }
 
 impl Validator for CreepClearWins {
@@ -763,14 +853,21 @@ impl Validator for CreepClearWins {
         "creep-clear-wins"
     }
     fn validate(&mut self, scenario: &Scenario) -> Verdict {
-        let (_, _, _, coordinated) = enemy_force_of(scenario);
-        let dps_margin = if coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
-        match clear_outcome_at(scenario, dps_margin) {
+        // Default params reproduce the seed (`COORDINATED_DPS_MARGIN`); a swept params injects the knobs.
+        let outcome = if self.params == screeps_combat_decision::composition::CompositionParams::default() {
+            let (_, _, _, coordinated) = enemy_force_of(scenario);
+            let dps_margin = if coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
+            clear_outcome_at(scenario, dps_margin)
+        } else {
+            clear_outcome_with(scenario, &self.params)
+        };
+        match outcome {
             None => Verdict { pass: true, label: self.label().into(), detail: "deferred / unfieldable (excluded)".into() },
             Some(o) => {
                 self.attempted += 1;
                 if o.cleared {
                     self.won += 1;
+                    self.winning_spawn_cost += o.spawn_cost as u64;
                 }
                 Verdict {
                     pass: o.cleared,
