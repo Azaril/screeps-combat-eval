@@ -12,7 +12,7 @@ use screeps_combat_agent::objective_bed::defense_intents;
 use screeps_combat_agent::opponents::tower_intents;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
-use screeps_combat_decision::composition::{assemble_force, force_ceiling, formation_for, BodyType, SquadComposition, SquadRole, SquadSlot};
+use screeps_combat_decision::composition::{assemble_force, formation_for, optimizer_ceiling_budget, BodyType, SquadComposition, SquadRole, SquadSlot};
 use screeps_combat_decision::damage::tower_repair_at_range;
 use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EnemyForce, EngagementContext, ForcePlan};
 use screeps_combat_decision::force_sizing::{clear_force, AssaultMode, DefenseProfile, ForceBudget, TowerThreat, COORDINATED_DPS_MARGIN};
@@ -192,6 +192,11 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
 /// oracle's required force against `budget` (the siege ceiling's, the calibration lens). The returned
 /// `ForcePlan` carries the verdict (`assessment`) + the sized `composition` (`None` = defer / drain /
 /// unfieldable). `importance: 0.0` matches the eval's base-force sizing (`importance_margin(0)` = 1×).
+/// A deliberately HIGH target value so the EV optimizer (ADR 0031 D16) commits ANY winnable bed (EV > 0 ⇒
+/// EV > commit threshold 0) — preserving the OracleCalibration FP/FN semantics (the calibration grades
+/// winnable→fielded→breached; a low value must not turn winnable beds into defers).
+const CALIBRATION_TARGET_VALUE: f32 = 1_000_000.0;
+
 pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32, enemy_force: Option<EnemyForce>) -> ForcePlan {
     // Coordination from the OBSERVED defenders: grouped (count > 1) or self-healing → Coordinated over-match;
     // none → Individual. (ADR 0031 P1b: feeding `enemy_force` is what triggers the SiegeBreach anti-creep
@@ -207,6 +212,13 @@ pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, 
         enemy_force,
         importance: 0.0,
         member_energy,
+        // ADR 0031 D16: target_value high enough that "EV > commit" ⇔ "winnable", so the OracleCalibration
+        // FP/FN semantics (winnable→fielded→breached) are PRESERVED — a low value must NOT turn winnable
+        // beds into defers. window = the scenario's on-site budget (carried on `budget`); Default knobs +
+        // the eval's member energy.
+        target_value: CALIBRATION_TARGET_VALUE,
+        onsite_window: budget.onsite_budget_ticks,
+        params: screeps_combat_decision::composition::CompositionParams { member_energy, ..Default::default() },
     };
     let doctrines = default_doctrines();
     let doctrine = decide_doctrine(&ctx, &doctrines).expect("DismantleStructure routes to the siege-breach doctrine");
@@ -709,7 +721,7 @@ pub struct ClearOutcome {
 pub fn clear_outcome_at(scenario: &Scenario, dps_margin: f32) -> Option<ClearOutcome> {
     let obj = &scenario.objectives[0];
     let (enemy_dps, enemy_hits, enemy_heal, _) = enemy_force_of(scenario);
-    let budget = force_ceiling(scenario.member_energy, SquadRole::RangedDPS).force_budget(scenario.member_energy, scenario.onsite_budget);
+    let budget = optimizer_ceiling_budget(DoctrineObjective::ClearCreeps, scenario.member_energy, scenario.onsite_budget);
     let (assessment, required) = clear_force(vec![], enemy_dps, enemy_hits, enemy_heal, &budget, dps_margin, scenario.world.safe_mode_owner.is_some());
     if !assessment.winnable {
         return None;

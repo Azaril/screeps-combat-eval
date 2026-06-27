@@ -312,7 +312,16 @@ pub fn run_defended_lifecycle_with(
         Some(ef) if ef.count > 1 || ef.heal > 0.0 => EnemyCoordination::Coordinated,
         _ => EnemyCoordination::Individual,
     };
-    let (assessment, required) = emit_requirement(DoctrineObjective::DismantleStructure, &profile, defenders, Some(&budget), coordination, 0.0);
+    let (assessment, required) = emit_requirement(
+        DoctrineObjective::DismantleStructure,
+        &profile,
+        defenders,
+        Some(&budget),
+        coordination,
+        0.0,
+        screeps_combat_decision::force_sizing::HOLD_MARGIN,
+        screeps_combat_decision::force_sizing::COORDINATED_DPS_MARGIN,
+    );
     let comp = match (assessment.winnable && assessment.mode == AssaultMode::Breach, assemble_force(&required, engage.member_energy)) {
         (true, Some(assembled)) => assembled,
         // The oracle deferred / drained / the assembler couldn't field the required force at this energy —
@@ -351,13 +360,21 @@ pub fn run_defended_lifecycle_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use screeps_combat_decision::composition::{force_ceiling, SquadRole};
+    use screeps_combat_decision::composition::assemble_force;
+    use screeps_combat_decision::force_sizing::RequiredForce;
+
+    /// A multi-slot placeholder composition (assembled template-free, ADR 0031 D16) the forming tests
+    /// override with the oracle-sized one; several RANGED + several HEAL members at the home cap.
+    fn placeholder_comp() -> SquadComposition {
+        assemble_force(&RequiredForce { heal_parts: 40, immune_struct_parts: 30, ..Default::default() }, 12_900)
+            .expect("assembles a multi-slot placeholder")
+    }
 
     /// Build a forming scenario: `homes` spawn homes at `income`/tick, combat at `combat_priority` vs a
     /// constant HIGH hauler (75), members live `member_ttl` ticks, `renew` keeps the rallying roster alive.
     fn forming(homes: usize, income: u32, combat_priority: f32, member_ttl: u32, renew: bool, budget: u32) -> ColonyFormingScenario {
         ColonyFormingScenario {
-            composition: force_ceiling(12_900, SquadRole::RangedDPS),
+            composition: placeholder_comp(),
             homes: (0..homes).map(|_| Home { energy_capacity: 5300, income, start_energy: 2000 }).collect(),
             economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
             combat_priority,
@@ -473,7 +490,7 @@ mod tests {
     /// placeholder composition with the oracle-sized one; this only supplies the homes + economy contention.
     fn defended_forming() -> ColonyFormingScenario {
         ColonyFormingScenario {
-            composition: force_ceiling(12_900, SquadRole::RangedDPS), // placeholder — replaced by the oracle-sized comp
+            composition: placeholder_comp(), // placeholder — replaced by the oracle-sized comp
             homes: (0..4).map(|_| Home { energy_capacity: 12_900, income: 1000, start_energy: 12_900 }).collect(),
             economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
             combat_priority: 87.5, // above the hauler (75) → combat wins the lane
