@@ -62,7 +62,7 @@ mod tests {
     use super::*;
     use generate::{CreepClearBed, Designed, ForemanGenerator, ImportedRoom, Permutations};
     use scenario::ObjectiveKind;
-    use validate::{CreepClearWins, ManagedSquadIntegration, SelfPlay, SizingWins};
+    use validate::{clear_outcome_at, CreepClearWins, ManagedSquadIntegration, SelfPlay, SizingWins};
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
     /// the force-sizing oracle is calibrated against the engine — winnable verdicts breach (fp ≤ 1%) and
@@ -126,6 +126,41 @@ mod tests {
         println!("creep-clear win rate: {:.0}% ({}/{} fielded)", v.win_rate() * 100.0, v.won, v.attempted);
         assert!(v.attempted >= 2, "at least some beds fielded a sized squad ({})", v.attempted);
         assert!(v.win_rate() >= 0.75, "clear_force-sized squads should clear most winnable beds (got {:.0}%)", v.win_rate() * 100.0);
+    }
+
+    /// ADR 0026 §9.10 L6b — the `COORDINATED_DPS_MARGIN` sweep on the creep-clear bed. For a range of
+    /// margins, field a `clear_force`-sized squad + score the payoff: winning DOMINATES (1M each), then
+    /// minimize spawn cost (the tiebreak) → the LEANEST margin that reliably clears the whole bed (the
+    /// minimum-favorable-force principle). Prints the curve + the best margin vs the shipped seed. Run with
+    /// `-- --ignored --nocapture`. `#[ignore]` — exploratory tuning, not a CI gate.
+    #[test]
+    #[ignore]
+    fn creep_clear_margin_sweep() {
+        let g = CreepClearBed;
+        let margins = [1.0_f32, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0];
+        let mut best: Option<(f32, i64)> = None;
+        for &m in &margins {
+            let (mut wins, mut fielded, mut cost, mut ticks) = (0u32, 0u32, 0u64, 0u64);
+            for i in 0..g.count() {
+                if let Some(o) = clear_outcome_at(&g.generate(i), m) {
+                    fielded += 1;
+                    if o.cleared {
+                        wins += 1;
+                    }
+                    cost += o.spawn_cost as u64;
+                    ticks += o.ticks as u64;
+                }
+            }
+            // Winning dominates; among margins that clear the same count, lowest spawn cost (then ticks).
+            let payoff = wins as i64 * 1_000_000 - cost as i64 - ticks as i64;
+            println!("margin {m:.2}: {wins}/{fielded} cleared | cost {cost} | ticks {ticks} | payoff {payoff}");
+            if best.map(|(_, p)| payoff > p).unwrap_or(true) {
+                best = Some((m, payoff));
+            }
+        }
+        let (bm, _) = best.expect("swept at least one margin");
+        println!("BEST margin: {bm:.2} (shipped COORDINATED_DPS_MARGIN seed = {:.2})", screeps_combat_decision::force_sizing::COORDINATED_DPS_MARGIN);
+        assert!(bm >= 1.0);
     }
 
     /// Full chain smoke test: Generation → Evaluation(record) → Visualization yields a self-contained
