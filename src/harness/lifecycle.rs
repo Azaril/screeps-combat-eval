@@ -286,7 +286,8 @@ pub fn run_defended_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
     // 2. Size the breach force via the SAME oracle path `SizingWins` uses, against THIS defended world.
     let profile = derive_profile(&engage.world, engage.defender_owner, obj);
     let budget = siege_ceiling(engage.member_energy).force_budget(engage.member_energy, engage.onsite_budget);
-    let plan = siege_doctrine_plan(profile, budget, engage.member_energy);
+    // P1b: feed the observed defenders so SiegeBreach's anti-creep fusion fires (siege_assault_quad).
+    let plan = siege_doctrine_plan(profile, budget, engage.member_energy, crate::harness::validate::defender_force(&engage));
     let comp = match (plan.winnable() && plan.assessment.mode == AssaultMode::Breach, plan.composition) {
         (true, Some(sized)) => sized,
         // The oracle deferred / drained / couldn't field the required force at this energy — field the
@@ -457,16 +458,14 @@ mod tests {
         }
     }
 
-    // KNOWN-FAILING — INTENTIONAL. Do NOT delete this test and do NOT "fix" it by softening the assertion.
-    // It pins the TARGET behavior (ADR 0029 §10 #1): an oracle-sized force, FORMED + MOVING, must KILL a
-    // Guard-defended core. Today it does NOT — the oracle's siege comp (dismantler + healer) has no
-    // anti-creep weapon, so the MOVING brain fixates on the unkillable melee guard and disengages at 0
-    // damage (kite.rs focus_dmg net=0 → safety dominates), while the PRE-PLACED `siege_intents` path wins
-    // ~99%. The redesign (defended-breach force composition) is in review; when it lands, REMOVE `#[ignore]`
-    // — the test should then pass on its own. `#[ignore]` keeps `cargo test` green meanwhile (it reports as
-    // `ignored`, a standing reminder), so other agents should leave it alone until the fix.
+    // The acceptance gate (ADR 0029 §10 #1 / 0031): an oracle-sized force, FORMED + MOVING, must KILL a
+    // Guard-defended core. Was KNOWN-FAILING — the oracle's siege comp (dismantler + healer) had no
+    // anti-creep weapon, so the MOVING brain fixated on the unkillable melee guard and disengaged at 0
+    // damage. NOW PASSES (un-ignored 2026-06-27): ADR 0031 P0a (dismantle counts toward fighting strength →
+    // no retreat at t0) + P1b (SiegeBreach anti-creep fusion → `siege_assault_quad` with a RangedDPS slot →
+    // the squad clears the guard, then breaches). Do NOT soften the assertion; it must keep passing as the
+    // assembler (P3) replaces the fusion.
     #[test]
-    #[ignore = "KNOWN-FAILING pending ADR 0029 §10 #1 (defended-breach force composition); see comment above"]
     fn oracle_sized_force_forms_and_kills_a_defended_core() {
         // The seam-closer (ADR 0029 §10 #1): the oracle sizes the breach force for a DEFENDED core (rampart
         // + tower + a melee guard force), that SAME force is FORMED under economy contention, then TRAVELS in

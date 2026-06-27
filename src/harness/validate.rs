@@ -14,7 +14,7 @@ use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
 use screeps_combat_decision::composition::{BodyType, SquadComposition, SquadRole, SquadSlot};
 use screeps_combat_decision::damage::tower_repair_at_range;
-use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EngagementContext, ForcePlan};
+use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EnemyForce, EngagementContext, ForcePlan};
 use screeps_combat_decision::force_sizing::{clear_force, AssaultMode, DefenseProfile, ForceBudget, TowerThreat, COORDINATED_DPS_MARGIN};
 use screeps_combat_engine::constants::TOWER_ENERGY_COST;
 use screeps_combat_engine::{CombatAction, CombatWorld, CreepId, Intents, PlayerId, SimBody, SimCreep, StructureId};
@@ -105,7 +105,7 @@ impl Validator for OracleCalibration {
         // SYSTEM can field (the ceiling), not the bare template.
         let ceiling = siege_ceiling(scenario.member_energy);
         let budget = ceiling.force_budget(scenario.member_energy, scenario.onsite_budget);
-        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy);
+        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy, defender_force(scenario));
 
         if plan.winnable() {
             if plan.assessment.mode == AssaultMode::Drain {
@@ -192,12 +192,19 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
 /// oracle's required force against `budget` (the siege ceiling's, the calibration lens). The returned
 /// `ForcePlan` carries the verdict (`assessment`) + the sized `composition` (`None` = defer / drain /
 /// unfieldable). `importance: 0.0` matches the eval's base-force sizing (`importance_margin(0)` = 1×).
-pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32) -> ForcePlan {
+pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32, enemy_force: Option<EnemyForce>) -> ForcePlan {
+    // Coordination from the OBSERVED defenders: grouped (count > 1) or self-healing → Coordinated over-match;
+    // none → Individual. (ADR 0031 P1b: feeding `enemy_force` is what triggers the SiegeBreach anti-creep
+    // fusion on a defended bed; a creep-free bed passes `None` → the structure path is unperturbed.)
+    let coordination = match enemy_force {
+        Some(ef) if ef.count > 1 || ef.heal > 0.0 => EnemyCoordination::Coordinated,
+        _ => EnemyCoordination::Individual,
+    };
     let ctx = EngagementContext {
         objective: DoctrineObjective::DismantleStructure,
-        coordination: EnemyCoordination::Individual,
+        coordination,
         defense: profile,
-        enemy_force: None,
+        enemy_force,
         importance: 0.0,
         member_energy,
     };
@@ -308,7 +315,7 @@ fn choose_fielded_comp(scenario: &Scenario, obj: &Objective) -> (SquadCompositio
     let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
     let ceiling = siege_ceiling(scenario.member_energy);
     let budget = ceiling.force_budget(scenario.member_energy, scenario.onsite_budget);
-    let plan = siege_doctrine_plan(profile, budget, scenario.member_energy);
+    let plan = siege_doctrine_plan(profile, budget, scenario.member_energy, defender_force(scenario));
     if plan.winnable() && plan.assessment.mode == AssaultMode::Breach {
         match plan.composition {
             Some(sized) => (sized, "winnable → fielded the sized force".to_string()),
@@ -631,7 +638,7 @@ impl Validator for SizingWins {
         let obj = &scenario.objectives[0];
         let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
         let budget = siege_ceiling(scenario.member_energy).force_budget(scenario.member_energy, scenario.onsite_budget);
-        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy);
+        let plan = siege_doctrine_plan(profile, budget, scenario.member_energy, defender_force(scenario));
         if plan.winnable() && plan.assessment.mode == AssaultMode::Breach {
             if let Some(sized) = plan.composition {
                 if let Some(breached) = breaches(scenario, obj, &sized) {
@@ -656,6 +663,16 @@ fn enemy_force_of(scenario: &Scenario) -> (f32, u32, f32, bool) {
     let hits: u32 = d.iter().map(|c| c.body.hits).sum();
     let heal: f32 = d.iter().map(|c| c.body.heal_power() as f32).sum();
     (dps, hits, heal, d.len() > 1 || heal > 0.0)
+}
+
+/// The observed defender force as a doctrine `EnemyForce` (the §9.3 "size from OBSERVED bodies") — the seam
+/// that drives the SiegeBreach anti-creep fusion (ADR 0031 P1b). `None` when the bed has no ATTACKING
+/// defender (`dps == 0`), so a creep-free structure bed leaves the structure sizing unperturbed (the
+/// calibration invariant: `SizingWins`/`OracleCalibration` beds are creep-free → `None`).
+pub(crate) fn defender_force(scenario: &Scenario) -> Option<EnemyForce> {
+    let (dps, hits, heal, _) = enemy_force_of(scenario);
+    let count = scenario.world.creeps.iter().filter(|c| c.owner == scenario.defender_owner && c.is_alive()).count() as u32;
+    (dps > 0.0).then_some(EnemyForce { dps, heal, hits, count, boosted: false })
 }
 
 /// The outcome of fielding a `clear_force`-sized attacker against a creep-clear bed (ADR 0026 §9.10 L6).
