@@ -12,7 +12,7 @@ use screeps_combat_agent::objective_bed::defense_intents;
 use screeps_combat_agent::opponents::tower_intents;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
-use screeps_combat_decision::composition::{BodyType, SquadComposition, SquadRole, SquadSlot};
+use screeps_combat_decision::composition::{assemble_force, force_ceiling, BodyType, SquadComposition, SquadRole, SquadSlot};
 use screeps_combat_decision::damage::tower_repair_at_range;
 use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EnemyForce, EngagementContext, ForcePlan};
 use screeps_combat_decision::force_sizing::{clear_force, AssaultMode, DefenseProfile, ForceBudget, TowerThreat, COORDINATED_DPS_MARGIN};
@@ -328,10 +328,29 @@ fn choose_fielded_comp(scenario: &Scenario, obj: &Objective) -> (SquadCompositio
 }
 
 /// The composition the MANAGED lens fields: a ranged+heal combat quad the squad brain can actually
-/// drive (advance, kite, focus-fire creeps, shoot structures), auto-sized to the home's energy. (The
-/// sizing-pure siege force is `choose_fielded_comp`/`OracleCalibration`.)
-fn managed_assault_comp(_scenario: &Scenario) -> SquadComposition {
-    SquadComposition::quad_ranged()
+/// drive (advance, kite, focus-fire creeps, shoot structures), auto-sized to the home's energy. The
+/// catalog `quad_ranged` it used to field is gone (ADR 0031 P4b), so it is reconstructed template-free
+/// from `Sized` bodies — the same 2×RangedDPS + 2×Healer Box2x2 the positioning gates are calibrated
+/// against. (The sizing-pure siege force is `choose_fielded_comp`/`OracleCalibration`.)
+fn managed_assault_comp(scenario: &Scenario) -> SquadComposition {
+    use screeps_combat_decision::composition::{FormationMode, FormationShape};
+    let energy = scenario.member_energy;
+    let ranged = max_role_parts(|n| CombatBodySpec { ranged_attack: n, ..Default::default() }, energy);
+    let heal = max_role_parts(|n| CombatBodySpec { heal: n, ..Default::default() }, energy);
+    let mut slots = Vec::new();
+    for _ in 0..2 {
+        slots.push(SquadSlot { role: SquadRole::RangedDPS, body_type: BodyType::Sized(CombatBodySpec { ranged_attack: ranged, ..Default::default() }) });
+    }
+    for _ in 0..2 {
+        slots.push(SquadSlot { role: SquadRole::Healer, body_type: BodyType::Sized(CombatBodySpec { heal, ..Default::default() }) });
+    }
+    SquadComposition {
+        label: "Quad Ranged".into(),
+        slots,
+        formation_shape: FormationShape::Box2x2,
+        formation_mode: FormationMode::Strict,
+        retreat_threshold: 0.3,
+    }
 }
 
 /// Place `comp`'s members as attacker creeps clustered at the objective's ENTRY (a MOVING assault),
@@ -690,12 +709,12 @@ pub struct ClearOutcome {
 pub fn clear_outcome_at(scenario: &Scenario, dps_margin: f32) -> Option<ClearOutcome> {
     let obj = &scenario.objectives[0];
     let (enemy_dps, enemy_hits, enemy_heal, _) = enemy_force_of(scenario);
-    let budget = SquadComposition::quad_ranged().force_budget(scenario.member_energy, scenario.onsite_budget);
+    let budget = force_ceiling(scenario.member_energy, SquadRole::RangedDPS).force_budget(scenario.member_energy, scenario.onsite_budget);
     let (assessment, required) = clear_force(vec![], enemy_dps, enemy_hits, enemy_heal, &budget, dps_margin, scenario.world.safe_mode_owner.is_some());
     if !assessment.winnable {
         return None;
     }
-    let comp = SquadComposition::quad_ranged().sized_for(required, scenario.member_energy)?;
+    let comp = assemble_force(&required, scenario.member_energy)?;
     let spawn_cost = comp.estimated_cost(scenario.member_energy);
     let (outcome, _) = run_managed_assault_with(scenario, obj, &comp, screeps_combat_decision::kite::SquadTacticParams::open_combat())?;
     Some(ClearOutcome {

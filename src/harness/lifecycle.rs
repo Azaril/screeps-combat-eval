@@ -351,12 +351,13 @@ pub fn run_defended_lifecycle_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use screeps_combat_decision::composition::{force_ceiling, SquadRole};
 
     /// Build a forming scenario: `homes` spawn homes at `income`/tick, combat at `combat_priority` vs a
     /// constant HIGH hauler (75), members live `member_ttl` ticks, `renew` keeps the rallying roster alive.
     fn forming(homes: usize, income: u32, combat_priority: f32, member_ttl: u32, renew: bool, budget: u32) -> ColonyFormingScenario {
         ColonyFormingScenario {
-            composition: SquadComposition::quad_ranged(),
+            composition: force_ceiling(12_900, SquadRole::RangedDPS),
             homes: (0..homes).map(|_| Home { energy_capacity: 5300, income, start_energy: 2000 }).collect(),
             economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
             combat_priority,
@@ -472,7 +473,7 @@ mod tests {
     /// placeholder composition with the oracle-sized one; this only supplies the homes + economy contention.
     fn defended_forming() -> ColonyFormingScenario {
         ColonyFormingScenario {
-            composition: SquadComposition::quad_ranged(), // placeholder — replaced by the oracle-sized comp
+            composition: force_ceiling(12_900, SquadRole::RangedDPS), // placeholder — replaced by the oracle-sized comp
             homes: (0..4).map(|_| Home { energy_capacity: 12_900, income: 1000, start_energy: 12_900 }).collect(),
             economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
             combat_priority: 87.5, // above the hauler (75) → combat wins the lane
