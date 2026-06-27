@@ -150,7 +150,7 @@ impl Validator for OracleCalibration {
 /// the maintainer's (last energized) `tower_repair_at_range` to the breach rampart; `enemy_dps` = Σ the
 /// defender creeps' attack+ranged power; safe-mode from the world. Tower ranges measured to the
 /// objective's assault tile.
-fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Objective) -> DefenseProfile {
+pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Objective) -> DefenseProfile {
     let energized: Vec<(Position, u32)> = world
         .towers
         .iter()
@@ -192,7 +192,7 @@ fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Objective) -> D
 /// oracle's required force against `budget` (the siege ceiling's, the calibration lens). The returned
 /// `ForcePlan` carries the verdict (`assessment`) + the sized `composition` (`None` = defer / drain /
 /// unfieldable). `importance: 0.0` matches the eval's base-force sizing (`importance_margin(0)` = 1×).
-fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32) -> ForcePlan {
+pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32) -> ForcePlan {
     let ctx = EngagementContext {
         objective: DoctrineObjective::DismantleStructure,
         coordination: EnemyCoordination::Individual,
@@ -686,7 +686,7 @@ pub fn clear_outcome_at(scenario: &Scenario, dps_margin: f32) -> Option<ClearOut
         cleared: outcome.stop == StopReason::SideWiped(scenario.defender_owner),
         ticks: outcome.ticks,
         spawn_cost,
-        ranged: required.ranged_parts,
+        ranged: required.anti_creep_parts, // clear_outcome_at sizes via clear_force (creep-clear) -> anti_creep_parts
         heal: required.heal_parts,
     })
 }
@@ -838,7 +838,7 @@ fn max_role_parts(spec_of: impl Fn(u32) -> CombatBodySpec, energy: u32) -> u32 {
 /// The strong-but-fieldable SIEGE CEILING — the oracle's BUDGET and the FN falsifier in one (so the
 /// verdict and the falsifier reference the same force): siege_quad grown to its practical max within
 /// the 8-member cap + the bed geometry (3 dismantlers + 5 healers), each at its per-member part cap.
-fn siege_ceiling(energy: u32) -> SquadComposition {
+pub(crate) fn siege_ceiling(energy: u32) -> SquadComposition {
     let work = max_role_parts(|n| CombatBodySpec { work: n, ..Default::default() }, energy);
     let heal = max_role_parts(|n| CombatBodySpec { heal: n, ..Default::default() }, energy);
     let mut slots = Vec::new();
