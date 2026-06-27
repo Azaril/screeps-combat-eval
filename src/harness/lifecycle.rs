@@ -43,6 +43,14 @@ pub struct ColonyFormingScenario {
     pub combat_priority: f32,
     pub per_member_cap: u32,
     pub budget_ticks: u32,
+    /// Ticks a spawned member lives before dying of old age (CREEP_LIFE_TIME ≈ 1500). A member that ages
+    /// out while the squad is still rallying drops back to unfilled → re-spawn → churn. This is the live
+    /// failure when forming is STUCK for longer than a member's life (the bot has no renew today —
+    /// `request_renew` has zero callers).
+    pub member_ttl: u32,
+    /// Whether the colony RENEWS aging present members while rallying (keeps the early roster alive until
+    /// the full squad forms) — the missing live behavior. Renewing costs a home's spawn lane for the tick.
+    pub renew: bool,
 }
 
 /// The result of running a forming scenario to completion or the tick budget.
@@ -57,6 +65,12 @@ pub enum FormingOutcome {
 const ECON_MINER_ID_BASE: u64 = 1_000_000_000;
 const ECON_HAULER_ID_BASE: u64 = 2_000_000_000;
 
+/// TTL a single renew action adds to a member (≈ `600 / body_size` per tick in the engine; ~20 for a
+/// 30-part member). A renew occupies the home's spawn lane for that tick (no new member spawns).
+const RENEW_PER_TICK: u32 = 20;
+/// Renew a present member once its remaining TTL drops below this (don't waste lanes renewing fresh ones).
+const RENEW_THRESHOLD: u32 = 100;
+
 fn dummy_home_pos() -> Position {
     Position::new(RoomCoordinate::new(25).unwrap(), RoomCoordinate::new(25).unwrap(), "W1N1".parse().unwrap())
 }
@@ -70,19 +84,30 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
     let mut busy_until: Vec<u32> = vec![0; s.homes.len()];
     // Combat slots currently spawning: (slot_id, completes_at_tick).
     let mut completing: Vec<(u64, u32)> = Vec::new();
+    // Per-filled-slot death tick (set on completion = tick + member_ttl). Members age out unless renewed.
+    let mut dies_at: Vec<u32> = vec![0; n_slots];
 
     for tick in 0..s.budget_ticks {
-        // 1. Complete spawns due this tick → mark their slot filled.
+        // 1. Complete spawns due this tick → mark their slot filled + stamp its death tick.
         completing.retain(|&(id, at)| {
             if at <= tick {
                 if (id as usize) < n_slots {
                     filled[id as usize] = true;
+                    dies_at[id as usize] = tick + s.member_ttl;
                 }
                 false
             } else {
                 true
             }
         });
+
+        // 1b. Age out members that died of old age while rallying (no renew kept them alive) — they drop
+        // back to unfilled and must re-spawn (the live churn when forming outlasts a member's life).
+        for i in 0..n_slots {
+            if filled[i] && dies_at[i] <= tick {
+                filled[i] = false;
+            }
+        }
 
         // 2. Ready to depart? (the K0 rally gate over the present roster.)
         let present = filled.iter().filter(|f| **f).count();
@@ -96,12 +121,28 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
 
         // Cross-home de-dup within this tick: a slot already in flight (or spawned this tick) is excluded.
         let mut in_flight: BTreeSet<u64> = completing.iter().map(|&(id, _)| id).collect();
+        // Each aging present member is renewed by at most one home per tick.
+        let mut renewed_this_tick: BTreeSet<usize> = BTreeSet::new();
 
         // 4. Each home banks income, then runs one spawn step (K1) over economy + the unfilled combat slots.
         for h in 0..s.homes.len() {
             avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
             if tick < busy_until[h] {
                 continue; // this home's spawn is still busy
+            }
+            // RENEW: keep the early roster alive while rallying. An aging present member is renewed instead
+            // of spawning a new one (the renew occupies this home's lane this tick). Only ONE home renews a
+            // given member per tick; a home with no aging member to renew falls through to spawning.
+            if s.renew {
+                if let Some(slot) = (0..n_slots)
+                    .filter(|&i| filled[i] && !renewed_this_tick.contains(&i) && dies_at[i].saturating_sub(tick) < RENEW_THRESHOLD)
+                    .min_by_key(|&i| dies_at[i])
+                {
+                    dies_at[slot] = (dies_at[slot] + RENEW_PER_TICK).min(tick + s.member_ttl);
+                    renewed_this_tick.insert(slot);
+                    busy_until[h] = tick + 1; // the renew action occupies this home this tick
+                    continue;
+                }
             }
             let mut queue: Vec<QueuedSpawn> = Vec::new();
             if let Some((p, c)) = s.economy.miner {
@@ -203,19 +244,24 @@ pub fn run_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
 mod tests {
     use super::*;
 
-    fn scenario(combat_priority: f32) -> ColonyFormingScenario {
+    /// Build a forming scenario: `homes` spawn homes at `income`/tick, combat at `combat_priority` vs a
+    /// constant HIGH hauler (75), members live `member_ttl` ticks, `renew` keeps the rallying roster alive.
+    fn forming(homes: usize, income: u32, combat_priority: f32, member_ttl: u32, renew: bool, budget: u32) -> ColonyFormingScenario {
         ColonyFormingScenario {
             composition: SquadComposition::quad_ranged(),
-            homes: vec![
-                Home { energy_capacity: 5300, income: 300, start_energy: 2000 },
-                Home { energy_capacity: 5300, income: 300, start_energy: 2000 },
-            ],
-            // Constant HIGH hauler pressure (75), no miner — isolates the combat-vs-economy lane contest.
+            homes: (0..homes).map(|_| Home { energy_capacity: 5300, income, start_energy: 2000 }).collect(),
             economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
             combat_priority,
             per_member_cap: 3000,
-            budget_ticks: 1500,
+            budget_ticks: budget,
+            member_ttl,
+            renew,
         }
+    }
+
+    /// The baseline 2-home, fresh-member (ttl 1500), no-renew scenario the original forming/lifecycle tests use.
+    fn scenario(combat_priority: f32) -> ColonyFormingScenario {
+        forming(2, 300, combat_priority, 1500, false, 1500)
     }
 
     #[test]
@@ -233,6 +279,51 @@ mod tests {
         match run_forming(&scenario(87.5)) {
             FormingOutcome::Completed { .. } => {}
             FormingOutcome::Stalled { filled, of } => panic!("above-economy combat should complete ({filled}/{of})"),
+        }
+    }
+
+    // ── Single- vs multi-room spawning + rally/renew (operator-requested) ──
+
+    #[test]
+    fn single_room_forms_the_roster() {
+        // One home, fresh members (ttl 1500) → forms serially within budget.
+        match run_forming(&forming(1, 400, 87.5, 1500, false, 3000)) {
+            FormingOutcome::Completed { .. } => {}
+            o => panic!("single-room above-economy should form, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_room_forms_faster_than_single_room() {
+        // Parallel spawning across homes forms the same roster in fewer ticks than one serial home.
+        let single = run_forming(&forming(1, 400, 87.5, 1500, false, 3000));
+        let multi = run_forming(&forming(4, 400, 87.5, 1500, false, 3000));
+        match (single, multi) {
+            (FormingOutcome::Completed { ticks: s }, FormingOutcome::Completed { ticks: m }) => {
+                assert!(m < s, "multi-room parallel spawning forms faster than single-room serial ({m} < {s})");
+            }
+            other => panic!("both single + multi room should complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stuck_forming_loses_early_members_without_renew() {
+        // A slow single home where forming OUTLASTS a member's life (ttl scaled to 200 for a fast
+        // deterministic test; the live equivalent is a form stalled >1500t by spawn contention). Early
+        // members age out → drop back to unfilled → the roster never has the full set present at once.
+        match run_forming(&forming(1, 200, 87.5, 200, false, 4000)) {
+            FormingOutcome::Stalled { filled, of } => assert!(filled < of, "early members die → stuck ({filled}/{of})"),
+            FormingOutcome::Completed { ticks } => panic!("a too-slow form must NOT complete without renew (did at {ticks})"),
+        }
+    }
+
+    #[test]
+    fn renew_completes_the_stuck_form() {
+        // The SAME stuck scenario, but the colony RENEWS the rallying roster (the missing live behavior) →
+        // early members stay alive until the full squad forms → it completes.
+        match run_forming(&forming(1, 200, 87.5, 200, true, 4000)) {
+            FormingOutcome::Completed { .. } => {}
+            FormingOutcome::Stalled { filled, of } => panic!("renew should keep the roster alive + complete ({filled}/{of})"),
         }
     }
 
