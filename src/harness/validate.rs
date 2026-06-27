@@ -15,7 +15,7 @@ use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MovePro
 use screeps_combat_decision::composition::{BodyType, SquadComposition, SquadRole, SquadSlot};
 use screeps_combat_decision::damage::tower_repair_at_range;
 use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EngagementContext, ForcePlan};
-use screeps_combat_decision::force_sizing::{AssaultMode, DefenseProfile, ForceBudget, TowerThreat};
+use screeps_combat_decision::force_sizing::{clear_force, AssaultMode, DefenseProfile, ForceBudget, TowerThreat, COORDINATED_DPS_MARGIN};
 use screeps_combat_engine::constants::TOWER_ENERGY_COST;
 use screeps_combat_engine::{CombatAction, CombatWorld, CreepId, Intents, PlayerId, SimBody, SimCreep, StructureId};
 
@@ -644,6 +644,70 @@ impl Validator for SizingWins {
             }
         }
         Verdict { pass: true, label: self.label().into(), detail: "deferred / drain / unfieldable (not a sizing attempt)".into() }
+    }
+}
+
+/// CREEP-CLEAR sizing validation (ADR 0026 §9.8/§9.10 L6): does `force_sizing::clear_force` size a squad
+/// that actually CLEARS the defender creep force it was sized against? Derives the enemy force from the
+/// bed's defender creeps (dps / hits / heal), picks the coordination margin (a force with mutual heal →
+/// `Coordinated`, else `Individual`), sizes a `quad_ranged` via `clear_force`, fields the REAL moving brain
+/// (`run_managed_assault_with`) against the (Secure) bed, and scores `SideWiped(defender)` = cleared. This
+/// is the offline gate that validates the creep-clear keystone BEFORE it is wired into the
+/// `PlayerDefend`/`PlayerRaid` rungs; the same harness will tune `COORDINATED_DPS_MARGIN` (L6 sweep).
+#[derive(Default)]
+pub struct CreepClearWins {
+    pub attempted: u32,
+    pub won: u32,
+}
+
+impl CreepClearWins {
+    pub fn win_rate(&self) -> f64 {
+        if self.attempted == 0 {
+            1.0
+        } else {
+            self.won as f64 / self.attempted as f64
+        }
+    }
+}
+
+impl Validator for CreepClearWins {
+    fn label(&self) -> &str {
+        "creep-clear-wins"
+    }
+    fn validate(&mut self, scenario: &Scenario) -> Verdict {
+        let obj = &scenario.objectives[0];
+        // Derive the enemy creep force from the defenders (the §9.3 principle: size from OBSERVED bodies).
+        let defenders: Vec<&SimCreep> = scenario.world.creeps.iter().filter(|c| c.owner == scenario.defender_owner && c.is_alive()).collect();
+        let enemy_dps: f32 = defenders.iter().map(|c| (c.body.attack_power() + c.body.ranged_attack_power()) as f32).sum();
+        let enemy_hits: u32 = defenders.iter().map(|c| c.body.hits).sum();
+        let enemy_heal: f32 = defenders.iter().map(|c| c.body.heal_power() as f32).sum();
+        // Coordinated if the enemies fight TOGETHER — grouped (count > 1, they focus-fire / cover each
+        // other) or self-sustaining (mutual heal) → the square-law over-match. A lone enemy is Individual
+        // (margin 1.0). (Open-field ranged kiters in particular evade a merely-matching force, so the
+        // over-match is what lets the attacker close + clear them.)
+        let coordinated = defenders.len() > 1 || enemy_heal > 0.0;
+        let dps_margin = if coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
+        // Size the attacker via clear_force (no towers in this bed), then field a ranged quad sized to it.
+        let budget = SquadComposition::quad_ranged().force_budget(scenario.member_energy, scenario.onsite_budget);
+        let safe_mode = scenario.world.safe_mode_owner.is_some();
+        let (assessment, required) = clear_force(vec![], enemy_dps, enemy_hits, enemy_heal, &budget, dps_margin, safe_mode);
+        if !assessment.winnable {
+            return Verdict { pass: true, label: self.label().into(), detail: format!("deferred ({})", assessment.reason) };
+        }
+        let Some(comp) = SquadComposition::quad_ranged().sized_for(required, scenario.member_energy) else {
+            return Verdict { pass: true, label: self.label().into(), detail: "winnable but unfieldable at this energy (excluded)".into() };
+        };
+        match run_managed_assault_with(scenario, obj, &comp, screeps_combat_decision::kite::SquadTacticParams::open_combat()) {
+            Some((outcome, _)) => {
+                self.attempted += 1;
+                let cleared = outcome.stop == StopReason::SideWiped(scenario.defender_owner);
+                if cleared {
+                    self.won += 1;
+                }
+                Verdict { pass: cleared, label: self.label().into(), detail: format!("sized→{:?} @ t{} ({} ranged, {} heal)", outcome.stop, outcome.ticks, required.ranged_parts, required.heal_parts) }
+            }
+            None => Verdict { pass: true, label: self.label().into(), detail: "couldn't field at entry (excluded)".into() },
+        }
     }
 }
 

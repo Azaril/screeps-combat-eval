@@ -60,9 +60,9 @@ pub fn calibration_replay(index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generate::{Designed, ForemanGenerator, ImportedRoom, Permutations};
+    use generate::{CreepClearBed, Designed, ForemanGenerator, ImportedRoom, Permutations};
     use scenario::ObjectiveKind;
-    use validate::{ManagedSquadIntegration, SelfPlay, SizingWins};
+    use validate::{CreepClearWins, ManagedSquadIntegration, SelfPlay, SizingWins};
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
     /// the force-sizing oracle is calibrated against the engine — winnable verdicts breach (fp ≤ 1%) and
@@ -106,6 +106,26 @@ mod tests {
         assert_eq!(report.verdicts.len(), 16);
         assert_eq!(report.scenarios, 16);
         assert_eq!(validator.tally().scenarios, 16);
+    }
+
+    /// ADR 0026 §9.10 L6 — the CREEP-CLEAR sizing gate: a `force_sizing::clear_force`-sized squad CLEARS
+    /// the graded defender forces it is sized against (the keystone validation before the
+    /// `PlayerDefend`/`PlayerRaid` rungs wire it live). Run with `-- --ignored --nocapture` for the
+    /// per-bed dashboard. `#[ignore]` — it runs the moving brain over 4 beds (slower) + the win-rate
+    /// threshold is still being calibrated for the L6 sweep.
+    #[test]
+    #[ignore]
+    fn creep_clear_sizing_clears_the_bed() {
+        let g = CreepClearBed;
+        let mut v = CreepClearWins::default();
+        for i in 0..g.count() {
+            let s = g.generate(i);
+            let verdict = v.validate(&s);
+            println!("{:48} -> {}", s.label, verdict.detail);
+        }
+        println!("creep-clear win rate: {:.0}% ({}/{} fielded)", v.win_rate() * 100.0, v.won, v.attempted);
+        assert!(v.attempted >= 2, "at least some beds fielded a sized squad ({})", v.attempted);
+        assert!(v.win_rate() >= 0.75, "clear_force-sized squads should clear most winnable beds (got {:.0}%)", v.win_rate() * 100.0);
     }
 
     /// Full chain smoke test: Generation → Evaluation(record) → Visualization yields a self-contained

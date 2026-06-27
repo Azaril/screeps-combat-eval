@@ -347,6 +347,38 @@ impl Generator for Permutations {
     }
 }
 
+/// CREEP-CLEAR bed (ADR 0026 §9.8/§9.10 L6) — the near-winnability-boundary scenarios that validate the
+/// `force_sizing::clear_force` creep-clear sizing (the keystone for the `PlayerDefend`/`PlayerRaid` rungs)
+/// before it is wired live. An open room (no towers, no rampart) with a graded DEFENDER creep force and an
+/// `ObjectiveKind::Secure` objective (stops on `SideWiped(defender)` — a pure clear). The forces are
+/// GROUPED, so they fight as a `Coordinated` squad (focus-fire / cover): graded by composition
+/// (`Skirmishers` = pure ranged kiters; `Guard` = melee + a healer that sustains the group) × strength
+/// (2 vs 4). (The true `Individual` case — spatially-separate enemies fought one at a time, e.g. SK
+/// keepers at distinct sources — is a separate bed, deferred.)
+pub struct CreepClearBed;
+
+impl Generator for CreepClearBed {
+    fn label(&self) -> &str {
+        "creep-clear"
+    }
+    fn count(&self) -> u32 {
+        4
+    }
+    fn generate(&self, index: u32) -> Scenario {
+        let (force, name) = match index % 4 {
+            0 => (ForceSpec::Skirmishers(2), "ranged-weak (2 kiters)"),
+            1 => (ForceSpec::Skirmishers(4), "ranged-strong (4 kiters)"),
+            2 => (ForceSpec::Guard(2), "melee+heal-weak (2+healer)"),
+            _ => (ForceSpec::Guard(4), "melee+heal-strong (4+healer)"),
+        };
+        // Open room, RCL7 energy, no rampart/towers — a pure creep fight. Override the objective kind to
+        // Secure so the run stops when the defender creeps are wiped (the clear).
+        let mut s = assemble_single_room(format!("creep-clear#{index} {name}"), index as u64, 5600, 600, (25, 25), 0, &[], Layout::Open, force, false);
+        s.objectives[0].kind = ObjectiveKind::Secure;
+        s
+    }
+}
+
 /// A small set of hand-authored fixtures (named, terrain-rich) — regression anchors + the variety the
 /// operator eyeballs. Includes a multi-room siege (the objective in the east neighbour, the assault
 /// staging in the home room).
