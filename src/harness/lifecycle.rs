@@ -134,6 +134,71 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
     FormingOutcome::Stalled { filled: filled.iter().filter(|f| **f).count(), of: n_slots }
 }
 
+/// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
+/// (vs stall / wipe / never-form)? Surfaces the form-vs-fight gap the live whack-a-mole could not isolate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleOutcome {
+    /// Formed AND the roster destroyed the core.
+    Killed { form_ticks: u32, engage_ticks: u32 },
+    /// Formed + engaged, but the core survived to the engage budget (under-DPS / disengage).
+    Stalled { form_ticks: u32, engage_ticks: u32 },
+    /// Formed, but the roster was wiped engaging (under-sized / retreat-into-fire).
+    RosterWiped { form_ticks: u32, engage_ticks: u32 },
+    /// Forming never completed — nothing departs (the "stuck at N/M" stall).
+    NeverFormed { filled: usize, of: usize },
+    /// Formed but couldn't be placed at the entry (body wouldn't build / no free tiles).
+    CouldNotField { form_ticks: u32 },
+}
+
+/// Chain the forming phase into the engine engage: form the roster under economy contention
+/// (`run_forming`), then drive that SAME roster against an UNDEFENDED L0 invader core (a 50k-hit spawn,
+/// no towers/ramparts/defenders) through the authoritative engine and report whether it actually kills.
+/// Reuses the existing engage machinery (`assemble_single_room` + `run_managed_assault_with`), so the
+/// engaged roster is the same composition the forming consumed. Deterministic: same scenario → same
+/// outcome. The undefended fixture isolates form→travel→raze from defender fire + the retreat gate (the
+/// FIRST end-to-end fixture; graded defenders are the same `assemble_single_room` with towers/force/ramparts).
+pub fn run_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
+    use crate::harness::evaluate::StopReason;
+    use crate::harness::generate::{assemble_single_room, ForceSpec, Layout};
+    use crate::harness::validate::run_managed_assault_with;
+    use screeps_combat_decision::kite::SquadTacticParams;
+
+    // 1. Forming. If the roster never completes, nothing departs — there is nothing to engage.
+    let form_ticks = match run_forming(s) {
+        FormingOutcome::Completed { ticks } => ticks,
+        FormingOutcome::Stalled { filled, of } => return LifecycleOutcome::NeverFormed { filled, of },
+    };
+
+    // 2. The engaged roster == the formed roster: both build from (composition, build_energy).
+    let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
+    let build_energy = best_capacity.min(s.per_member_cap);
+
+    // 3. An undefended L0 core: a 50k-hit spawn at (25,25), no rampart/towers/defenders.
+    let engage = assemble_single_room(
+        "lifecycle L0 core".into(),
+        1, // fixed seed (open/undefended → nothing random to vary)
+        build_energy,
+        1500, // engage tick budget
+        (25, 25),
+        0,   // no rampart
+        &[], // no towers
+        Layout::Open,
+        ForceSpec::None, // no defenders
+        false,           // no safe mode
+    );
+
+    // 4. Engage via the existing managed-assault driver (clone world → place roster at entry →
+    //    ManagedSimSquad → resolve_tick to ObjectivesDestroyed | SideWiped(attacker) | Timeout).
+    match run_managed_assault_with(&engage, &engage.objectives[0], &s.composition, SquadTacticParams::default()) {
+        None => LifecycleOutcome::CouldNotField { form_ticks },
+        Some((out, _rec)) => match out.stop {
+            StopReason::ObjectivesComplete => LifecycleOutcome::Killed { form_ticks, engage_ticks: out.ticks },
+            StopReason::SideWiped(_) => LifecycleOutcome::RosterWiped { form_ticks, engage_ticks: out.ticks },
+            _ => LifecycleOutcome::Stalled { form_ticks, engage_ticks: out.ticks },
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +239,30 @@ mod tests {
     #[test]
     fn forming_is_deterministic() {
         assert_eq!(run_forming(&scenario(87.5)), run_forming(&scenario(87.5)));
+    }
+
+    // ── End-to-end: form → engine engage → kill (ADR 0028 engage handoff) ──
+
+    #[test]
+    fn above_economy_roster_forms_and_kills_an_undefended_core() {
+        // The full chain: form above economy (completes) → travel → raze the 50k-hit core.
+        match run_lifecycle(&scenario(87.5)) {
+            LifecycleOutcome::Killed { .. } => {}
+            other => panic!("expected the formed roster to kill the undefended core, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn medium_priority_never_forms_so_never_engages() {
+        // The form gate prevents a doomed engage: MEDIUM stalls forming → NeverFormed (no engage attempt).
+        match run_lifecycle(&scenario(50.0)) {
+            LifecycleOutcome::NeverFormed { .. } => {}
+            other => panic!("MEDIUM should never form, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_is_deterministic() {
+        assert_eq!(run_lifecycle(&scenario(87.5)), run_lifecycle(&scenario(87.5)));
     }
 }

@@ -253,7 +253,7 @@ fn place_force(world: &mut CombatWorld, rm: RoomName, core: (u8, u8), spec: Forc
 /// towers, and an opponent force. The breach staging + a clear western `entry` come from
 /// [`breach_geometry`].
 #[allow(clippy::too_many_arguments)]
-fn assemble_single_room(
+pub(crate) fn assemble_single_room(
     label: String,
     seed: u64,
     member_energy: u32,

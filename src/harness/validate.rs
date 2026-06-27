@@ -413,7 +413,7 @@ fn run_managed_assault(scenario: &Scenario, obj: &Objective, comp: &SquadComposi
 
 /// As [`run_managed_assault`] but with chosen squad tactics — the seam the base-attack tuning pass uses to
 /// field the assault under each `KernelParams` candidate (ADR 0025 basket enrichment: base attack/defend).
-fn run_managed_assault_with(
+pub(crate) fn run_managed_assault_with(
     scenario: &Scenario,
     obj: &Objective,
     comp: &SquadComposition,
