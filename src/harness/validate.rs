@@ -197,7 +197,7 @@ fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_ener
         objective: DoctrineObjective::DismantleStructure,
         coordination: EnemyCoordination::Individual,
         defense: profile,
-        worst_single: None,
+        enemy_force: None,
         importance: 0.0,
         member_energy,
     };
