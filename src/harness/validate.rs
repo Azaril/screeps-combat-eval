@@ -882,6 +882,25 @@ mod invariant_tests {
     /// source was a harness placement bug (`place_at_entry`'s clamp-collapse onto an edge), now fixed. This
     /// scans every recorded tick of a representative set of base assaults (which all cross rooms to reach
     /// the objective) for a same-tile pair.
+    /// ADR 0031 P2 golden-output / byte-stability fence: the unified `emit_requirement` (which
+    /// `siege_doctrine_plan` now routes through) must produce IDENTICAL sizing — verdict + `RequiredForce`
+    /// + the full serialized composition — run-twice over EVERY realistic base. This is the bed-level
+    /// determinism the bot/eval parity depends on (the doctrine-crate unit fence covers the math in
+    /// isolation; this covers it over the real beds, defenders fed in). (ADR 0031 §3 Phase 2, §5.)
+    #[test]
+    fn emit_requirement_golden_output_is_stable_over_realistic_bases() {
+        for scenario in crate::harness::generate::realistic_bases() {
+            let obj = &scenario.objectives[0];
+            let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
+            let budget = siege_ceiling(scenario.member_energy).force_budget(scenario.member_energy, scenario.onsite_budget);
+            let run = || {
+                let p = siege_doctrine_plan(profile.clone(), budget, scenario.member_energy, defender_force(&scenario));
+                (p.assessment, p.required, p.composition.map(|c| format!("{c:?}")))
+            };
+            assert_eq!(run(), run(), "{}: emitter golden-output is stable", scenario.label);
+        }
+    }
+
     #[test]
     fn sim_maintains_one_creep_per_tile() {
         let scenarios = crate::tournament::realistic_base_scenarios();
