@@ -12,7 +12,7 @@ use screeps_combat_agent::objective_bed::defense_intents;
 use screeps_combat_agent::opponents::tower_intents;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
-use screeps_combat_decision::composition::{assemble_force, force_ceiling, BodyType, SquadComposition, SquadRole, SquadSlot};
+use screeps_combat_decision::composition::{assemble_force, force_ceiling, formation_for, BodyType, SquadComposition, SquadRole, SquadSlot};
 use screeps_combat_decision::damage::tower_repair_at_range;
 use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EnemyForce, EngagementContext, ForcePlan};
 use screeps_combat_decision::force_sizing::{clear_force, AssaultMode, DefenseProfile, ForceBudget, TowerThreat, COORDINATED_DPS_MARGIN};
@@ -887,7 +887,10 @@ pub(crate) fn siege_ceiling(energy: u32) -> SquadComposition {
             slots.push(SquadSlot { role: SquadRole::Healer, body_type: BodyType::Sized(CombatBodySpec { heal, ..Default::default() }) });
         }
     }
-    SquadComposition { label: "Siege Ceiling".into(), slots, formation_shape: Default::default(), formation_mode: Default::default(), retreat_threshold: 0.3 }
+    // Derive the formation from the member count (ADR 0031 D14) — NOT Default(None), which on an 8-member
+    // force would imply a single (0,0) layout that stacks every member on the anchor.
+    let (formation_shape, formation_mode) = formation_for(slots.len());
+    SquadComposition { label: "Siege Ceiling".into(), slots, formation_shape, formation_mode, retreat_threshold: 0.3 }
 }
 
 #[cfg(test)]
