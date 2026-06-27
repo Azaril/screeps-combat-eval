@@ -7,6 +7,7 @@
 pub mod evaluate;
 pub mod foreman_capture;
 pub mod generate;
+pub mod lifecycle;
 pub mod report;
 pub mod roster;
 pub mod scenario;
