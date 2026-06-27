@@ -209,9 +209,8 @@ pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, 
         member_energy,
     };
     let doctrines = default_doctrines();
-    decide_doctrine(&ctx, &doctrines)
-        .expect("DismantleStructure routes to the siege-breach doctrine")
-        .plan(&ctx, Some(budget))
+    let doctrine = decide_doctrine(&ctx, &doctrines).expect("DismantleStructure routes to the siege-breach doctrine");
+    screeps_combat_decision::doctrine::plan_engagement(doctrine, &ctx, Some(budget))
 }
 
 /// Place `comp`'s members as attacker creeps on the objective's staging tiles (dismantlers → front,
