@@ -255,9 +255,26 @@ pub fn run_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
 /// fixture is deterministic: a fixed seed, `safe_mode = false`, and a fixed `ForceSpec::Guard`. `s`'s
 /// economy / homes / priority / ttl / renew drive the forming contention; its `composition` is overridden.
 pub fn run_defended_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
+    // Canonical fixture (the acceptance bed): a rampart breach-gate, one energized tower, a melee guard force.
+    run_defended_lifecycle_with(s, 30_000, &[((24, 16), 100_000)], crate::harness::generate::Layout::Open, crate::harness::generate::ForceSpec::Guard(2))
+}
+
+/// Parameterized defended lifecycle (ADR 0031 P3 — the graded regime sweep): emit_requirement → assemble_force
+/// → FORM under economy contention → MOVE in → engage, against a defended core whose rampart / towers / layout
+/// / defender force are the regime knobs. Same determinism contract as the canonical bed (fixed seed, no safe
+/// mode). Proves the assembler kills-when-winnable / defers-cleanly across defense shapes.
+pub fn run_defended_lifecycle_with(
+    s: &ColonyFormingScenario,
+    rampart_hits: u32,
+    towers: &[((u8, u8), u32)],
+    layout: crate::harness::generate::Layout,
+    force: crate::harness::generate::ForceSpec,
+) -> LifecycleOutcome {
     use crate::harness::evaluate::StopReason;
-    use crate::harness::generate::{assemble_single_room, ForceSpec, Layout};
-    use crate::harness::validate::{derive_profile, run_managed_assault_with, siege_ceiling, siege_doctrine_plan};
+    use crate::harness::generate::assemble_single_room;
+    use crate::harness::validate::{derive_profile, run_managed_assault_with, siege_ceiling};
+    use screeps_combat_decision::composition::assemble_force;
+    use screeps_combat_decision::doctrine::{emit_requirement, DoctrineObjective, EnemyCoordination};
     use screeps_combat_decision::force_sizing::AssaultMode;
     use screeps_combat_decision::kite::SquadTacticParams;
 
@@ -275,23 +292,31 @@ pub fn run_defended_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
         build_energy,
         ENGAGE_BUDGET,
         (25, 25),
-        30_000,                 // rampart breach-gate
-        &[((24, 16), 100_000)], // one energized tower
-        Layout::Open,
-        ForceSpec::Guard(2), // a deterministic melee guard force (+ 1 healer)
-        false,               // no safe mode (deterministic)
+        rampart_hits, // rampart breach-gate (regime knob)
+        towers,       // energized towers (regime knob)
+        layout,       // approach layout (regime knob)
+        force,        // defender force (regime knob)
+        false,        // no safe mode (deterministic)
     );
     let obj = &engage.objectives[0];
 
-    // 2. Size the breach force via the SAME oracle path `SizingWins` uses, against THIS defended world.
+    // 2. Size the breach force via the UNIFIED EMITTER + the ASSEMBLER (ADR 0031 P3) against THIS defended
+    //    world — emit_requirement folds assess + the anti-creep overlay (the observed guards), then
+    //    assemble_force fields the capability vector directly (no template, no sized_for). This is the path
+    //    the bot will run at P4; the lifecycle proves it end-to-end now (emit → assemble → form → move → kill).
     let profile = derive_profile(&engage.world, engage.defender_owner, obj);
     let budget = siege_ceiling(engage.member_energy).force_budget(engage.member_energy, engage.onsite_budget);
-    // P1b: feed the observed defenders so SiegeBreach's anti-creep fusion fires (siege_assault_quad).
-    let plan = siege_doctrine_plan(profile, budget, engage.member_energy, crate::harness::validate::defender_force(&engage));
-    let comp = match (plan.winnable() && plan.assessment.mode == AssaultMode::Breach, plan.composition) {
-        (true, Some(sized)) => sized,
-        // The oracle deferred / drained / couldn't field the required force at this energy — field the
-        // ceiling so the chain still runs (the test then surfaces whether even the ceiling, FORMED, kills).
+    let defenders = crate::harness::validate::defender_force(&engage);
+    // Coordination from the OBSERVED guards (grouped / self-healing → over-match), matching the doctrine path.
+    let coordination = match defenders {
+        Some(ef) if ef.count > 1 || ef.heal > 0.0 => EnemyCoordination::Coordinated,
+        _ => EnemyCoordination::Individual,
+    };
+    let (assessment, required) = emit_requirement(DoctrineObjective::DismantleStructure, &profile, defenders, Some(&budget), coordination, 0.0);
+    let comp = match (assessment.winnable && assessment.mode == AssaultMode::Breach, assemble_force(&required, engage.member_energy)) {
+        (true, Some(assembled)) => assembled,
+        // The oracle deferred / drained / the assembler couldn't field the required force at this energy —
+        // field the ceiling so the chain still runs (the test then surfaces whether even the ceiling kills).
         _ => siege_ceiling(engage.member_energy),
     };
 
@@ -483,5 +508,28 @@ mod tests {
         // Fixed seed + safe_mode=false + a fixed ForceSpec → the defended chain is reproducible (it stalls
         // identically each run today; this still holds once the redesign flips the outcome to Killed).
         assert_eq!(run_defended_lifecycle(&defended_forming()), run_defended_lifecycle(&defended_forming()));
+    }
+
+    /// ADR 0031 P3 — the GRADED REGIME SWEEP: an emit→assemble force, FORMED + MOVING, must KILL a defended
+    /// core across rampart thickness / tower presence / approach layout / guard strength. Melee guards do
+    /// not evade, so a correctly-assembled force reliably clears them then breaches — the discriminating
+    /// proof that the assembler fields a WINNING force across defense shapes, not just the canonical bed.
+    /// Reuses the generous forming bed (`defended_forming`), so the ENGAGE outcome (the assembler's kill
+    /// quality) is what is under test, not spawn contention. Determinism is checked alongside.
+    #[test]
+    fn assembler_kills_across_defended_regimes() {
+        use crate::harness::generate::{ForceSpec, Layout};
+        let regimes: &[(&str, u32, &[((u8, u8), u32)], Layout, ForceSpec)] = &[
+            ("rampart-only + light guard", 50_000, &[], Layout::Open, ForceSpec::Guard(1)),
+            ("tower-only + guard", 0, &[((24, 16), 100_000)], Layout::Open, ForceSpec::Guard(2)),
+            ("tower + rampart + guard", 30_000, &[((24, 16), 100_000)], Layout::Open, ForceSpec::Guard(2)),
+            ("corridor choke + guard", 20_000, &[((24, 16), 100_000)], Layout::Corridor, ForceSpec::Guard(2)),
+        ];
+        for (name, rampart, towers, layout, force) in regimes {
+            let out = run_defended_lifecycle_with(&defended_forming(), *rampart, towers, *layout, *force);
+            let out2 = run_defended_lifecycle_with(&defended_forming(), *rampart, towers, *layout, *force);
+            assert_eq!(out, out2, "{name}: the regime is deterministic");
+            assert!(matches!(out, LifecycleOutcome::Killed { .. }), "{name}: the assembled force should KILL the defended core, got {out:?}");
+        }
     }
 }
