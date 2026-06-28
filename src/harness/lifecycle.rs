@@ -559,6 +559,7 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             travel_progress,
             travel_budget_remaining,
             holding_station: false, // offense spatial repro — never a Defend garrison
+            declaiming: false,      // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
         };
         match reconcile(snapshot) {
@@ -852,6 +853,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             travel_progress,
             travel_budget_remaining,
             holding_station,
+            declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
         };
         // BUG B2 (fixed state): a defender that has GARRISONED its owned room (in-room, focus-less) and held
@@ -1274,6 +1276,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             travel_progress,
             travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
             holding_station: is_defend_holding(in_target_room, has_focus),
+            declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available,
         };
         match reconcile(snapshot) {
@@ -1532,6 +1535,7 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             travel_progress,
             travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
             holding_station: false,
+            declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // offense reassign is v1.2+; this driver isolates production→engage
         };
         match reconcile(snapshot) {
@@ -1557,6 +1561,213 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
     // Budget elapsed. If nothing was ever emitted, EVERY candidate was gated out (the deferred-hopeless case).
     let _ = emitted_any;
     ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present: 0 }
+}
+
+// ═══ ADR 0027 v1.1 P2 — the DECLAIM flow (sim-first) ═════════════════════════════════════════════════════
+//
+// The operator's sim-first requirement for the highest-risk salvage migration: prove the WHOLE declaim chain
+// offline + deterministically — a `Declaim` objective is fielded as a CLAIM declaimer squad, it FORMS,
+// TRAVELS, arrives, and `attackController`s the controller across the 1000-tick upgrade-block CADENCE,
+// PERSISTING (the `declaiming` lease-hold refreshes the lease) through every cadence cycle until the
+// controller is neutralized — NEVER giving up mid-neutralization. The terminal is the PRODUCER withdrawing
+// the objective when the controller goes neutral (`objective_gone` retires the declaimer cleanly), exactly
+// like the live `SalvageMission`. The reconcile DECISION is the SHARED `lifecycle::reconcile` kernel (no
+// live/sim drift); the cadence + neutralization are modeled here (the engine `attackController` cadence is
+// the soak's job, per the ADR — this proves the LIFECYCLE persistence the live bug would break).
+
+/// The declaim-flow scenario: where home is, where the controller room is, the per-strike cadence, the number
+/// of strikes to neutralize the controller (`−CONTROLLER_DOWNGRADE_PER_STRIKE` over `strikes_to_neutralize`),
+/// and the lifecycle timing.
+#[derive(Clone, Debug)]
+pub struct DeclaimFlowScenario {
+    pub home: V1Room,
+    pub controller_room: V1Room,
+    /// Ticks the upgrade-block lasts after a strike (the engine cadence, ~1000). Modeled as the gap between
+    /// strikes a declaimer can land — DELIBERATELY longer than `COMMITMENT_BUDGET` so the base lease lapses
+    /// BETWEEN strikes (the exact mid-cadence lapse the `declaiming` hold must bridge).
+    pub cadence: u32,
+    /// Strikes needed to drive the controller to neutral. The flow runs through this many cadence cycles,
+    /// proving the squad persists across ALL of them.
+    pub strikes_to_neutralize: u32,
+    /// Ticks the declaimer needs to form (small — one CLAIM member).
+    pub form_ticks: u32,
+    pub objective_ttl: u32,
+    pub budget_ticks: u32,
+}
+
+/// The declaim-flow outcome — did the declaimer reach the controller AND persist across the cadence to fully
+/// neutralize it (the SUCCESS the P2 lease-hold must produce), or did it give up mid-neutralization (the
+/// pre-fix failure: the base lease lapses between strikes → GaveUp → mark_unwinnable → re-field churn)?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclaimOutcome {
+    /// The declaimer formed, traveled, arrived, and STRUCK the controller across `cadence_cycles` cadence
+    /// cycles WITHOUT ever giving up, until the controller went neutral and the producer withdrew the
+    /// objective — the squad retired cleanly (`generations == 0`: no re-field churn). The P2 success path.
+    Neutralized { cadence_cycles: u32, neutralized_tick: u32 },
+    /// The declaimer gave up mid-neutralization (the lease lapsed between strikes and was NOT held) → it was
+    /// re-fielded. `generations` counts the churn. The pre-`declaiming`-fix failure.
+    GaveUpMidNeutralization { generations: u32, strikes_landed: u32 },
+    /// The declaimer never reached the controller within the budget (a travel/form stall — not the P2 concern,
+    /// but reported for completeness).
+    NeverReached { generations: u32 },
+}
+
+/// Drive the DECLAIM lifecycle end-to-end + deterministically (ADR 0027 v1.1 P2): a `Declaim` objective → ONE
+/// CLAIM declaimer squad claims, forms, travels, arrives, and strikes the controller on the 1000-tick cadence,
+/// PERSISTING across every cadence cycle (the `declaiming` lease-hold) until the controller is neutralized and
+/// the producer withdraws the objective. Returns [`DeclaimOutcome::Neutralized`] (with `generations == 0` — no
+/// churn) on the success path. The reconcile is the SHARED `lifecycle::reconcile` kernel — the same Phase-A
+/// logic the bot runs — so the persistence-across-cadence behavior cannot drift between sim and live.
+pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
+    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+
+    let mut queue = V1Queue::default();
+    let mut generation: u32 = 0;
+
+    let mut claimed_id: Option<u32> = None;
+    let mut phase = V1Phase::Forming;
+    let mut pos: V1Room = s.home;
+    let mut form_done_at: u32 = s.form_ticks;
+    let mut deadline: u32 = COMMITMENT_BUDGET;
+    let mut gen_start: u32 = 0;
+    let mut travel_start: u32 = 0;
+
+    // The controller's neutralization progress: it goes neutral after `strikes_to_neutralize` strikes, one
+    // strike landing per cadence cycle (the engine upgrade-block). `next_strike_at` is when the in-room
+    // declaimer can land its next strike (`None` until it arrives + the first strike fires).
+    let mut strikes_landed: u32 = 0;
+    let mut next_strike_at: Option<u32> = None;
+    let mut cadence_cycles: u32 = 0;
+    let mut controller_neutral = false;
+
+    for tick in 0..s.budget_ticks {
+        // ── PRODUCER (SalvageMission): emit the Declaim objective while the controller is still owned + the
+        //    corridor is open (ReachableNow). Once the controller goes neutral, the producer STOPS emitting +
+        //    WITHDRAWS — the `objective_gone` terminal that retires the declaimer cleanly. ──
+        if !controller_neutral {
+            queue.request(s.controller_room, 25.0 /* LOW */, tick, s.objective_ttl);
+        } else if let Some(id) = queue.objectives.iter().find(|o| o.room == s.controller_room).map(|o| o.id) {
+            queue.withdraw(id); // controller neutral → withdraw (the de-claim is done)
+        }
+        queue.expire(tick);
+
+        // ── Claim: an unclaimed declaimer squad claims the Declaim objective. ──
+        if claimed_id.is_none() {
+            if let Some(id) = queue.best_unclaimed_excluding(u32::MAX) {
+                queue.claim(id);
+                claimed_id = Some(id);
+                phase = V1Phase::Forming;
+                form_done_at = tick + s.form_ticks;
+                pos = s.home;
+                deadline = tick + COMMITMENT_BUDGET;
+                gen_start = tick;
+            }
+        }
+
+        let Some(cur_id) = claimed_id else {
+            if controller_neutral {
+                // The controller is neutral AND the squad has retired (no claim) — the success terminal.
+                return DeclaimOutcome::Neutralized { cadence_cycles, neutralized_tick: tick };
+            }
+            continue;
+        };
+        let obj = queue.get(cur_id).copied();
+        let objective_gone = obj.is_none();
+        let target_room = obj.map(|o| o.room);
+
+        // ── Phase progression: form → travel → in-room (then strike on the cadence). ──
+        let mut in_target_room = false;
+        let mut traveling = false;
+        let mut travel_progress = false;
+        if let Some(target) = target_room {
+            match phase {
+                V1Phase::Forming => {
+                    if tick >= form_done_at {
+                        phase = if pos == target { V1Phase::InRoom } else { V1Phase::Traveling };
+                        travel_start = tick;
+                    }
+                }
+                V1Phase::Traveling => {
+                    traveling = true;
+                    let before = v1_dist(pos, target);
+                    pos = (pos.0 + (target.0 - pos.0).signum(), pos.1 + (target.1 - pos.1).signum());
+                    travel_progress = v1_dist(pos, target) < before;
+                    if pos == target {
+                        phase = V1Phase::InRoom;
+                    }
+                }
+                V1Phase::InRoom => {
+                    in_target_room = true;
+                    // ── DECLAIM DRIVE (the engine `attackController` cadence, modeled): land a strike when the
+                    //    upgrade-block has cleared. The FIRST in-room tick arms the first strike. ──
+                    let strike_due = next_strike_at.map(|t| tick >= t).unwrap_or(true);
+                    if strike_due && !controller_neutral {
+                        strikes_landed += 1;
+                        cadence_cycles += 1;
+                        next_strike_at = Some(tick + s.cadence); // upgrade-blocked for `cadence` ticks
+                        if strikes_landed >= s.strikes_to_neutralize {
+                            controller_neutral = true; // the controller goes neutral → producer withdraws next tick
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase A reconcile (the SHARED kernel). A declaimer has NO focus and never engages, so the
+        //    `declaiming` hold (is_declaim && in_target_room && has_members) is what refreshes the lease across
+        //    the cadence — without it the base lease lapses BETWEEN strikes (cadence > COMMITMENT_BUDGET) and
+        //    the squad would GaveUp+mark_unwinnable mid-neutralization. ──
+        let forming = phase == V1Phase::Forming && tick < form_done_at;
+        let declaiming = in_target_room; // the manager's is_declaim && in_target_room && has_members
+        let snapshot = ReconcileSnapshot {
+            objective_gone,
+            duplicate: false,
+            is_defend: false,
+            deadline_lapsed: tick >= deadline,
+            wiped: false,
+            has_focus: false,   // a quiet derelict room — a declaimer never has a combat focus
+            engaged_once: false, // a declaimer never enters combat
+            in_target_room,
+            has_members: true,
+            forming,
+            forming_progress: forming,
+            forming_in_flight: forming,
+            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET,
+            traveling,
+            travel_progress,
+            travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
+            holding_station: false,
+            declaiming,
+            reassign_available: false,
+        };
+        match reconcile(snapshot) {
+            ReconcileAction::Retire { reason, withdraw, .. } => {
+                // The ONLY clean terminal for a declaimer is ObjectiveGone (the producer withdrew on neutral).
+                // A GaveUp here is the pre-fix failure: the lease lapsed mid-cadence and was NOT held.
+                if reason == RetireReason::ObjectiveGone && controller_neutral {
+                    return DeclaimOutcome::Neutralized { cadence_cycles, neutralized_tick: tick };
+                }
+                if reason == RetireReason::GaveUp {
+                    return DeclaimOutcome::GaveUpMidNeutralization { generations: generation, strikes_landed };
+                }
+                let _ = withdraw;
+                if withdraw {
+                    queue.withdraw(cur_id);
+                } else {
+                    queue.release(cur_id);
+                }
+                generation += 1;
+                claimed_id = None;
+                phase = V1Phase::Forming;
+            }
+            ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
+            ReconcileAction::Keep => {}
+            ReconcileAction::Reassign { .. } => unreachable!("declaim flow never feeds reassign_available=true"),
+        }
+    }
+
+    // Budget elapsed without neutralizing → never reached / never finished.
+    DeclaimOutcome::NeverReached { generations: generation }
 }
 
 /// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
@@ -2551,5 +2762,55 @@ mod tests {
             "an infeasible breach seal must be gated out (no squad fielded), got {out:?}"
         );
         assert_eq!(run_offense_flow(&s), out, "the salvage breach flow is deterministic");
+    }
+
+    // ── ADR 0027 v1.1 P2 — the DECLAIM flow ──────────────────────────────────────────────────────────────
+
+    /// A declaim flow whose `cadence` (the 1000-tick upgrade-block between strikes) DELIBERATELY exceeds the
+    /// `COMMITMENT_BUDGET` (400), so the base lease lapses BETWEEN strikes — the exact mid-cadence lapse the
+    /// `declaiming` lease-hold must bridge. Needs several strikes to neutralize, proving persistence across
+    /// MULTIPLE cadence cycles. The controller is one room from home.
+    fn declaim_scenario() -> DeclaimFlowScenario {
+        DeclaimFlowScenario {
+            home: (0, 0),
+            controller_room: (1, 0),
+            cadence: 1000,             // the engine upgrade-block (>> COMMITMENT_BUDGET=400)
+            strikes_to_neutralize: 3,  // multiple cadence cycles
+            form_ticks: 4,
+            objective_ttl: 100,        // << cadence — proves the objective survives via the lease, not the TTL
+            budget_ticks: 4000,        // room for 3 cadence cycles + form + travel
+        }
+    }
+
+    /// THE P2 success path: a `Declaim` objective fields a CLAIM declaimer that forms, travels, arrives, and
+    /// strikes the controller across EVERY 1000-tick cadence cycle WITHOUT giving up, until the controller is
+    /// neutralized + the producer withdraws — the squad retires cleanly (`generations`-free, no churn). This
+    /// is precisely what the `declaiming` lease-hold buys: a declaimer has no focus and never engages, so the
+    /// base lease lapses between strikes; without the hold this would `GaveUp` mid-neutralization.
+    #[test]
+    fn declaim_flow_persists_across_the_cadence_and_neutralizes() {
+        let out = run_declaim_flow(&declaim_scenario());
+        match out {
+            DeclaimOutcome::Neutralized { cadence_cycles, .. } => {
+                assert_eq!(cadence_cycles, 3, "all three cadence-cycle strikes landed (the squad persisted)");
+            }
+            other => panic!("declaim must persist across the cadence + neutralize, got {other:?}"),
+        }
+        assert_eq!(run_declaim_flow(&declaim_scenario()), out, "the declaim flow is deterministic");
+    }
+
+    /// The declaimer must persist EVEN THOUGH the lease lapses mid-cadence — i.e. the success above is NOT an
+    /// artifact of the lease never lapsing. With `cadence` (1000) >> `COMMITMENT_BUDGET` (400), the lease
+    /// DEMONSTRABLY lapses between strikes; the only thing keeping the squad alive is the `declaiming` hold. A
+    /// control with the cadence SHORTENED below the budget would also pass — so this asserts the demanding case.
+    #[test]
+    fn declaim_flow_lease_actually_lapses_between_strikes() {
+        let s = declaim_scenario();
+        assert!(s.cadence > COMMITMENT_BUDGET, "the test must exercise the mid-cadence lapse the hold bridges");
+        let out = run_declaim_flow(&s);
+        assert!(
+            matches!(out, DeclaimOutcome::Neutralized { .. }),
+            "the declaimer holds across a lease that DOES lapse between strikes, got {out:?}"
+        );
     }
 }
