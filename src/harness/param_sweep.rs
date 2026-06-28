@@ -428,4 +428,74 @@ mod tests {
         assert_eq!(ranked[2].1.win_rate, 0.8, "lower win-rate ranks third");
         assert!(!ranked[3].1.gates_held, "gates-failing ranks last");
     }
+
+    /// ADR 0031 #39 DRAIN Phase 0 — the finite-energy multi-tower drain BED + the BASELINE lock.
+    ///
+    /// A core behind a thin rampart, guarded by FOUR finite-energy towers at MODERATE energy (1500 each —
+    /// drainable: ~150 shots to dry, and a tank can soak that long) clustered at point-blank. The four
+    /// towers at the breach standoff deal far more than a single squad can out-heal, so a BREACH force is
+    /// NOT winnable head-on (the oracle defers the breach / the fielded ceiling can't out-heal → it does
+    /// NOT kill). But the towers are FINITE, so the configuration IS winnable by a DRAIN (a tank soaks them
+    /// dry, then the squad breaches). `assess`'s `AssaultMode::Drain` branch confirms the drain is feasible.
+    ///
+    /// THIS TEST LOCKS THE P0 BASELINE + THE TARGET: today's breach-only pipeline does NOT kill this bed
+    /// (deferred or lost). It MUST FLIP to `Killed` once P2 fields a drain composition through this same
+    /// lifecycle (the optimizer/doctrine emitting a TOUGH+HEAL drain comp + the P1 drain tactic — proven at
+    /// the tactic layer by `screeps-combat-agent`'s `a_drain_squad_bleeds_finite_towers_dry_then_breaches`).
+    /// When P2 lands, change this assertion to `matches!(out, LifecycleOutcome::Killed { .. })`.
+    ///
+    /// NOTE: deliberately NOT added to `acceptance_regimes()` — that set is the gate every point must KILL,
+    /// and this bed is (correctly) un-killable by the breach pipeline until drain comps are fielded. Adding
+    /// it there now would (rightly) fail the whole sweep.
+    #[test]
+    fn finite_multi_tower_drain_bed_is_not_killed_by_the_breach_pipeline_today() {
+        use crate::harness::generate::{ForceSpec, Layout};
+        use screeps_combat_decision::composition::CompositionParams;
+        use screeps_combat_decision::force_sizing::{assess, AssaultMode, DefenseProfile, ForceBudget, TowerThreat};
+
+        // The finite-energy multi-tower drain bed: 4 towers @ 1500 energy each, point-blank to the breach
+        // standoff, behind a thin rampart, with a small guard.
+        let bed = defended_forming();
+        let drain_towers: Vec<((u8, u8), u32)> = vec![((24, 24), 1500), ((26, 24), 1500), ((24, 26), 1500), ((26, 26), 1500)];
+        let rampart = 8_000u32;
+        let params = CompositionParams::default();
+
+        // (1) The drain MATH agrees this bed is drainable-but-not-breachable for a representative single
+        //     squad budget: at the FALLOFF STANDOFF (range 20, where the runtime drain tactic holds — the P1
+        //     tactic stands off rather than soaking point-blank), `assess` returns `AssaultMode::Drain`. A
+        //     direct BREACH cannot out-heal even the falloff fire with the hold margin, but the FINITE drain
+        //     is feasible (the tank's HP + heal over the drain ≥ the falloff damage over the drain ticks).
+        //     This is the existence proof the runtime tactic targets. (The oracle's drain model soaks at the
+        //     supplied `range_to_assault`; refining it to SELECT the standoff is P2 — here we evaluate it at
+        //     the standoff the P1 tactic already implements.)
+        let profile = DefenseProfile {
+            objective_hits: 30_000,
+            breach_hits: rampart,
+            repair_per_tick: 0.0,
+            // Four energized finite towers, evaluated at the falloff standoff (range 20 → 150/tower).
+            towers: drain_towers.iter().map(|&(_, e)| TowerThreat { range_to_assault: 20, energy: e }).collect(),
+            enemy_dps: 0.0,
+            safe_mode: false,
+        };
+        // A single squad budget whose heal beats 4×150 falloff (drain) but not 4×150×1.3 with the hold
+        // margin (breach), and whose tank HP + heal over the drain ticks ≥ the falloff damage over them.
+        let budget = ForceBudget {
+            max_heal_per_tick: 600.0,
+            max_dismantle_dps: 600.0,
+            tank_effective_hp: 20_000.0,
+            onsite_budget_ticks: 1500,
+        };
+        let a = assess(&profile, &budget);
+        assert!(a.winnable, "the bed IS winnable for a single squad — via drain ({})", a.reason);
+        assert_eq!(a.mode, AssaultMode::Drain, "and the winning mode is DRAIN, not breach ({})", a.reason);
+
+        // (2) The BASELINE: today's breach-only lifecycle does NOT kill this bed (it defers the breach / the
+        //     fielded ceiling can't out-heal the four point-blank towers → not Killed). This is the lock.
+        let out = run_defended_lifecycle_with_params(&bed, rampart, &drain_towers, Layout::Open, ForceSpec::Guard(1), &params);
+        assert!(
+            !matches!(out, LifecycleOutcome::Killed { .. }),
+            "P0 BASELINE: the breach-only pipeline must NOT kill the finite multi-tower drain bed today (got {out:?}); \
+             this FLIPS to Killed when P2 fields a drain composition through this lifecycle"
+        );
+    }
 }
