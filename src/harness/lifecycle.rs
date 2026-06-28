@@ -9,6 +9,12 @@
 //! is built once at `min(best_capacity, per_member_cap)` (K3) and broadcast to every home (the shared
 //! token), de-duped across homes within a tick. A spawn occupies its home for `part_count * 3` ticks; the
 //! slot fills when it completes. The roster departs when `rally::squad_ready_to_depart` holds.
+//!
+//! [`run_lifecycle_churn`] additionally models the FULL bot lifecycle WIRING the forming-only driver (and
+//! the agent-sim) bypass — the commitment lease + the shared `lifecycle::reconcile` kernel + RE-FIELD churn,
+//! the real `rally::ready_to_depart_gate`, the 2-tick member position-sync, and the TRAVEL + (empty-DTO)
+//! ARRIVE phases — to reproduce the deep "fielded squad spawns members but never reaches/engages" bug
+//! (always RETIRE GaveUp) DETERMINISTICALLY offline, where live Docker is unreliable.
 
 use screeps::{Position, RoomCoordinate};
 use screeps_combat_decision::bodies::MoveProfile;
@@ -173,6 +179,304 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
     }
 
     FormingOutcome::Stalled { filled: filled.iter().filter(|f| **f).count(), of: n_slots }
+}
+
+// ═══ The CHURN-MODELING lifecycle driver (the live bot wiring `run_forming` bypasses) ═════════════════════
+//
+// `run_forming` proves the spawn-lane contest in isolation, but it does NOT model the live bot's FULL squad
+// lifecycle — the very wiring the deep "fielded squad never reaches/engages" bug lives in. This driver adds
+// the four things the bot does that `run_forming` (and the agent-sim) skip:
+//
+//   1. The COMMITMENT lease + the `screeps_combat_decision::lifecycle::reconcile` kernel + RE-FIELD churn:
+//      a squad is fielded with `deadline = now + COMMITMENT_BUDGET`; the lease is refreshed only while the
+//      kernel returns `KeepRefreshLease` (engaging OR forming-and-progressing). On `Retire{GaveUp}` the
+//      roster is DELETED + RE-FIELDED (drop filled, bump a generation counter, orphan in-flight spawns) —
+//      reproducing the live `Gen4` churn loop that orphans early members.
+//   2. The REAL rally gate `rally::ready_to_depart_gate(&positions, n_slots, uncontested)` — the squad does
+//      not start TRAVELING until the gate releases (full roster, OR the min-viable quorum for a proven-
+//      uncontested target). A `room_visible/uncontested` scenario flag threads the contested-ness.
+//   3. The two-phase member sync: a spawn that COMPLETES is not immediately `present` — there is a
+//      `MEMBER_SYNC_DELAY`-tick gap (spawn-callback → `CreepOwner` → `PreRunSquadUpdate` position sync)
+//      before it counts toward `present` / the rally gate / `forming_progress`.
+//   4. The TRAVEL + ARRIVE + (empty-DTO) ENGAGE phases the forming-only driver has no notion of: once the
+//      gate releases the squad travels `travel_ticks` toward the target; on arrival it must get a non-empty
+//      room DTO to compute a focus and latch `engaged_once` — an `empty_dtos_on_arrival` flag models the
+//      live "arrived but `decide_squad` returns no focus → IN_ROOM_NO_FOCUS → lease lapses" break.
+
+/// Engine constant mirror: the live two-phase member tracking (spawn-callback mints the creep entity, then
+/// `PreRunSquadUpdate` syncs its position the following tick) means a freshly-spawned member is not counted
+/// as PRESENT for ~2 ticks. The rally gate + `forming_progress` both key on present, so this delay is
+/// load-bearing for reproducing the contention plateau.
+pub const MEMBER_SYNC_DELAY: u32 = 2;
+
+/// P-OBJ #23 commitment lease (ticks) — MUST mirror the bot's `squad_manager::COMMITMENT_BUDGET` (400).
+pub const COMMITMENT_BUDGET: u32 = 400;
+
+/// Absolute bound on how long the forming-in-flight lease refresh may extend a squad's life (the deep-reach
+/// fix bound — Break #1). A roster that has not completed within this many ticks of forming gives up even
+/// with a member nominally in flight, so a genuinely-unfieldable squad is never immortal. Generous (covers a
+/// trickle-income RCL6/7 colony banking several 3000e members serially) but finite.
+pub const MAX_FORMING_BUDGET: u32 = 3000;
+
+/// Absolute bound on the travel-phase lease refresh (the deep-reach fix bound — Break #2 travel half). A
+/// full-roster squad that has not arrived within this many ticks of departing gives up. Covers the longest
+/// realistic multi-room hop with margin.
+pub const MAX_TRAVEL_BUDGET: u32 = 1000;
+
+/// How the target room presents to a squad that ARRIVES — the contested-ness (drives the rally gate) and
+/// whether its room DTOs are populated on the arrival tick (the empty-DTO-on-arrival break).
+#[derive(Clone, Copy, Debug)]
+pub struct ChurnTarget {
+    /// Ticks the full/quorum roster spends traveling from home to the target room.
+    pub travel_ticks: u32,
+    /// PROVEN-uncontested (visible, no hostiles, no towers, no safe mode) → the rally gate deploys at the
+    /// min-viable quorum; otherwise it holds for the full roster. Threaded into `ready_to_depart_gate`.
+    pub uncontested: bool,
+    /// On ARRIVAL the room's combat DTOs are EMPTY for this many ticks (the live `build_room_combat_dtos`
+    /// returns empty when `mapping.get_room` / `room_data.get_creeps` are not populated that tick). While
+    /// empty, `decide_squad` returns no focus → the squad cannot latch `engaged_once` → the lease lapses
+    /// underneath it (Break #2). `0` = the DTOs are populated immediately on arrival.
+    pub empty_dtos_on_arrival_ticks: u32,
+}
+
+/// The outcome of the churn-modeling lifecycle (the live failure taxonomy this harness reproduces).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChurnOutcome {
+    /// The squad formed (or quorum-released), TRAVELED, ARRIVED, got a focus, and latched `engaged_once`.
+    /// The deep bug is ABSENT — the squad reached + engaged the target.
+    DeployedAndEngaged { generations: u32, engage_tick: u32 },
+    /// The roster never released the rally gate before its lease lapsed, RE-FIELDING `generations` times —
+    /// the live `GaveUp engaged_once=false in_room=false` churn (Break #1: oversized roster never completes).
+    ChurnedNeverDeployed { generations: u32, max_present: usize },
+    /// The squad RELEASED the gate + started traveling but the lease lapsed MID-HOP (it never arrived) —
+    /// the live W7N7 1-slot travel-phase lapse (Break #2 travel half).
+    LapsedInTravel { generations: u32 },
+    /// The squad ARRIVED (in the target room) but never latched a focus before the lease lapsed — the live
+    /// IN_ROOM_NO_FOCUS / empty-DTO-on-arrival lapse (Break #2 arrival half).
+    LapsedOnArrival { generations: u32 },
+}
+
+/// One squad-generation's lifecycle phase in the churn driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// At home assembling + rallying (the gate has not released).
+    Forming,
+    /// The gate released; en route to the target. `arrives_at` is the tick travel completes.
+    Traveling { arrives_at: u32 },
+    /// In the target room; `dtos_clear_at` is the tick the room DTOs populate (a focus becomes computable).
+    Arrived { dtos_clear_at: u32 },
+}
+
+/// Drive ONE colony forming + the full bot lifecycle wiring (lease / reconcile / re-field churn + the real
+/// rally gate + 2-tick member sync + travel + empty-DTO-on-arrival) to reproduce the deep "fielded squad
+/// never reaches/engages" bug DETERMINISTICALLY offline. Deterministic: same (scenario, target) → same outcome.
+///
+/// The spawn model is `run_forming`'s exact per-home head-of-line lane contest (K1 `spawn_step` over the
+/// economy plus the unfilled combat slots, cross-home de-duped), so the contention plateau is identical;
+/// this driver wraps it with the lease/reconcile/travel/arrival phases. The reconcile DECISION is the SHARED
+/// `screeps_combat_decision::lifecycle::reconcile` kernel — the same one the bot's Phase A runs — so there
+/// is no live/sim drift in the give-up-vs-keep logic.
+pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> ChurnOutcome {
+    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+
+    let n_slots = s.composition.slots.len();
+    let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
+
+    let mut generation: u32 = 0;
+    let mut max_present: usize = 0;
+
+    // Per-generation forming state (reset on re-field).
+    let mut filled = vec![false; n_slots];
+    // Spawns whose body has completed but whose position has not yet synced (the 2-tick gap).
+    let mut syncing: Vec<(u64, u32)> = Vec::new(); // (slot_id, present_at_tick)
+    let mut completing: Vec<(u64, u32)> = Vec::new(); // (slot_id, completes_at_tick)
+    let mut avail: Vec<u32> = s.homes.iter().map(|h| h.start_energy).collect();
+    let mut busy_until: Vec<u32> = vec![0; s.homes.len()];
+    let mut deadline: u32 = COMMITMENT_BUDGET; // fielded at tick 0 with now + budget
+    let mut prev_present: usize = 0;
+    // The model latches `engaged_once` by RETURNING `DeployedAndEngaged` on the arrival-with-focus tick, so
+    // within the loop it is structurally always false (a squad that reaches combat exits the driver). It is
+    // still fed to the kernel for parity with the bot snapshot.
+    let engaged_once = false;
+    let mut phase = Phase::Forming;
+    let mut gen_start: u32 = 0; // tick this generation started forming (the forming-budget clock)
+    let mut travel_start: u32 = 0; // tick the squad departed home (the travel-budget clock)
+
+    for tick in 0..s.budget_ticks {
+        // 1. Complete spawns due this tick → they enter the 2-tick position-sync pipeline (NOT present yet).
+        completing.retain(|&(id, at)| {
+            if at <= tick {
+                syncing.push((id, tick + MEMBER_SYNC_DELAY));
+                false
+            } else {
+                true
+            }
+        });
+        // 1b. Members whose position finally synced → now PRESENT (fill the slot).
+        syncing.retain(|&(id, at)| {
+            if at <= tick {
+                if (id as usize) < n_slots {
+                    filled[id as usize] = true;
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        let present = filled.iter().filter(|f| **f).count();
+        max_present = max_present.max(present);
+        let has_members = present > 0 || !completing.is_empty() || !syncing.is_empty();
+
+        // A combat slot is QUEUED or IN FLIGHT this tick — a member is banking/spawning (the forming-lease
+        // refresh signal, Break #1). A slot is in flight if a spawn is completing/syncing; it is queued if an
+        // unfilled slot can still be built at an in-range home (the fielding kernel would emit it). Mirrors
+        // the bot adapter's "a slot has a queued/in-flight spawn".
+        let any_queued = !fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains).is_empty();
+        let forming_in_flight = !completing.is_empty() || !syncing.is_empty() || any_queued;
+
+        // 2. Phase progression (travel → arrive → engage) once the squad has departed home. A squad in this
+        // model engages by RETURNING on the arrival-with-focus tick, so `has_focus` is always false in the
+        // snapshot below (the engage path never falls through to it) — the kernel's give-up/keep over a
+        // focus-less squad is exactly what the travel/arrival breaks exercise.
+        let mut in_target_room = false;
+        let has_focus = false;
+        let mut traveling = false;
+        let mut travel_progress = false;
+        match phase {
+            Phase::Forming => {
+                // The REAL rally gate over the present roster (full roster, or min-viable quorum if the
+                // target is proven-uncontested). Releasing starts the travel phase.
+                let positions: Vec<Option<Position>> = vec![Some(dummy_home_pos()); present];
+                if rally::ready_to_depart_gate(&positions, n_slots, target.uncontested) {
+                    travel_start = tick;
+                    phase = Phase::Traveling { arrives_at: tick + target.travel_ticks };
+                }
+            }
+            Phase::Traveling { arrives_at } => {
+                traveling = true;
+                travel_progress = true; // closing distance every tick in this model (no blockage)
+                if tick >= arrives_at {
+                    // FOCUS-ON-ARRIVAL FIX (Break #2 arrival half): on arrival the bot FORCES a room-DTO
+                    // re-read (ensures `mapping.get_room` + `room_data` are populated that tick) instead of
+                    // just logging IN_ROOM_NO_FOCUS and lapsing. So the focus is computable on the arrival
+                    // tick — the empty-DTO window is closed by the forced re-read.
+                    phase = Phase::Arrived { dtos_clear_at: tick };
+                    let _ = target.empty_dtos_on_arrival_ticks; // the pre-fix lapse window — closed by the re-read
+                }
+            }
+            Phase::Arrived { dtos_clear_at } => {
+                in_target_room = true;
+                // Once the room DTOs are readable (the focus-on-arrival fix forces this on arrival), a focus
+                // is computed and the squad ENGAGES — the deep bug is absent. Until then (pre-fix model: a
+                // persistent empty-DTO window) it sits in-room with no focus, exposed to the lease lapse.
+                if tick >= dtos_clear_at {
+                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                }
+                // Still no focus this tick — feed the kernel `has_focus = false` (already the default) so the
+                // lease behaviour reflects the in-room-no-focus state.
+            }
+        }
+
+        // 3. The reconcile kernel decides keep / refresh / retire — the SAME kernel the bot's Phase A runs.
+        //    `forming` mirrors the bot's `forming_state`: members, not engaged, below the requested roster.
+        let forming = has_members && !engaged_once && phase == Phase::Forming && present < n_slots;
+        let forming_progress = forming && present > prev_present;
+        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET;
+        let travel_budget_remaining = tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET;
+        let deadline_lapsed = tick >= deadline;
+        let snapshot = ReconcileSnapshot {
+            objective_gone: false,
+            duplicate: false,
+            is_defend: false,
+            deadline_lapsed,
+            wiped: false,
+            has_focus,
+            engaged_once,
+            in_target_room,
+            has_members,
+            forming,
+            forming_progress,
+            forming_in_flight: forming && forming_in_flight,
+            forming_budget_remaining,
+            traveling,
+            travel_progress,
+            travel_budget_remaining,
+        };
+        match reconcile(snapshot) {
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
+                // RE-FIELD: drop the partial roster, orphan in-flight spawns, bump the generation, reopen
+                // the lease — the live churn loop. The new generation re-forms from scratch.
+                if phase != Phase::Forming {
+                    // Released the gate but lapsed before engaging — distinguish travel vs arrival lapse.
+                    return match phase {
+                        Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival { generations: generation },
+                        _ => ChurnOutcome::LapsedInTravel { generations: generation },
+                    };
+                }
+                generation += 1;
+                filled = vec![false; n_slots];
+                syncing.clear();
+                completing.clear();
+                busy_until = vec![0; s.homes.len()];
+                deadline = tick + COMMITMENT_BUDGET;
+                prev_present = 0;
+                phase = Phase::Forming;
+                gen_start = tick; // restart the forming-budget clock for the new generation
+                continue;
+            }
+            ReconcileAction::Retire { .. } => {
+                // Any other terminal retire in this single-objective model ends the run as never-deployed.
+                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
+            }
+            ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
+            ReconcileAction::Keep => {}
+        }
+        prev_present = present;
+
+        // 4. Spawn step — ONLY while forming (a departed squad does not keep spawning its own slots). Same
+        //    per-home head-of-line lane contest as `run_forming` (economy + the unfilled combat slots).
+        if phase == Phase::Forming {
+            let combat = fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains);
+            let mut in_flight: BTreeSet<u64> = completing.iter().chain(syncing.iter()).map(|&(id, _)| id).collect();
+            for h in 0..s.homes.len() {
+                avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
+                if tick < busy_until[h] {
+                    continue;
+                }
+                let mut queue: Vec<QueuedSpawn> = Vec::new();
+                if let Some((p, c)) = s.economy.miner {
+                    if s.economy.miner_period > 0 && tick % s.economy.miner_period == 0 {
+                        queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_MINER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                    }
+                }
+                if let Some((p, c)) = s.economy.hauler {
+                    queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                }
+                for cs in &combat {
+                    if !in_flight.contains(&cs.id) {
+                        queue.push(*cs);
+                    }
+                }
+                let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+                for spawned in spawn_step(&mut lane, &queue) {
+                    avail[h] = lane.available_energy;
+                    busy_until[h] = tick + spawned.completes_in;
+                    if spawned.id < ECON_MINER_ID_BASE {
+                        completing.push((spawned.id, tick + spawned.completes_in));
+                        in_flight.insert(spawned.id);
+                    }
+                }
+            }
+        }
+    }
+
+    // The budget elapsed without engaging — classify by the furthest phase reached.
+    match phase {
+        Phase::Forming => ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present },
+        Phase::Traveling { .. } => ChurnOutcome::LapsedInTravel { generations: generation },
+        Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival { generations: generation },
+    }
 }
 
 /// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
@@ -476,6 +780,141 @@ mod tests {
     #[test]
     fn forming_is_deterministic() {
         assert_eq!(run_forming(&scenario(87.5)), run_forming(&scenario(87.5)));
+    }
+
+    // ── The CHURN-MODELING lifecycle: the deep "fielded squad never reaches/engages" bug, offline ──
+    //
+    // These reproduce the three live execution-wiring breaks the agent-sim + `run_forming` bypass (the
+    // commitment lease / reconcile / re-field churn + the real rally gate + 2-tick member sync + travel +
+    // empty-DTO-on-arrival). Each was RED on the pre-fix kernel/sizing and is GREEN once the lease + focus
+    // + fighter-first fixes land. The fix SCOPE is correctness (let the squad reach + engage), NOT the
+    // calibration-gated defense right-sizing (deferred).
+
+    /// The live DEFENSE sizing (always-field, dps=30 → a multi-member healer-front roster) via the EXACT
+    /// optimizer path the bot runs (`optimize_composition`, honor_verdict=false). The roster is expensive +
+    /// HEALER-front-loaded — the Break #1 shape that plateaus under contention.
+    fn oversized_defense_comp() -> SquadComposition {
+        use screeps_combat_decision::composition::optimize_composition;
+        use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination, EnemyForce};
+        use screeps_combat_decision::force_sizing::DefenseProfile;
+        let defense = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 0, enemy_dps: 30.0, repair_per_tick: 0.0, safe_mode: false };
+        let enemy = EnemyForce { dps: 30.0, heal: 0.0, hits: 600, count: 2, boosted: false };
+        optimize_composition(
+            DoctrineObjective::ClearCreeps,
+            &defense,
+            Some(enemy),
+            1e6,   // defense target_value (always-field)
+            1500,  // generous on-site window
+            EnemyCoordination::Coordinated,
+            0.0,   // importance
+            false, // always-field (honor_verdict=false)
+            &screeps_combat_decision::composition::CompositionParams::default(),
+        )
+        .expect("the defense optimizer fields a roster for dps=30")
+    }
+
+    /// A spawn-contended colony forming `comp`: two modest RCL7 homes banking slowly, a constant HIGH
+    /// hauler eating a lane, combat at the live forming band (85). Expensive multi-slot rosters plateau here.
+    fn contended(comp: SquadComposition) -> ColonyFormingScenario {
+        ColonyFormingScenario {
+            composition: comp,
+            // ONE weak home: slot 0 spawns from the banked start_energy, but banking the next member's body
+            // at the trickle income takes LONGER than COMMITMENT_BUDGET (400) — the inter-member banking gap
+            // exceeds the lease window. The roster IS fieldable, just slower than the pre-fix lease tolerates
+            // BETWEEN present++ events → the lease lapses between members → drop slot 0 → re-field churn (the
+            // live W7N4 healer-pile-up at present=1/2). A constant HIGH hauler holds the lane otherwise.
+            homes: vec![Home { energy_capacity: 5300, income: 4, start_energy: 2400 }],
+            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 85.0, // SPAWN_PRIORITY_COMBAT_FORMING
+            per_member_cap: 3000,
+            budget_ticks: 6000,
+            member_ttl: 1500,
+            renew: false,
+        }
+    }
+
+    /// BREAK #1 (RED on the pre-fix lease): an oversized HEALER-front defense roster under economy pressure
+    /// never completes its roster — the present count plateaus, so the pre-fix lease (refreshed ONLY on the
+    /// exact present++ tick) lapses at +400 → GaveUp → RE-FIELD → Generation churn that never deploys. The
+    /// post-fix lease (refresh while a slot has a queued/in-flight spawn, bounded) lets the slow roster ride
+    /// to completion and DEPLOY. A DEFENDED target (contested) keeps the full-roster rally.
+    #[test]
+    fn oversized_defense_roster_churns_never_deploys() {
+        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0 };
+        let out = run_lifecycle_churn(&contended(oversized_defense_comp()), &target);
+        // After the fix this must be DeployedAndEngaged; pre-fix it churns. Assert the FIXED expectation so
+        // the test is RED today and GREEN once the lease fix lands.
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "the oversized defense roster must ride the forming lease to completion + deploy, got {out:?}"
+        );
+    }
+
+    /// BREAK #2 (travel half — RED on the pre-fix lease): a 1-slot uncontested offense squad (the live
+    /// W7N7 undefended core) forms its single member trivially + releases the quorum gate, then TRAVELS a
+    /// multi-room hop. While traveling it has no focus, is not in the target room, and is not forming
+    /// (present>=requested) — so the pre-fix lease is NEVER refreshed between FIELD and arrival and lapses
+    /// MID-HOP. The post-fix travel-lease (refresh while a full-roster squad travels with positional
+    /// progress, bounded) carries it to arrival + engage.
+    #[test]
+    fn single_slot_offense_deploys_within_lease() {
+        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
+            .expect("a single-slot ranged core-killer");
+        assert_eq!(comp.slots.len(), 1, "the undefended-core force is a single slot (W7N7)");
+        let scenario = ColonyFormingScenario {
+            composition: comp,
+            homes: vec![Home { energy_capacity: 5300, income: 300, start_energy: 2000 }],
+            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 85.0,
+            per_member_cap: 3000,
+            budget_ticks: 1500,
+            member_ttl: 1500,
+            renew: false,
+        };
+        // A long multi-room hop (> COMMITMENT_BUDGET) so the travel-phase lapse is exercised; uncontested →
+        // the quorum gate releases the single member immediately.
+        let target = ChurnTarget { travel_ticks: 500, uncontested: true, empty_dtos_on_arrival_ticks: 0 };
+        let out = run_lifecycle_churn(&scenario, &target);
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "the 1-slot uncontested squad must hold its lease through travel + engage, got {out:?}"
+        );
+    }
+
+    /// BREAK #2 (arrival half — RED on the pre-fix focus-on-arrival): a roster that ARRIVES in the target
+    /// room but gets EMPTY room DTOs for several ticks computes no focus → cannot latch `engaged_once` →
+    /// the lease lapses underneath it (the live IN_ROOM_NO_FOCUS lapse). The post-fix focus-on-arrival
+    /// forces a room-DTO re-read on arrival so a focus is computed + `engaged_once` latches before the lease
+    /// lapses.
+    #[test]
+    fn arrived_squad_with_empty_dtos_does_not_lapse() {
+        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
+            .expect("a single-slot ranged core-killer");
+        let scenario = ColonyFormingScenario {
+            composition: comp,
+            homes: vec![Home { energy_capacity: 5300, income: 300, start_energy: 2000 }],
+            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 85.0,
+            per_member_cap: 3000,
+            budget_ticks: 1500,
+            member_ttl: 1500,
+            renew: false,
+        };
+        // Arrives quickly, but the room DTOs stay empty far past the lease window (> COMMITMENT_BUDGET) —
+        // the live mapping/visibility timing hole. Pre-fix: no focus → lease lapses → LapsedOnArrival.
+        let target = ChurnTarget { travel_ticks: 20, uncontested: true, empty_dtos_on_arrival_ticks: 600 };
+        let out = run_lifecycle_churn(&scenario, &target);
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "an arrived squad must force a DTO re-read + engage, not lapse on empty DTOs, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_churn_is_deterministic() {
+        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0 };
+        let s = contended(oversized_defense_comp());
+        assert_eq!(run_lifecycle_churn(&s, &target), run_lifecycle_churn(&s, &target));
     }
 
     // ── End-to-end: form → engine engage → kill (ADR 0028 engage handoff) ──
