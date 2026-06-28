@@ -1107,7 +1107,9 @@ enum V1Phase {
 /// generations) because the stale objective vanishes underneath the squad and it re-fields from scratch.
 pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
     use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
-    use screeps_combat_decision::war_decision::{emit_defense, DefensePolicy, OwnedRoom, Threat};
+    use screeps_combat_decision::war_decision::{
+        emit_defense, neighbour_threats, observe_neighbours, DefensePolicy, OwnedRoom, RawObservation, Threat,
+    };
 
     let owned: Vec<OwnedRoom<V1Room>> = s.owned.iter().map(|&(r, v)| OwnedRoom { room: r, value: v }).collect();
     let policy = DefensePolicy::default();
@@ -1131,11 +1133,43 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
     let mut threat_step: usize = 0;
 
     for tick in 0..s.budget_ticks {
-        // ── DEFENSE SCAN (every scan_period ticks): advance the threat one room + run the PURE kernel. ──
+        // ── DEFENSE SCAN (every scan_period ticks): advance the threat one room + run the FULL PRODUCTION
+        //    CHAIN (ADR 0027 P0): synthetic room-with-hostile → observe_neighbours → neighbour_threats →
+        //    emit_defense → queue. The threat is an ARMED (Attack) hostile creep occupying one room; when it
+        //    is in an OWNED room it goes through the owned-room threat path (emit_defense directly, as war.rs
+        //    does), when it roams a NEIGHBOUR it goes through the PURE observe_neighbours → neighbour_threats
+        //    builder — exactly the live war.rs seam, now end-to-end offline + deterministic. ──
         if tick % s.scan_period == 0 {
-            // The threat occupies path[threat_step] this scan (None once exhausted).
+            // The threat occupies path[threat_step] this scan (None once exhausted). Model it as one armed
+            // hostile body (a single Attack part ⇒ danger 30 via the lifted estimate).
             let threat_room = s.threat_path.get(threat_step).copied();
-            let threats: Vec<Threat<V1Room>> = threat_room.map(|r| vec![Threat { room: r, danger: 1.0 }]).into_iter().flatten().collect();
+            let owned_set: Vec<V1Room> = s.owned.iter().map(|&(r, _)| r).collect();
+
+            // OWNED-ROOM threats (emit_defense directly): the threat is in an owned room this scan.
+            let owned_threats: Vec<Threat<V1Room>> = threat_room
+                .filter(|r| owned_set.contains(r))
+                .map(|r| vec![Threat { room: r, danger: 30.0 }])
+                .into_iter()
+                .flatten()
+                .collect();
+
+            // NEIGHBOUR observation (the lifted P0 chain): build a synthetic RawObservation for the threat's
+            // room (visible, non-owned, an armed Attack body) and run observe_neighbours → neighbour_threats.
+            let bodies: Vec<Vec<screeps::Part>> = vec![vec![screeps::Part::Attack, screeps::Part::Move]];
+            let neighbour_obs: Vec<RawObservation<V1Room>> = threat_room
+                .filter(|r| !owned_set.contains(r))
+                .map(|r| {
+                    let nearest = owned_set.iter().map(|&o| v1_dist(o, r)).min();
+                    vec![RawObservation { room: r, hostile_bodies: &bodies, visible: true, is_owned: false, nearest_owned_dist: nearest }]
+                })
+                .into_iter()
+                .flatten()
+                .collect();
+            let observed = observe_neighbours(&neighbour_obs, policy);
+            let neighbour_threats = neighbour_threats(&owned, &observed, policy, v1_dist);
+
+            // Feed the owned-room threats AND the neighbour threats to the one proven emission kernel.
+            let threats: Vec<Threat<V1Room>> = owned_threats.into_iter().chain(neighbour_threats).collect();
             // PURE defense emission: Secure at the threat's current room (boost + leash applied in-kernel).
             for emission in emit_defense(&owned, &threats, policy, v1_dist) {
                 queue.request(emission.room, emission.priority, tick, s.objective_ttl);
@@ -1308,6 +1342,221 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
 /// The defender hold-station signal (mirrors the manager's `is_defend && in_target_room && !has_focus`).
 fn is_defend_holding(in_target_room: bool, has_focus: bool) -> bool {
     in_target_room && !has_focus
+}
+
+// ═══ ADR 0027 P0: run_offense_flow — the OFFENSE production layer, sim-able end-to-end ════════════════════
+//
+// `run_v1_flow` proves the DEFENSE production chain (observe → threats → emit_defense → queue → reconcile).
+// This driver brings the OFFENSE production layer in too (ADR 0027 P0 line 326-328): an offense CANDIDATE
+// (room + source + defense) flows through the SAME two pure decisions the live `war.rs::run_offense_evaluation`
+// makes — the source→(DoctrineObjective, ObjectiveKind class, priority) MAP and the WINNABILITY/ROI gate (the
+// real `decision::doctrine::plan_engagement` honoring the oracle's unwinnable defer) — into the objective
+// queue, where ONE squad claims it, fields, travels, and engages via the shared `reconcile` kernel. So
+// offense production is offline-provable: a winnable candidate yields an engaged squad; an unwinnable one is
+// gated out (no objective, no squad). Pure + deterministic.
+
+/// An offense candidate the toy `run_offense_evaluation` produced — the bot-agnostic slice of `war.rs`'s
+/// `AttackCandidate` the production decision needs.
+#[derive(Clone, Debug)]
+pub struct OffenseCandidate {
+    /// The target room (toy grid coords; Chebyshev distance from home).
+    pub room: V1Room,
+    /// The bot-agnostic engagement objective (the source→doctrine map: a level-0 core is
+    /// `KillImmuneStructure`; an attack flag is `ClearCreeps`; a player remote is `RaidCreeps`).
+    pub objective: screeps_combat_decision::doctrine::DoctrineObjective,
+    /// Whether the doctrine HONORS the oracle's unwinnable verdict (a gated core/raid defers a hopeless room;
+    /// an operator flag always-fields). Mirrors `Doctrine::honor_verdict`.
+    pub honor_verdict: bool,
+    /// The scouted defense the winnability gate judges (towers / objective hits / enemy dps). An undefended
+    /// level-0 core is `DefenseProfile::default()` with `objective_hits` set.
+    pub defense: screeps_combat_decision::force_sizing::DefenseProfile,
+    /// The EV upside (the candidate score scaled) the optimizer maximizes against.
+    pub target_value: f32,
+}
+
+/// The offense-flow scenario: where home is, the candidate(s) the scan produced, the per-member spawn energy
+/// + the on-site window the winnability gate sizes against, and the lifecycle timing.
+#[derive(Clone, Debug)]
+pub struct OffenseFlowScenario {
+    pub home: V1Room,
+    pub candidates: Vec<OffenseCandidate>,
+    /// Per-member spawn energy (the optimizer sizes each member to this).
+    pub member_energy: u32,
+    /// On-site window (ticks) the candidate has to deliver its kill (`CREEP_LIFE_TIME − spawn − travel`).
+    pub onsite_window: u32,
+    pub scan_period: u32,
+    pub objective_ttl: u32,
+    pub form_ticks: u32,
+    pub budget_ticks: u32,
+}
+
+/// The PURE offense production decision (ADR 0027 P0): a candidate → an objective to queue, OR `None`
+/// (the winnability/ROI gate defers a hopeless room). Mirrors `war.rs::run_offense_evaluation`'s
+/// candidate→objective map + the `plan_engagement` winnability gate, in one sim-able place: a gated
+/// doctrine (`honor_verdict`) commits ONLY when `optimize_composition` returns a comp (EV-positive +
+/// winnable); an always-field doctrine commits regardless. Returns `(priority, member_count)` for the
+/// objective when fielded. Deterministic (the decision crate's optimizer is bit-deterministic).
+fn offense_candidate_to_objective(c: &OffenseCandidate, member_energy: u32, onsite_window: u32) -> Option<f32> {
+    use screeps_combat_decision::composition::{optimize_composition, CompositionParams};
+    use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination};
+
+    // The source→priority map (a slice of war.rs's mapping): a core is MEDIUM, a flag HIGH, a raid LOW.
+    let priority = match c.objective {
+        DoctrineObjective::KillImmuneStructure | DoctrineObjective::DismantleStructure => 50.0,
+        DoctrineObjective::ClearCreeps => 75.0,
+        _ => 25.0,
+    };
+
+    // The WINNABILITY/ROI gate: run the SAME EV optimizer war.rs's `plan_engagement` runs. A gated doctrine
+    // (`honor_verdict`) defers (`None`) a hopeless / negative-EV room; an always-field doctrine fields the
+    // best regardless. The enemy creep force is folded into the defense profile's `enemy_dps`.
+    let comp = optimize_composition(
+        c.objective,
+        &c.defense,
+        None,
+        c.target_value,
+        onsite_window,
+        EnemyCoordination::Coordinated,
+        0.0,
+        c.honor_verdict,
+        &CompositionParams { member_energy, ..Default::default() },
+    );
+    comp.map(|_| priority)
+}
+
+/// Drive the OFFENSE production layer end-to-end + deterministically (ADR 0027 P0): candidate(s) →
+/// `offense_candidate_to_objective` (source map + winnability gate) → queue → ONE squad claims, forms,
+/// travels, engages via the shared `reconcile` kernel. Returns the [`ChurnOutcome`]: `DeployedAndEngaged`
+/// when a winnable candidate yields an engaged squad; `ChurnedNeverDeployed` (generation 0) when EVERY
+/// candidate is gated out (no objective ever queued → nothing to field).
+pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
+    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot};
+
+    let mut queue = V1Queue::default();
+    let mut generation: u32 = 0;
+
+    let mut claimed_id: Option<u32> = None;
+    let mut phase = V1Phase::Forming;
+    let mut pos: V1Room = s.home;
+    let mut form_done_at: u32 = s.form_ticks;
+    // Never set true (the InRoom branch returns DeployedAndEngaged immediately) — kept mutable only for the
+    // re-field reset symmetry below; the snapshot reads it as the always-forming/traveling pre-engage state.
+    #[allow(unused_assignments)]
+    let mut engaged_once = false;
+    let mut deadline: u32 = COMMITMENT_BUDGET;
+    let mut gen_start: u32 = 0;
+    let mut travel_start: u32 = 0;
+    let mut emitted_any = false;
+
+    for tick in 0..s.budget_ticks {
+        // ── OFFENSE SCAN: map each candidate through the production decision (source map + winnability gate)
+        //    and upsert the surviving objectives. A gated, hopeless candidate yields nothing (deferred). ──
+        if tick % s.scan_period == 0 {
+            for c in &s.candidates {
+                if let Some(priority) = offense_candidate_to_objective(c, s.member_energy, s.onsite_window) {
+                    queue.request(c.room, priority, tick, s.objective_ttl);
+                    emitted_any = true;
+                }
+            }
+        }
+        queue.expire(tick);
+
+        // ── Claim: an unclaimed squad claims the best objective. ──
+        if claimed_id.is_none() {
+            if let Some(id) = queue.best_unclaimed_excluding(u32::MAX) {
+                queue.claim(id);
+                claimed_id = Some(id);
+                phase = V1Phase::Forming;
+                form_done_at = tick + s.form_ticks;
+                pos = s.home;
+                engaged_once = false;
+                deadline = tick + COMMITMENT_BUDGET;
+                gen_start = tick;
+            }
+        }
+
+        let Some(cur_id) = claimed_id else {
+            continue;
+        };
+        let obj = queue.get(cur_id).copied();
+        let objective_gone = obj.is_none();
+        let target_room = obj.map(|o| o.room);
+
+        // ── Phase progression: form → travel → in-room → engage. ──
+        // The squad ENGAGES (exits the driver) on reaching the target room, so `in_target_room` stays false
+        // at the snapshot below (a pre-engage forming/traveling state) — the offense flow isolates the
+        // production→field→reach decision, not the in-room fight.
+        let in_target_room = false;
+        let mut traveling = false;
+        let mut travel_progress = false;
+        if let Some(target) = target_room {
+            match phase {
+                V1Phase::Forming => {
+                    if tick >= form_done_at {
+                        phase = if pos == target { V1Phase::InRoom } else { V1Phase::Traveling };
+                        travel_start = tick;
+                    }
+                }
+                V1Phase::Traveling => {
+                    traveling = true;
+                    let before = v1_dist(pos, target);
+                    pos = (pos.0 + (target.0 - pos.0).signum(), pos.1 + (target.1 - pos.1).signum());
+                    travel_progress = v1_dist(pos, target) < before;
+                    if pos == target {
+                        phase = V1Phase::InRoom;
+                    }
+                }
+                V1Phase::InRoom => {
+                    // Arrived + engaging the offense target — the production layer drove a squad to the kill.
+                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                }
+            }
+        }
+
+        let forming = phase == V1Phase::Forming && tick < form_done_at;
+        let snapshot = ReconcileSnapshot {
+            objective_gone,
+            duplicate: false,
+            is_defend: false,
+            deadline_lapsed: tick >= deadline,
+            wiped: false,
+            has_focus: in_target_room,
+            engaged_once,
+            in_target_room,
+            has_members: true,
+            forming,
+            forming_progress: forming,
+            forming_in_flight: forming,
+            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET,
+            traveling,
+            travel_progress,
+            travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
+            holding_station: false,
+            reassign_available: false, // offense reassign is v1.2+; this driver isolates production→engage
+        };
+        match reconcile(snapshot) {
+            ReconcileAction::Retire { reason, withdraw, .. } => {
+                if withdraw {
+                    queue.withdraw(cur_id);
+                } else {
+                    queue.release(cur_id);
+                }
+                let _ = reason;
+                generation += 1;
+                claimed_id = None;
+                phase = V1Phase::Forming;
+                engaged_once = false;
+                continue;
+            }
+            ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
+            ReconcileAction::Keep => {}
+            ReconcileAction::Reassign { .. } => unreachable!("offense flow never feeds reassign_available=true"),
+        }
+    }
+
+    // Budget elapsed. If nothing was ever emitted, EVERY candidate was gated out (the deferred-hopeless case).
+    let _ = emitted_any;
+    ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present: 0 }
 }
 
 /// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
@@ -2152,5 +2401,88 @@ mod tests {
             !matches!(out, ChurnOutcome::Reassigned { .. }),
             "with no sibling available, the squad must NOT reassign — it falls back to retire, got {out:?}"
         );
+    }
+
+    /// ADR 0027 P0: the FULL DEFENSE PRODUCTION CHAIN is sim-able — a MOVING ARMED NEIGHBOUR hostile flows
+    /// through observe_neighbours → neighbour_threats → emit_defense → queue → reconcile and produces the
+    /// Secure objective chain end-to-end (the squad reassigns to follow). This is the same `run_v1_flow`
+    /// acceptance, but it now exercises the LIFTED `observe_neighbours` kernel on the neighbour leg (the
+    /// threat walks from the owned room into a neighbour), proving the whole observation LAYER offline.
+    #[test]
+    fn full_defense_production_chain_drives_secure_via_observe_neighbours() {
+        // The threat starts in the owned room, then walks to the neighbour (1,0) — the neighbour leg runs
+        // through observe_neighbours (armed Attack body, visible, non-owned, within leash).
+        let out = run_v1_flow(&v1_threat_walks_to_neighbour(true));
+        match out {
+            ChurnOutcome::Reassigned { from_gen, reassignments, .. } => {
+                assert_eq!(from_gen, 0, "same squad followed the threat via the lifted observe chain (no churn)");
+                assert!(reassignments >= 1, "the squad rebound to the neighbour Secure produced by observe_neighbours");
+            }
+            other => panic!("the full defense production chain must drive Secure end-to-end, got {other:?}"),
+        }
+    }
+
+    // ── ADR 0027 P0: run_offense_flow — the offense production layer, sim-able ──
+
+    use screeps_combat_decision::doctrine::DoctrineObjective;
+    use screeps_combat_decision::force_sizing::DefenseProfile;
+
+    /// An UNDEFENDED level-0 invader core (a 50k-hit dismantle-immune structure, no towers/defenders) is a
+    /// WINNABLE candidate: the production layer maps it to a `KillImmuneStructure` objective, the winnability
+    /// gate passes, a squad claims + forms + travels + ENGAGES it. The offense production chain drives a kill.
+    #[test]
+    fn offense_flow_winnable_core_fields_and_engages() {
+        let s = OffenseFlowScenario {
+            home: (0, 0),
+            candidates: vec![OffenseCandidate {
+                room: (2, 0),
+                objective: DoctrineObjective::KillImmuneStructure,
+                honor_verdict: true, // a gated doctrine — must pass the winnability gate to field
+                defense: DefenseProfile { objective_hits: 50_000, ..Default::default() },
+                target_value: 1_000_000.0,
+            }],
+            member_energy: 5600,
+            onsite_window: 1000,
+            scan_period: 2,
+            objective_ttl: 100,
+            form_ticks: 4,
+            budget_ticks: 400,
+        };
+        let out = run_offense_flow(&s);
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { generations: 0, .. }),
+            "a winnable undefended core must field + engage end-to-end, got {out:?}"
+        );
+        assert_eq!(run_offense_flow(&s), out, "the offense flow is deterministic");
+    }
+
+    /// A SAFE-MODED room is UNWINNABLE (zero damage possible): the gated doctrine's winnability gate DEFERS
+    /// it — no objective is ever queued, so no squad is fielded. The production layer never feeds a squad to
+    /// a hopeless room (the ROI/winnability gate working in the sim).
+    #[test]
+    fn offense_flow_unwinnable_safe_mode_is_gated_out() {
+        let s = OffenseFlowScenario {
+            home: (0, 0),
+            candidates: vec![OffenseCandidate {
+                room: (2, 0),
+                objective: DoctrineObjective::KillImmuneStructure,
+                honor_verdict: true,
+                // Safe mode → zero damage possible → unwinnable → the gate defers (no comp).
+                defense: DefenseProfile { objective_hits: 50_000, safe_mode: true, ..Default::default() },
+                target_value: 1_000_000.0,
+            }],
+            member_energy: 5600,
+            onsite_window: 1000,
+            scan_period: 2,
+            objective_ttl: 100,
+            form_ticks: 4,
+            budget_ticks: 200,
+        };
+        let out = run_offense_flow(&s);
+        assert!(
+            matches!(out, ChurnOutcome::ChurnedNeverDeployed { generations: 0, .. }),
+            "an unwinnable safe-moded room must be gated out (no squad fielded), got {out:?}"
+        );
+        assert_eq!(run_offense_flow(&s), out, "the offense flow is deterministic");
     }
 }
