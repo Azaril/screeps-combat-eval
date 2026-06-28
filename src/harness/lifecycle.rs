@@ -2485,4 +2485,71 @@ mod tests {
         );
         assert_eq!(run_offense_flow(&s), out, "the offense flow is deterministic");
     }
+
+    /// ADR 0027 v1.1 P1 — the SALVAGE BREACH migration, proved offline end-to-end. A derelict room's
+    /// controller/source is walled behind a dismantlable over-horizon seal: the salvage breach producer emits
+    /// a `Dismantle{room, breach-blocker}` candidate (a `DismantleStructure` objective — the dormant
+    /// `SiegeBreach` doctrine's FIRST live producer). The corridor's total hits (a feasible wall) are the
+    /// `objective_hits` the doctrine sizes the WORK squad against. The production layer maps it through the
+    /// SAME winnability gate, a squad claims + forms + travels + ENGAGES (razes) the blocker — the corridor
+    /// opens. This is the migrated path: the mission no longer fields its own breach dismantler; the v1
+    /// SquadManager sizes + fields it via `SiegeBreach`. Offline-provable + deterministic.
+    #[test]
+    fn offense_flow_salvage_breach_blocker_fields_sizes_and_dismantles() {
+        let s = OffenseFlowScenario {
+            home: (0, 0),
+            candidates: vec![OffenseCandidate {
+                room: (2, 0),
+                // The breach corridor blocker is a dismantle-able structure ring → `SiegeBreach` (WORK).
+                objective: DoctrineObjective::DismantleStructure,
+                honor_verdict: true, // gated offense — must pass the winnability gate to field
+                // A feasible dismantlable seal: the corridor's total hits (a single over-horizon wall here).
+                defense: DefenseProfile { objective_hits: 30_000, ..Default::default() },
+                target_value: 1_000_000.0,
+            }],
+            member_energy: 5600,
+            onsite_window: 1000,
+            scan_period: 2,
+            objective_ttl: 100,
+            form_ticks: 4,
+            budget_ticks: 400,
+        };
+        let out = run_offense_flow(&s);
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { generations: 0, .. }),
+            "a feasible breach blocker must field a SiegeBreach squad + engage (dismantle) it end-to-end, got {out:?}"
+        );
+        assert_eq!(run_offense_flow(&s), out, "the salvage breach flow is deterministic");
+    }
+
+    /// The breach winnability gate: a breach corridor sealed past any feasible WORK budget (an enormous hit
+    /// pool the `SiegeBreach` sizer can't crack within the on-site window) is DEFERRED — no objective, no
+    /// squad. The producer never feeds a dismantler squad to an un-chewable seal (mirrors the mission only
+    /// emitting on a feasible `breach_target`).
+    #[test]
+    fn offense_flow_salvage_breach_infeasible_seal_is_gated_out() {
+        let s = OffenseFlowScenario {
+            home: (0, 0),
+            candidates: vec![OffenseCandidate {
+                room: (2, 0),
+                objective: DoctrineObjective::DismantleStructure,
+                honor_verdict: true,
+                // A wall hit-pool far beyond what a WORK squad can chew in the window → unwinnable → deferred.
+                defense: DefenseProfile { objective_hits: u32::MAX, ..Default::default() },
+                target_value: 1_000_000.0,
+            }],
+            member_energy: 5600,
+            onsite_window: 1000,
+            scan_period: 2,
+            objective_ttl: 100,
+            form_ticks: 4,
+            budget_ticks: 200,
+        };
+        let out = run_offense_flow(&s);
+        assert!(
+            matches!(out, ChurnOutcome::ChurnedNeverDeployed { generations: 0, .. }),
+            "an infeasible breach seal must be gated out (no squad fielded), got {out:?}"
+        );
+        assert_eq!(run_offense_flow(&s), out, "the salvage breach flow is deterministic");
+    }
 }
