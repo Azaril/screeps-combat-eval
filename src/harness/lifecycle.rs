@@ -1838,6 +1838,7 @@ fn auction_matrix(s: &AuctionFlowScenario) -> screeps_combat_decision::assignmen
             class: CapClass::Offense,
             current_objective: sq.current_objective,
             recycle_ev: 0,
+            ..Default::default()
         })
         .collect();
     let n_rows = rows.len();
@@ -1915,6 +1916,214 @@ pub fn run_auction_flow(s: &AuctionFlowScenario) -> AuctionOutcome {
         })
         .collect();
     AuctionOutcome { total_ev: sol.total_ev, picks }
+}
+
+// ═══ ADR 0032 v2 / ADR 0027 — run_merge_flow: the MERGE/transfer pending-slot primitive (kernel + model) ══
+//
+// SCOPE — what this proves and what it does NOT. The kernel tests prove the Merge COLUMN (feasibility guard +
+// EV) in isolation. `run_merge_flow` proves the KERNEL SELECTION (the solve picks a `Merge→Bk` when, and only
+// when, it is EV-positive) plus an ABSTRACT transfer model mirroring the bot's `apply_merges` — (1) the
+// donor's role-matched member is moved INTO the receiver's open pending slot, (2) that slot is marked filled,
+// (3) the donor EMPTIES → clean retire (the creep was TRANSFERRED, never deleted; it ends owned by EXACTLY ONE
+// squad). The "spawn-slot drop" in step (2) is asserted BY CONSTRUCTION (the model flips `filled = true`); it
+// does NOT model the live SpawnQueue / Phase-B / deferred-`exec_mut` INTERLEAVING. In particular this harness
+// does NOT exercise the same-tick DOUBLE-FILL race (a Phase-B spawn queued before the deferred transfer
+// applied). That live no-double-fill is guarded in the BOT by the `create_spawn_callback` `is_slot_filled`
+// recheck (`squad_manager::should_register_spawned_member` — Bug #1) and its bot `--lib` test; this harness
+// validates only the kernel decision + the abstract transfer outcome, with NO ECS.
+
+use screeps_combat_decision::assignment::{build_ev_matrix_with_merge, role_bit};
+use screeps_combat_decision::composition::SquadRole;
+
+/// One member-in-a-slot of an abstract squad in the merge flow: the role it fills + whether it is a real
+/// (present, transferable) body or an unfilled PENDING spawn slot (queued, not yet spawned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeSlot {
+    pub role: SquadRole,
+    /// `true` ⇒ a present body (the donor sheds these); `false` ⇒ an OPEN pending spawn slot (the receiver's
+    /// queue holds these; a transfer FILLS one, dropping it from the queue).
+    pub filled: bool,
+}
+
+/// One abstract squad in the merge flow: its caps (for the receiver's marginal-lift P(win)), its current
+/// objective id, and its slots (present bodies + open pending slots). The DONOR has present bodies it can
+/// shed; the RECEIVER has open pending slots a transfer fills.
+#[derive(Clone, Debug)]
+pub struct MergeSquad {
+    pub structure_dps: u32,
+    pub heal: u32,
+    /// The caps of this squad's SHEDDABLE (present) members — added to a receiver for the marginal lift.
+    pub sheddable_dps: u32,
+    pub sheddable_heal: u32,
+    pub current_objective: u32,
+    pub slots: Vec<MergeSlot>,
+    /// Merge-eligible donor (terminal-with-survivors / over-rostered / forming-consolidate). A receiver does
+    /// not need this set; an ineligible squad is never a donor.
+    pub merge_eligible: bool,
+}
+
+impl MergeSquad {
+    fn open_slot_roles(&self) -> u8 {
+        self.slots.iter().filter(|s| !s.filled).fold(0u8, |acc, s| acc | role_bit(s.role))
+    }
+    fn sheddable_roles(&self) -> u8 {
+        self.slots.iter().filter(|s| s.filled).fold(0u8, |acc, s| acc | role_bit(s.role))
+    }
+    fn present_count(&self) -> usize {
+        self.slots.iter().filter(|s| s.filled).count()
+    }
+    fn open_count(&self) -> usize {
+        self.slots.iter().filter(|s| !s.filled).count()
+    }
+}
+
+/// The merge-flow scenario: the abstract squads, their objectives' values + defense (for the marginal lift),
+/// and a toggle for the merge column (RED control = merge disabled ⇒ the donor can only solo-reassign/recycle).
+#[derive(Clone, Debug)]
+pub struct MergeFlowScenario {
+    pub squads: Vec<MergeSquad>,
+    /// Per-objective value (energy-equivalent) keyed by objective id == index.
+    pub objective_values: Vec<f32>,
+    /// Per-objective tower range (0 ⇒ undefended; >0 ⇒ a single energized tower at that range — so caps
+    /// matter and there is real marginal lift). Index == objective id.
+    pub objective_tower_range: Vec<u32>,
+    /// Per-objective required kill hits (0 ⇒ undefended/trivial). Index == objective id.
+    pub objective_required_hits: Vec<u32>,
+    /// `true` ⇒ the Merge column is offered (GREEN); `false` ⇒ merge disabled (RED control — solo only).
+    pub merge_enabled: bool,
+}
+
+/// The merge-flow outcome — the ABSTRACT-model state AFTER applying the chosen merge (or none): which squads
+/// retired (emptied donors), the receiver's filled/open slot counts (the modeled slot-fill), and how many
+/// members transferred. Lets a test assert the kernel SELECTION + the modeled transfer outcome (transfer +
+/// slot-fill + clean retire). NOTE the slot-fill is asserted by construction — the live spawn-queue drop /
+/// no-double-fill is guarded in the bot (see the section header / Bug #1), not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// `true` per squad index ⇒ that squad RETIRED (emptied donor). A receiver/partial donor stays `false`.
+    pub retired: Vec<bool>,
+    /// Per squad index: `(filled_slots, open_pending_slots)` AFTER the transfer. The receiver's open count
+    /// DROPS by the number of transfers (the model marks the filled slots; the live queue-drop is the bot's).
+    pub slots: Vec<(usize, usize)>,
+    /// `(donor_idx, receiver_idx, transferred_count)` for the applied merge, or `None` if no merge fired.
+    pub merge: Option<(usize, usize, usize)>,
+}
+
+fn merge_squad_row(sq: &MergeSquad) -> SquadRow {
+    SquadRow {
+        caps: SquadCapabilities { heal_per_tick: sq.heal, structure_dps: sq.structure_dps, tank_effective_hp: 2000 },
+        class: CapClass::Offense,
+        current_objective: Some(sq.current_objective),
+        recycle_ev: 0,
+        merge_eligible: sq.merge_eligible,
+        sheddable: SquadCapabilities { heal_per_tick: sq.sheddable_heal, structure_dps: sq.sheddable_dps, tank_effective_hp: 2000 },
+        sheddable_roles: sq.sheddable_roles(),
+        // A receiver offers its open pending slots (a squad with present members AND open slots is forming).
+        open_slot_roles: if sq.present_count() > 0 && sq.open_count() > 0 { sq.open_slot_roles() } else { 0 },
+    }
+}
+
+fn merge_objective_cell(s: &MergeFlowScenario, id: u32, n_rows: usize) -> ObjectiveCell {
+    use screeps_combat_decision::force_sizing::{DefenseProfile, TowerThreat};
+    let i = id as usize;
+    let value = s.objective_values[i];
+    let tower_range = s.objective_tower_range.get(i).copied().unwrap_or(0);
+    let required = s.objective_required_hits.get(i).copied().unwrap_or(0);
+    let defense = if tower_range > 0 {
+        DefenseProfile { objective_hits: required, towers: vec![TowerThreat { range_to_assault: tower_range, energy: 1000 }], ..Default::default() }
+    } else {
+        DefenseProfile { objective_hits: required, ..Default::default() }
+    };
+    ObjectiveCell {
+        id,
+        class: CapClass::Offense,
+        value_kind: ObjectiveValueKind::Denial,
+        intel: ObjectiveIntel { denial_value: value * 2.0, ..Default::default() },
+        defense,
+        enemy: None,
+        travel_rooms_per_row: vec![0; n_rows],
+        feasible_per_row: vec![true; n_rows], // current objectives are reachable via StayPut; merge is the move under test
+    }
+}
+
+/// Drive the MERGE flow (ADR 0032 v2 / ADR 0027 — kernel selection + abstract transfer; see the section
+/// header for the precise scope). Build the matrix WITH the merge column (or without, the RED control), solve,
+/// then APPLY the chosen `Merge→Bk` to the ABSTRACT squad model the way the bot's `apply_merges` does: move
+/// the donor's role-matched present member into the receiver's open pending slot, mark that slot filled (the
+/// modeled spawn-slot drop — the live queue-drop / no-double-fill is the bot's, guarded by the callback
+/// `is_slot_filled` recheck, NOT modeled here), and RETIRE the donor if it emptied. Returns the
+/// [`MergeOutcome`].
+pub fn run_merge_flow(s: &MergeFlowScenario) -> MergeOutcome {
+    let rows: Vec<SquadRow> = s.squads.iter().map(merge_squad_row).collect();
+    let n = rows.len();
+    // Distinct objective ids per squad (each squad is on its own objective in these scenarios).
+    let mut objective_ids: Vec<u32> = s.squads.iter().map(|sq| sq.current_objective).collect();
+    objective_ids.sort_unstable();
+    objective_ids.dedup();
+    let cells: Vec<ObjectiveCell> = objective_ids.iter().map(|&id| merge_objective_cell(s, id, n)).collect();
+
+    // RED control: zero out every receiver's open_slot_roles so NO merge column is built (merge disabled).
+    let rows = if s.merge_enabled {
+        rows
+    } else {
+        rows.into_iter().map(|mut r| { r.open_slot_roles = 0; r }).collect()
+    };
+
+    let matrix = build_ev_matrix_with_merge(&rows, &cells, &[], &MatrixParams::default());
+    let sol = solve_assignment(&matrix);
+
+    // Mutable copy of the slot state to apply the transfer to.
+    let mut slots: Vec<Vec<MergeSlot>> = s.squads.iter().map(|sq| sq.slots.clone()).collect();
+    let mut retired = vec![false; n];
+    let mut merge: Option<(usize, usize, usize)> = None;
+
+    // Find the chosen merge (a donor row matched to a Merge column). The commit gate mirrors the bot: the
+    // merge must beat the donor's StayPut by >0 (a positive lift).
+    let stay_base = cells.len();
+    for (r, pick) in sol.row_to_col.iter().enumerate() {
+        let Some(col) = pick else { continue };
+        if let ColumnKind::Merge { receiver_row } = matrix.columns[*col] {
+            let merge_ev = matrix.at(r, *col);
+            let stay_ev = matrix.at(r, stay_base + r).max(0);
+            if merge_ev <= stay_ev {
+                continue;
+            }
+            // ── APPLY (ADR 0027) — transfer the donor's role-matched present member(s) into the receiver's
+            //    OPEN pending slots, greedily in stable order; DROP the filled slot from the receiver's queue. ──
+            let shed_roles = rows[r].sheddable_roles;
+            let mut transferred = 0usize;
+            // Open receiver slots whose role matches a shed role, stable order.
+            let open_idxs: Vec<usize> = slots[receiver_row]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, sl)| (!sl.filled && (role_bit(sl.role) & shed_roles) != 0).then_some(i))
+                .collect();
+            for oi in open_idxs {
+                let want = slots[receiver_row][oi].role;
+                // First unused present donor body of the matching role.
+                if let Some(di) = slots[r].iter().position(|sl| sl.filled && sl.role == want) {
+                    // Move it: drop from donor, FILL the receiver's pending slot (the spawn queue drops it).
+                    slots[r].remove(di);
+                    slots[receiver_row][oi].filled = true; // the pending slot is now filled BY TRANSFER (queue drops it)
+                    transferred += 1;
+                }
+            }
+            if transferred > 0 {
+                // Donor emptied (all present bodies shed) ⇒ clean retire (the creeps were TRANSFERRED).
+                if slots[r].iter().all(|sl| !sl.filled) {
+                    retired[r] = true;
+                }
+                merge = Some((r, receiver_row, transferred));
+            }
+            break; // these scenarios apply at most one merge
+        }
+    }
+
+    let slot_counts: Vec<(usize, usize)> = slots
+        .iter()
+        .map(|sl| (sl.iter().filter(|s| s.filled).count(), sl.iter().filter(|s| !s.filled).count()))
+        .collect();
+    MergeOutcome { retired, slots: slot_counts, merge }
 }
 
 /// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
@@ -2832,6 +3041,128 @@ mod tests {
         };
         let out = run_auction_flow(&s);
         assert_ne!(out.picks[0], Some(1), "must NOT take the sub-threshold objective — StayPut/high-value wins");
+    }
+
+    // ── ADR 0032 v2 / ADR 0027: the MERGE FLOW (transfer pending-slot primitive END-TO-END) ──
+
+    use crate::harness::lifecycle::{run_merge_flow, MergeFlowScenario, MergeSlot, MergeSquad};
+    use screeps_combat_decision::composition::SquadRole;
+
+    /// A receiver forming for a high-value DEFENDED objective (under-DPS alone, an OPEN Dismantler pending
+    /// slot) + a terminal-with-survivors donor whose sheddable Dismantler fills that slot. Greedy on whether
+    /// merge is enabled.
+    fn merge_reinforce_scenario(merge_enabled: bool) -> MergeFlowScenario {
+        MergeFlowScenario {
+            squads: vec![
+                // Receiver (idx 0): present RangedDPS + an OPEN Dismantler pending slot; under-DPS alone.
+                MergeSquad {
+                    structure_dps: 200,
+                    heal: 50,
+                    sheddable_dps: 0,
+                    sheddable_heal: 0,
+                    current_objective: 0,
+                    slots: vec![
+                        MergeSlot { role: SquadRole::RangedDPS, filled: true },
+                        MergeSlot { role: SquadRole::Dismantler, filled: false }, // OPEN pending slot
+                    ],
+                    merge_eligible: false,
+                },
+                // Donor (idx 1): a present Dismantler to shed; merge-eligible; its own objective is low-value.
+                MergeSquad {
+                    structure_dps: 800,
+                    heal: 0,
+                    sheddable_dps: 800,
+                    sheddable_heal: 0,
+                    current_objective: 1,
+                    slots: vec![MergeSlot { role: SquadRole::Dismantler, filled: true }],
+                    merge_eligible: true,
+                },
+            ],
+            objective_values: vec![200_000.0, 50.0],
+            objective_tower_range: vec![20, 0],
+            objective_required_hits: vec![400_000, 0],
+            merge_enabled,
+        }
+    }
+
+    /// THE MERGE FLOW HEADLINE (ADR 0027 lines 256-312 — kernel selection + abstract transfer; see the section
+    /// header for scope): with the merge column enabled, the kernel picks the merge and the model TRANSFERS the
+    /// donor's Dismantler into the receiver's open pending slot — the receiver's open slot is marked filled (by
+    /// transfer, not spawn), the donor EMPTIES and cleanly RETIRES, and exactly one member transfers. The RED
+    /// control (merge disabled) does NONE of this. (The live spawn-slot drop / no-double-fill is the bot's,
+    /// guarded by the `create_spawn_callback` `is_slot_filled` recheck — not asserted here.)
+    #[test]
+    fn merge_flow_transfers_fills_the_pending_slot_and_retires_the_empty_donor() {
+        let green = run_merge_flow(&merge_reinforce_scenario(true));
+        // The merge fired: donor 1 → receiver 0, 1 member.
+        assert_eq!(green.merge, Some((1, 0, 1)), "the donor merges into the receiver's open slot (1 transfer)");
+        // The receiver's pending slot is now filled in the model (2 filled, 0 open — BY TRANSFER, not spawn).
+        assert_eq!(green.slots[0], (2, 0), "the receiver's open pending slot is filled by transfer (model)");
+        // The donor EMPTIED → clean retire (the creep was TRANSFERRED, not orphaned/deleted).
+        assert!(green.retired[1], "the emptied donor retires cleanly");
+        assert!(!green.retired[0], "the receiver is not retired");
+        assert_eq!(green.slots[1], (0, 0), "the donor has no members left (all transferred)");
+
+        // RED control: merge disabled ⇒ no transfer, no slot drop, no retire.
+        let red = run_merge_flow(&merge_reinforce_scenario(false));
+        assert_eq!(red.merge, None, "with merge disabled the donor cannot transfer (no merge column)");
+        assert_eq!(red.slots[0], (1, 1), "the receiver's pending slot stays OPEN (must be spawned)");
+        assert!(!red.retired[1], "the donor does not empty/retire without the transfer");
+    }
+
+    /// FORMING-CONSOLIDATION end-to-end (ADR 0027 lines 270-271 — "two squads stuck at 1/4 each → one at
+    /// 2/4"): two forming squads each at partial strength consolidate into ONE via the transfer.
+    #[test]
+    fn merge_flow_consolidates_two_forming_squads() {
+        let s = MergeFlowScenario {
+            squads: vec![
+                // Receiver: 1 present RangedDPS + 1 OPEN RangedDPS pending slot (1/2), under-DPS alone.
+                MergeSquad {
+                    structure_dps: 150,
+                    heal: 50,
+                    sheddable_dps: 0,
+                    sheddable_heal: 0,
+                    current_objective: 0,
+                    slots: vec![
+                        MergeSlot { role: SquadRole::RangedDPS, filled: true },
+                        MergeSlot { role: SquadRole::RangedDPS, filled: false },
+                    ],
+                    merge_eligible: false,
+                },
+                // Donor: ALSO forming (1 present RangedDPS, an open slot of its own), merge-eligible, sheds RangedDPS.
+                MergeSquad {
+                    structure_dps: 150,
+                    heal: 50,
+                    sheddable_dps: 500,
+                    sheddable_heal: 30,
+                    current_objective: 1,
+                    slots: vec![
+                        MergeSlot { role: SquadRole::RangedDPS, filled: true },
+                        MergeSlot { role: SquadRole::RangedDPS, filled: false },
+                    ],
+                    merge_eligible: true,
+                },
+            ],
+            objective_values: vec![150_000.0, 40_000.0],
+            objective_tower_range: vec![20, 20],
+            objective_required_hits: vec![300_000, 300_000],
+            merge_enabled: true,
+        };
+        let out = run_merge_flow(&s);
+        assert_eq!(out.merge, Some((1, 0, 1)), "the donor consolidates its present member into the receiver");
+        assert_eq!(out.slots[0], (2, 0), "the receiver is now at 2/2 (consolidated) — the pending slot dropped");
+        assert!(out.retired[1], "the donor emptied and retired (two 1/2 squads became one 2/2)");
+    }
+
+    /// The merge flow is DETERMINISTIC (ADR 0032 §Determinism): the same scenario yields a byte-identical
+    /// outcome on repeat (the donor→slot match is role-matched + stable order).
+    #[test]
+    fn merge_flow_is_deterministic() {
+        for enabled in [false, true] {
+            let a = run_merge_flow(&merge_reinforce_scenario(enabled));
+            let b = run_merge_flow(&merge_reinforce_scenario(enabled));
+            assert_eq!(a, b, "the merge flow is deterministic (enabled={enabled})");
+        }
     }
 
     /// ADR 0027 P0: the FULL DEFENSE PRODUCTION CHAIN is sim-able — a MOVING ARMED NEIGHBOUR hostile flows
