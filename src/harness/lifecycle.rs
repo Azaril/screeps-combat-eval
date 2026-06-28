@@ -237,6 +237,44 @@ pub struct ChurnTarget {
     /// empty, `decide_squad` returns no focus → the squad cannot latch `engaged_once` → the lease lapses
     /// underneath it (Break #2). `0` = the DTOs are populated immediately on arrival.
     pub empty_dtos_on_arrival_ticks: u32,
+    /// This squad is a `Defend` garrison for an OWNED room (war.rs `ObjectiveKind::Defend`). The owned
+    /// target room is itself CLEAR (the threat roams a NEIGHBOUR), so on arrival there is NEVER an in-room
+    /// focus — the defender stands in the empty owned-room centre. BUG B2: pre-fix the focus-less in-room
+    /// defender past its lease `GaveUp` → Phase C re-fielded the SAME defender → Gen churn. Post-fix the
+    /// `holding_station` signal garrisons it (lease refreshed) while the Defend objective persists.
+    pub is_defend: bool,
+    /// BUG B1 (engaged-en-route latch): the TARGET room is kept visible via a HIGH OBSERVE request and has a
+    /// hostile in it, so while the squad is still TRAVELING (dist>0, in_room=false) the proximity-free
+    /// `select_focus_target` returns a focus → `decide_squad` sets `state=Engaged` → the bot's
+    /// `apply_squad_decision` latches `engaged_once=true` with NO in-room gate. The PERMANENT latch kills the
+    /// travel lease (`traveling` requires `!engaged_once`) → the squad freezes mid-travel. The FIX gates the
+    /// latch on in-room presence (`latch_engaged_in_room_only`).
+    pub target_visible_with_hostile_en_route: bool,
+    /// FIX B1 toggle: latch `engaged_once` ONLY when a member is actually IN the target room (`in_room_any`).
+    /// `false` reproduces the pre-fix bug (latch from `focus.is_some()` regardless of distance); `true` is the
+    /// fixed bot (`apply_squad_decision` gates the latch on in-room presence). A far defender with a visible
+    /// target-room hostile then does NOT latch + keeps its travel lease.
+    pub latch_engaged_in_room_only: bool,
+    /// FIX B2 toggle: does the bot adapter SUPPLY the `holding_station` signal to the (shared) reconcile
+    /// kernel? `true` is the fixed bot (a Defend garrison's `is_defend && in_target_room && !has_focus`
+    /// refreshes its lease → it garrisons); `false` reproduces the pre-fix bot (no signal → the focus-less
+    /// in-room defender past its lease GaveUp → Phase C re-fields the SAME defender → Gen churn). The KERNEL
+    /// is unchanged either way — this only controls whether the adapter feeds it the signal (no drift).
+    pub garrison_holds: bool,
+}
+
+impl Default for ChurnTarget {
+    fn default() -> Self {
+        ChurnTarget {
+            travel_ticks: 30,
+            uncontested: false,
+            empty_dtos_on_arrival_ticks: 0,
+            is_defend: false,
+            target_visible_with_hostile_en_route: false,
+            latch_engaged_in_room_only: true, // default to the FIXED bot behaviour
+            garrison_holds: true,             // default to the FIXED bot behaviour
+        }
+    }
 }
 
 // ═══ The SPATIAL movement-stall repro (ADR 0028 K0): distinct homes → shared rally → assault ═══════════
@@ -297,6 +335,19 @@ pub struct SpatialTravel {
     /// assault anchor advance rally→target). `false` = the BUGGY model (per-member-home rally, the
     /// cross-room box anchor freezes for scattered members → never converges).
     pub use_shared_rally: bool,
+    /// BUG A (contested boundary oscillation, the W4N7 defender). Rooms (world room-coords `(rx, ry)`) the
+    /// enemy HOLDS — a member that steps INTO one of these in-transit DIES (the multi-home defender's members
+    /// die crossing the enemy-held neighbours between their scattered homes and the rally). A dead member
+    /// drops back to UNFILLED → `present` falls → re-spawn. Combined with the NON-latched per-tick gather
+    /// re-eval (`latch_assault == false`), the squad never reaches a stable quorum → it oscillates
+    /// in_room<->travel and never commits the assault. Empty ⇒ no in-transit attrition (the clean path).
+    pub enemy_held_rooms: Vec<(i32, i32)>,
+    /// FIX A toggle: once `gather_quorum_met` first returns true, LATCH the assault and thereafter take the
+    /// assault branch WITHOUT re-evaluating the quorum (so members dying/lagging can't un-commit it), AND
+    /// count members already IN the target room as gathered. `false` reproduces the pre-fix bot (re-evaluate
+    /// the quorum every tick over all positions, never latch — squad_manager.rs 1255-1262) → oscillation;
+    /// `true` is the fixed bot (latch the assault on the first quorum). Default `true` (the fixed behaviour).
+    pub latch_assault: bool,
 }
 
 impl SpatialTravel {
@@ -318,6 +369,14 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
 
     let mut generation: u32 = 0;
     let mut max_present: usize = 0;
+    // BUG A: the peak count of members ever gathered at the rally (the oscillation diagnostic — a buggy
+    // contested defender never reaches the full quorum, so this stays below the requested roster).
+    let mut max_gathered: usize = 0;
+    // BUG A: how many times the gather state FLIPPED true→false (un-committed the assault) — the
+    // in_room<->travel oscillation. Non-zero ⇒ the buggy non-latched re-eval is thrashing (it never commits
+    // a stable assault; the FIXED latch returns `DeployedAndEngaged` before the budget elapses).
+    let mut oscillations: u32 = 0;
+    let mut prev_gathered = false;
 
     let mut filled = vec![false; n_slots];
     let mut syncing: Vec<(u64, u32)> = Vec::new();
@@ -382,69 +441,98 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             }
         }
 
-        if departed && !gathered {
-            // SOLO TRAVEL to the shared rally (FIXED) vs the BUGGY per-member-home / frozen anchor.
+        if departed {
             traveling = true;
-            for i in 0..n_slots {
-                if !filled[i] {
-                    continue;
-                }
-                if travel.use_shared_rally {
-                    // FIXED: each member paths SOLO to the ONE shared rally (no cross-room formation).
-                    member_pos[i] = member_pos[i].step_toward(travel.rally);
-                } else {
-                    // BUGGY: the cross-room box-formation anchor freezes for scattered members, so the
-                    // per-member target is the FROZEN anchor offset ≈ its own home → it never converges.
-                    // (Model: a scattered member does not move; only a member already co-located with the
-                    // anchor's room could advance — which scattered multi-home members never are.)
-                    if member_pos[i].room() != anchor.room() {
-                        // frozen — no movement (the live fatigue=0, d=(stalled) symptom)
-                    } else {
-                        member_pos[i] = member_pos[i].step_toward(travel.rally);
+            // ── GATHER DECISION (evaluated EVERY tick so the buggy non-latched model can OSCILLATE). The
+            // gather quorum over the CURRENT positions; FIX A also counts in-target-room members as gathered.
+            let pre_step: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+            let has_fighter = !pre_step.is_empty();
+            let in_room_count = (0..n_slots).filter(|&i| filled[i] && member_pos[i].room() == travel.target.room()).count();
+            let quorum_now = (travel.use_shared_rally
+                && rally::gather_quorum_met(&SpatialTravel::pos_options(&pre_step), travel.rally.to_pos(), n_slots, travel.uncontested, has_fighter, rally::RALLY_GATHER_RADIUS))
+                // FIX A: members already IN the target room count as gathered (arrived members can't fail it).
+                || (travel.latch_assault && in_room_count > 0 && has_fighter);
+            max_gathered = max_gathered.max(rally::members_gathered_at(&SpatialTravel::pos_options(&pre_step), travel.rally.to_pos(), rally::RALLY_GATHER_RADIUS));
+            if travel.latch_assault {
+                // FIXED: LATCH the assault on the FIRST quorum — members dying/lagging can't un-commit it
+                // (the bot stops re-evaluating `gather_quorum_met` once it latches the assault state).
+                gathered |= quorum_now;
+            } else {
+                // BUGGY (the live per-tick non-latched re-eval, squad_manager.rs 1255-1262): `gathered`
+                // tracks the CURRENT quorum — if a member dies in transit and the quorum drops, the squad
+                // REVERTS from assault to solo travel (the in_room<->travel oscillation that never commits).
+                gathered = quorum_now;
+            }
+            // Count a true→false flip — the assault un-committing (the oscillation diagnostic).
+            if prev_gathered && !gathered {
+                oscillations += 1;
+            }
+            prev_gathered = gathered;
+
+            if gathered {
+                // ASSAULT: the anchor advances rally→target as a bloc; members follow it.
+                anchor = anchor.step_toward(travel.target);
+                for i in 0..n_slots {
+                    if filled[i] {
+                        member_pos[i] = member_pos[i].step_toward(anchor);
+                        // BUG A attrition during the assault crossing: a SUPPORT member (slot >= 1, the
+                        // lagging healer) stepping into an enemy-held room DIES; the lead fighter (slot 0)
+                        // tanks the crossing. Pre-fix (non-latched) the support death drops `present` below
+                        // the contested quorum → the next tick's re-eval REVERTS assault→travel (oscillation).
+                        // The latch keeps the assault committed so the surviving fighter reaches the target.
+                        if i >= 1 && travel.enemy_held_rooms.contains(&member_pos[i].room()) {
+                            filled[i] = false;
+                            member_pos[i] = travel.homes[i];
+                        }
                     }
                 }
-            }
-            // Recompute present positions after the step for the gather kernel + progress signal.
-            let stepped: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
-            // Has a fighter gathered? (Slot 0 is the fighter-first spawn; treat any present member as a
-            // potential fighter for the model — the bot supplies a role-aware flag.)
-            let has_fighter = !stepped.is_empty();
-            if travel.use_shared_rally
-                && rally::gather_quorum_met(&SpatialTravel::pos_options(&stepped), travel.rally.to_pos(), n_slots, travel.uncontested, has_fighter, rally::RALLY_GATHER_RADIUS)
-            {
-                gathered = true;
-            }
-            // Travel progress = the CLOSEST present member closed room-distance to the rally this tick.
-            let cur_dist = stepped.iter().map(|p| p.room_dist(travel.rally)).min();
-            travel_progress = match (cur_dist, prev_target_room_dist) {
-                (Some(c), Some(p)) => c < p,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            prev_target_room_dist = cur_dist;
-        }
-
-        if gathered {
-            // ASSAULT: the anchor advances rally→target as a bloc; members follow it.
-            traveling = true;
-            anchor = anchor.step_toward(travel.target);
-            for i in 0..n_slots {
-                if filled[i] {
-                    member_pos[i] = member_pos[i].step_toward(anchor);
+                in_target_room = (0..n_slots).any(|i| filled[i] && member_pos[i].room() == travel.target.room());
+                if in_target_room && travel.latch_assault {
+                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
                 }
+                let cur_dist = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i].room_dist(travel.target)).min();
+                travel_progress = match (cur_dist, prev_target_room_dist) {
+                    (Some(c), Some(p)) => c < p,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                prev_target_room_dist = cur_dist;
+            } else {
+                // SOLO TRAVEL to the shared rally (FIXED) vs the BUGGY per-member-home / frozen anchor.
+                for i in 0..n_slots {
+                    if !filled[i] {
+                        continue;
+                    }
+                    if travel.use_shared_rally {
+                        // FIXED: each member paths SOLO to the ONE shared rally (no cross-room formation).
+                        member_pos[i] = member_pos[i].step_toward(travel.rally);
+                    } else {
+                        // BUGGY: the cross-room box-formation anchor freezes for scattered members, so the
+                        // per-member target is the FROZEN anchor offset ≈ its own home → it never converges.
+                        if member_pos[i].room() != anchor.room() {
+                            // frozen — no movement (the live fatigue=0, d=(stalled) symptom)
+                        } else {
+                            member_pos[i] = member_pos[i].step_toward(travel.rally);
+                        }
+                    }
+                    // BUG A: in-transit ATTRITION. A member that stepped INTO an enemy-held room DIES — it
+                    // drops back to UNFILLED + must re-spawn (the multi-home defender's members dying while
+                    // crossing the enemy-held neighbours between their scattered homes and the rally →
+                    // `present` falls → the non-latched quorum can never stabilise).
+                    if travel.enemy_held_rooms.contains(&member_pos[i].room()) {
+                        filled[i] = false;
+                        member_pos[i] = travel.homes[i]; // the slot reopens; a fresh member re-spawns at home
+                    }
+                }
+                let stepped: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+                let cur_dist = stepped.iter().map(|p| p.room_dist(travel.rally)).min();
+                travel_progress = match (cur_dist, prev_target_room_dist) {
+                    (Some(c), Some(p)) => c < p,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                prev_target_room_dist = cur_dist;
             }
-            // ARRIVED when a member stands in the target room.
-            in_target_room = (0..n_slots).any(|i| filled[i] && member_pos[i].room() == travel.target.room());
-            if in_target_room {
-                return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
-            }
-            let cur_dist = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i].room_dist(travel.target)).min();
-            travel_progress = match (cur_dist, prev_target_room_dist) {
-                (Some(c), Some(p)) => c < p,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            prev_target_room_dist = cur_dist;
         }
 
         // Reconcile (the shared kernel).
@@ -470,10 +558,16 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             traveling,
             travel_progress,
             travel_budget_remaining,
+            holding_station: false, // offense spatial repro — never a Defend garrison
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
                 if departed {
+                    // BUG A: an oscillating contested squad that never committed the assault → classify the
+                    // thrash distinctly from a clean mid-hop travel lapse.
+                    if oscillations > 0 {
+                        return ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered };
+                    }
                     return ChurnOutcome::LapsedInTravel { generations: generation };
                 }
                 generation += 1;
@@ -531,7 +625,14 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
     }
 
     if departed {
-        ChurnOutcome::LapsedInTravel { generations: generation }
+        // BUG A: the budget elapsed while still departed without ever committing the assault, having
+        // oscillated (the buggy non-latched re-eval thrashing) → `OscillatedNeverGathered`. A clean
+        // non-oscillating travel lapse stays `LapsedInTravel`.
+        if oscillations > 0 {
+            ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered }
+        } else {
+            ChurnOutcome::LapsedInTravel { generations: generation }
+        }
     } else {
         ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present }
     }
@@ -552,6 +653,20 @@ pub enum ChurnOutcome {
     /// The squad ARRIVED (in the target room) but never latched a focus before the lease lapsed — the live
     /// IN_ROOM_NO_FOCUS / empty-DTO-on-arrival lapse (Break #2 arrival half).
     LapsedOnArrival { generations: u32 },
+    /// BUG B1: the squad latched `engaged_once` EN ROUTE (a proximity-free focus on the visible target room
+    /// while still traveling, dist>0, in_room=false). The permanent latch killed the travel lease
+    /// (`traveling` requires `!engaged_once`) → it FROZE mid-hop, never arriving. Fixed by gating the latch
+    /// on in-room presence.
+    LatchedEnRoute { generations: u32 },
+    /// BUG A: a CONTESTED multi-home defender never reached `gather_quorum_met` (members die crossing
+    /// enemy-held neighbours → `present` oscillates, and the gather is re-evaluated every tick, never
+    /// latched) → it oscillated in_room<->travel and never committed the assault within the budget. Fixed by
+    /// LATCHING the assault once the quorum first fires + counting in-room members as gathered.
+    OscillatedNeverGathered { generations: u32, max_gathered: usize },
+    /// BUG B2 (fixed state): a Defend squad ARRIVED in its clear owned room, found no in-room focus, and
+    /// GARRISONED it (lease held) for the whole budget without churning — a single stable generation. The
+    /// pre-fix outcome here was repeated GaveUp+refield (`generations` climbing).
+    Garrisoned { generations: u32 },
 }
 
 /// One squad-generation's lifecycle phase in the churn driver.
@@ -592,10 +707,11 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
     let mut busy_until: Vec<u32> = vec![0; s.homes.len()];
     let mut deadline: u32 = COMMITMENT_BUDGET; // fielded at tick 0 with now + budget
     let mut prev_present: usize = 0;
-    // The model latches `engaged_once` by RETURNING `DeployedAndEngaged` on the arrival-with-focus tick, so
-    // within the loop it is structurally always false (a squad that reaches combat exits the driver). It is
-    // still fed to the kernel for parity with the bot snapshot.
-    let engaged_once = false;
+    // `engaged_once` is the bot's latch (set by `apply_squad_decision` when `state==Engaged`). The model
+    // normally latches by RETURNING `DeployedAndEngaged` on the arrival-with-focus tick. BUG B1 makes it
+    // mutable: a squad whose VISIBLE target room has a hostile while still TRAVELING gets a proximity-free
+    // focus → the pre-fix bot latches `engaged_once=true` en route (no in-room gate) → the travel lease dies.
+    let mut engaged_once = false;
     let mut phase = Phase::Forming;
     let mut gen_start: u32 = 0; // tick this generation started forming (the forming-budget clock)
     let mut travel_start: u32 = 0; // tick the squad departed home (the travel-budget clock)
@@ -638,7 +754,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         // snapshot below (the engage path never falls through to it) — the kernel's give-up/keep over a
         // focus-less squad is exactly what the travel/arrival breaks exercise.
         let mut in_target_room = false;
-        let has_focus = false;
+        let mut has_focus = false;
         let mut traveling = false;
         let mut travel_progress = false;
         match phase {
@@ -654,6 +770,17 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             Phase::Traveling { arrives_at } => {
                 traveling = true;
                 travel_progress = true; // closing distance every tick in this model (no blockage)
+                // ── BUG B1 (engaged-en-route latch). The target room is kept VISIBLE (a HIGH OBSERVE) and has
+                // a hostile, so the proximity-free `select_focus_target` returns a focus while we are STILL
+                // traveling (in_room=false, dist>0). The bot's `decide_squad` sets `state=Engaged` from
+                // `focus.is_some()` with NO proximity gate; `apply_squad_decision` then latches
+                // `engaged_once=true`. PRE-FIX (`latch_engaged_in_room_only == false`) it latches HERE,
+                // en route, with no member in the room → the travel lease dies (`traveling` needs
+                // `!engaged_once`) → the squad FREEZES mid-hop. The FIX gates the latch on in-room presence,
+                // so a far defender with a visible target-room hostile does NOT latch + keeps its lease.
+                if target.target_visible_with_hostile_en_route && !target.latch_engaged_in_room_only {
+                    engaged_once = true; // the pre-fix unconditional latch (no in_room_any gate)
+                }
                 if tick >= arrives_at {
                     // FOCUS-ON-ARRIVAL FIX (Break #2 arrival half): on arrival the bot FORCES a room-DTO
                     // re-read (ensures `mapping.get_room` + `room_data` are populated that tick) instead of
@@ -665,16 +792,26 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             }
             Phase::Arrived { dtos_clear_at } => {
                 in_target_room = true;
-                // Once the room DTOs are readable (the focus-on-arrival fix forces this on arrival), a focus
-                // is computed and the squad ENGAGES — the deep bug is absent. Until then (pre-fix model: a
-                // persistent empty-DTO window) it sits in-room with no focus, exposed to the lease lapse.
-                if tick >= dtos_clear_at {
+                if target.is_defend {
+                    // ── BUG B2 (defender garrison). A Defend squad ARRIVES in its OWNED room — but the threat
+                    // roams a NEIGHBOUR, so the owned room is CLEAR: `decide_squad` finds NO in-room focus
+                    // (has_focus stays false). It garrisons the empty owned-room centre. Pre-fix the
+                    // focus-less in-room defender past its lease GaveUp → Phase C re-fielded the SAME
+                    // defender → Gen churn (the dominant live waste). Post-fix the `holding_station` signal
+                    // (built below) refreshes its lease while the Defend objective persists. The kernel
+                    // verdict (KeepRefreshLease vs Retire{GaveUp}) below decides which — no early return here.
+                } else if tick >= dtos_clear_at {
+                    // OFFENSE: once the room DTOs are readable (the focus-on-arrival fix forces this on
+                    // arrival), a focus is computed and the squad ENGAGES — the deep bug is absent.
                     return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
                 }
-                // Still no focus this tick — feed the kernel `has_focus = false` (already the default) so the
-                // lease behaviour reflects the in-room-no-focus state.
+                // Still no focus this tick — feed the kernel `has_focus = false` so the lease behaviour
+                // reflects the in-room-no-focus state.
             }
         }
+        // `has_focus` stays false in this model (an offense squad that finds a focus exits the driver; a
+        // defender's owned room is clear) — assigned for clarity that the garrison branch is focus-less.
+        let _ = &mut has_focus;
 
         // 3. The reconcile kernel decides keep / refresh / retire — the SAME kernel the bot's Phase A runs.
         //    `forming` mirrors the bot's `forming_state`: members, not engaged, below the requested roster.
@@ -683,10 +820,15 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET;
         let travel_budget_remaining = tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET;
         let deadline_lapsed = tick >= deadline;
+        // FIX B2: a Defend squad GARRISONING its clear owned room (arrived, no in-room focus) holds its lease
+        // while the Defend objective persists. (`is_defend && in_target_room && !has_focus` — the manager's
+        // exact signal.) `garrison_holds` toggles whether the adapter SUPPLIES the signal (RED→GREEN); for an
+        // offense squad this is always false. The shared kernel is unchanged either way.
+        let holding_station = target.garrison_holds && target.is_defend && in_target_room && !has_focus;
         let snapshot = ReconcileSnapshot {
             objective_gone: false,
             duplicate: false,
-            is_defend: false,
+            is_defend: target.is_defend,
             deadline_lapsed,
             wiped: false,
             has_focus,
@@ -700,13 +842,41 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             traveling,
             travel_progress,
             travel_budget_remaining,
+            holding_station,
         };
+        // BUG B2 (fixed state): a defender that has GARRISONED its owned room (in-room, focus-less) and held
+        // its lease until the budget elapsed without churning — a single stable generation. Detected when the
+        // garrison reaches the final tick still in-room (no re-field happened). Checked before reconcile so
+        // the stable-hold case reports `Garrisoned` rather than running the loop to the bottom-of-fn classify.
+        if holding_station && tick + 1 >= s.budget_ticks {
+            return ChurnOutcome::Garrisoned { generations: generation };
+        }
         match reconcile(snapshot) {
             ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
                 // RE-FIELD: drop the partial roster, orphan in-flight spawns, bump the generation, reopen
                 // the lease — the live churn loop. The new generation re-forms from scratch.
                 if phase != Phase::Forming {
-                    // Released the gate but lapsed before engaging — distinguish travel vs arrival lapse.
+                    // Released the gate but lapsed before engaging. BUG B1: if the squad latched
+                    // `engaged_once` EN ROUTE, it froze mid-travel (the travel lease needs `!engaged_once`) —
+                    // report `LatchedEnRoute`. A defender that GaveUp in-room is the B2 churn (re-field).
+                    if engaged_once && !in_target_room {
+                        return ChurnOutcome::LatchedEnRoute { generations: generation };
+                    }
+                    if target.is_defend && in_target_room {
+                        // BUG B2 pre-fix: the garrison gave up in-room → it RE-FIELDS (Phase C immediately
+                        // re-fields the same defender). Loop back to Forming, bumping the generation (churn).
+                        generation += 1;
+                        filled = vec![false; n_slots];
+                        syncing.clear();
+                        completing.clear();
+                        busy_until = vec![0; s.homes.len()];
+                        deadline = tick + COMMITMENT_BUDGET;
+                        prev_present = 0;
+                        engaged_once = false;
+                        phase = Phase::Forming;
+                        gen_start = tick;
+                        continue;
+                    }
                     return match phase {
                         Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival { generations: generation },
                         _ => ChurnOutcome::LapsedInTravel { generations: generation },
@@ -1138,7 +1308,7 @@ mod tests {
     /// to completion and DEPLOY. A DEFENDED target (contested) keeps the full-roster rally.
     #[test]
     fn oversized_defense_roster_churns_never_deploys() {
-        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0 };
+        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0, ..Default::default() };
         let out = run_lifecycle_churn(&contended(oversized_defense_comp()), &target);
         // After the fix this must be DeployedAndEngaged; pre-fix it churns. Assert the FIXED expectation so
         // the test is RED today and GREEN once the lease fix lands.
@@ -1171,7 +1341,7 @@ mod tests {
         };
         // A long multi-room hop (> COMMITMENT_BUDGET) so the travel-phase lapse is exercised; uncontested →
         // the quorum gate releases the single member immediately.
-        let target = ChurnTarget { travel_ticks: 500, uncontested: true, empty_dtos_on_arrival_ticks: 0 };
+        let target = ChurnTarget { travel_ticks: 500, uncontested: true, empty_dtos_on_arrival_ticks: 0, ..Default::default() };
         let out = run_lifecycle_churn(&scenario, &target);
         assert!(
             matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
@@ -1200,7 +1370,7 @@ mod tests {
         };
         // Arrives quickly, but the room DTOs stay empty far past the lease window (> COMMITMENT_BUDGET) —
         // the live mapping/visibility timing hole. Pre-fix: no focus → lease lapses → LapsedOnArrival.
-        let target = ChurnTarget { travel_ticks: 20, uncontested: true, empty_dtos_on_arrival_ticks: 600 };
+        let target = ChurnTarget { travel_ticks: 20, uncontested: true, empty_dtos_on_arrival_ticks: 600, ..Default::default() };
         let out = run_lifecycle_churn(&scenario, &target);
         assert!(
             matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
@@ -1210,9 +1380,106 @@ mod tests {
 
     #[test]
     fn lifecycle_churn_is_deterministic() {
-        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0 };
+        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0, ..Default::default() };
         let s = contended(oversized_defense_comp());
         assert_eq!(run_lifecycle_churn(&s, &target), run_lifecycle_churn(&s, &target));
+    }
+
+    /// An easily-fielded single-slot scenario for the B1/B2 lifecycle repros (no spawn contention — the bug
+    /// under test is the LATCH / GARRISON wiring, not the forming plateau).
+    fn easy_single_slot() -> ColonyFormingScenario {
+        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
+            .expect("a single-slot core-killer");
+        ColonyFormingScenario {
+            composition: comp,
+            homes: vec![Home { energy_capacity: 5300, income: 300, start_energy: 3000 }],
+            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 87.5,
+            per_member_cap: 3000,
+            budget_ticks: 2000,
+            member_ttl: 1500,
+            renew: false,
+        }
+    }
+
+    /// BUG B1 (engaged-en-route latch): a squad whose VISIBLE target room has a hostile latches
+    /// `engaged_once` while STILL TRAVELING (a proximity-free focus, no in-room gate). The PERMANENT latch
+    /// kills the travel lease (`traveling` needs `!engaged_once`) → the squad FREEZES mid-hop on a long
+    /// (> COMMITMENT_BUDGET) approach. The FIX gates the latch on in-room presence so it keeps its lease.
+    #[test]
+    fn engaged_en_route_latch_freezes_then_fixed_keeps_lease() {
+        // PRE-FIX: latch from focus.is_some() regardless of distance (latch_engaged_in_room_only = false).
+        let buggy = run_lifecycle_churn(
+            &easy_single_slot(),
+            &ChurnTarget {
+                travel_ticks: 600, // > COMMITMENT_BUDGET (400) so the lapse is exercised mid-hop
+                uncontested: true, // releases the gate quickly so we are squarely in TRAVEL
+                target_visible_with_hostile_en_route: true,
+                latch_engaged_in_room_only: false,
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(buggy, ChurnOutcome::LatchedEnRoute { .. }),
+            "pre-fix: latching engaged_once en route kills the travel lease → freeze, got {buggy:?}"
+        );
+        // FIXED: latch only when in the target room (latch_engaged_in_room_only = true, the default).
+        let fixed = run_lifecycle_churn(
+            &easy_single_slot(),
+            &ChurnTarget {
+                travel_ticks: 600,
+                uncontested: true,
+                target_visible_with_hostile_en_route: true,
+                latch_engaged_in_room_only: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(fixed, ChurnOutcome::DeployedAndEngaged { .. }),
+            "fixed: gating the latch on in-room presence keeps the travel lease → arrives + engages, got {fixed:?}"
+        );
+    }
+
+    /// BUG B2 (defender garrison churn): a Defend squad ARRIVES in its clear OWNED room, finds no in-room
+    /// focus (the threat roams a neighbour), and — pre-fix (the adapter never supplies `holding_station`) —
+    /// GaveUp+RE-FIELDS the SAME defender every lease window → Generation churn. The FIX's `holding_station`
+    /// signal garrisons it (one stable generation, no re-field). RED → GREEN.
+    #[test]
+    fn defender_garrison_churns_then_fixed_holds_station() {
+        // PRE-FIX: the adapter does NOT supply holding_station → the focus-less in-room defender past its
+        // lease GaveUp → re-field → churn (generations climb over the budget).
+        let buggy = run_lifecycle_churn(
+            &easy_single_slot(),
+            &ChurnTarget {
+                travel_ticks: 20,
+                uncontested: true, // owned room is clear → quorum gate + no in-room focus on arrival
+                is_defend: true,
+                garrison_holds: false, // pre-fix: no holding_station signal
+                ..Default::default()
+            },
+        );
+        match buggy {
+            ChurnOutcome::Garrisoned { generations } => panic!("pre-fix must CHURN, not garrison ({generations} gens)"),
+            other => assert!(
+                matches!(other, ChurnOutcome::LapsedOnArrival { generations } if generations >= 1),
+                "pre-fix: the focus-less in-room defender GaveUp + re-fields → churn, got {other:?}"
+            ),
+        }
+        // FIXED: the holding_station signal garrisons the SAME defender — one stable generation, no churn.
+        let fixed = run_lifecycle_churn(
+            &easy_single_slot(),
+            &ChurnTarget {
+                travel_ticks: 20,
+                uncontested: true,
+                is_defend: true,
+                garrison_holds: true, // the fix supplies holding_station
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(fixed, ChurnOutcome::Garrisoned { generations: 0 }),
+            "fixed: the Defend garrison HOLDS its clear owned room in a single stable generation, got {fixed:?}"
+        );
     }
 
     // ── SPATIAL movement-stall repro (ADR 0028 K0): distinct homes → shared rally → assault ──
@@ -1253,6 +1520,8 @@ mod tests {
             target: WPos { wx: -5 * 50 + 25, wy: -4 * 50 + 25 }, // W4N3 target
             uncontested,
             use_shared_rally,
+            enemy_held_rooms: vec![], // no in-transit attrition in the baseline movement-stall repro
+            latch_assault: true,      // the fixed assault-latch (Fix A) by default
         }
     }
 
@@ -1292,6 +1561,52 @@ mod tests {
         let s = two_home_offense();
         let t = scatter_travel(false, true);
         assert_eq!(run_lifecycle_churn_spatial(&s, &t), run_lifecycle_churn_spatial(&s, &t));
+    }
+
+    // ── BUG A: CONTESTED boundary oscillation (the W4N7 multi-home defender) ──
+
+    /// Scattered homes whose members must CROSS an enemy-held neighbour to reach the rally, plus a CONTESTED
+    /// target (so the gather quorum demands the near-full roster). A member stepping into the enemy-held room
+    /// DIES + re-spawns → `present` oscillates → the non-latched per-tick gather re-eval never stabilises.
+    fn contested_scatter(latch_assault: bool) -> SpatialTravel {
+        SpatialTravel {
+            // Two homes co-located near the rally room (rx=-4, ry=-5) → both members reach the rally without
+            // attrition + form the contested quorum (so the assault DOES commit at least once).
+            homes: vec![
+                WPos { wx: -4 * 50 + 20, wy: -5 * 50 + 25 }, // W3N4 (near the rally)
+                WPos { wx: -4 * 50 + 30, wy: -5 * 50 + 25 }, // W3N4 (near the rally)
+            ],
+            rally: WPos { wx: -4 * 50 + 25, wy: -5 * 50 + 25 }, // W3N4 staging
+            target: WPos { wx: -6 * 50 + 25, wy: -5 * 50 + 25 }, // W5N4 target (two rooms away)
+            uncontested: false,                                  // CONTESTED → near-full quorum required
+            use_shared_rally: true,                              // the shared-rally travel is in place (ADR 0028)
+            // The enemy HOLDS the intermediate room (rx=-5, ry=-5 = W4N4) the ASSAULT must cross from the
+            // rally (rx=-4) to the target (rx=-6). A member stepping into it during the assault DIES → present
+            // drops 2→1 → the NON-LATCHED per-tick gather re-eval loses quorum → reverts assault→travel → the
+            // dead member re-spawns at home → re-gathers → re-assaults → dies again: the in_room<->travel
+            // OSCILLATION that never commits. The latch keeps the assault committed through the same attrition.
+            enemy_held_rooms: vec![(-5, -5)],
+            latch_assault,
+        }
+    }
+
+    /// RED on the pre-fix (non-latched re-eval), GREEN on Fix A (latch the assault on first quorum + count
+    /// in-room members as gathered): a CONTESTED multi-home defender whose members die crossing enemy-held
+    /// neighbours OSCILLATES (present thrashes → the per-tick gather never stabilises) and never commits the
+    /// assault → `OscillatedNeverGathered`. The latch commits the assault on the first quorum and rides it to
+    /// the target despite later attrition → `DeployedAndEngaged`.
+    #[test]
+    fn contested_scatter_oscillates_then_latch_commits_the_assault() {
+        let buggy = run_lifecycle_churn_spatial(&two_home_offense(), &contested_scatter(false));
+        assert!(
+            matches!(buggy, ChurnOutcome::OscillatedNeverGathered { .. }),
+            "pre-fix (non-latched gather re-eval): the contested defender oscillates + never commits, got {buggy:?}"
+        );
+        let fixed = run_lifecycle_churn_spatial(&two_home_offense(), &contested_scatter(true));
+        assert!(
+            matches!(fixed, ChurnOutcome::DeployedAndEngaged { .. }),
+            "Fix A: latch the assault on the first quorum → commit + reach the target despite attrition, got {fixed:?}"
+        );
     }
 
     // ── End-to-end: form → engine engage → kill (ADR 0028 engage handoff) ──
