@@ -1770,6 +1770,153 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
     DeclaimOutcome::NeverReached { generations: generation }
 }
 
+// ═══ ADR 0032 v1.2 — run_auction_flow: the GLOBAL Hungarian matching flow (extends run_v1_flow to N
+//     squads × M objectives, with a greedy-vs-global toggle) ════════════════════════════════════════════
+//
+// `run_v1_flow` proves the SINGLE-squad reassign LIFECYCLE (one defender following a moving threat).
+// `run_auction_flow` proves the MULTI-squad ASSIGNMENT: given N already-fielded squads (heterogeneous
+// caps) and M live objectives, the GLOBAL solve (`assignment::solve_assignment`) finds a strictly higher
+// total-EV matching than the per-squad GREEDY baseline (a faithful model of the OLD v1.1 behaviour:
+// iterate squads in order, each greedily claims its best still-unclaimed objective). This is the FLOW
+// analog of the kernel headline test — it proves global-optimality through the harness's RED→GREEN toggle,
+// not just in the kernel unit test.
+
+use screeps_combat_decision::assignment::{
+    build_ev_matrix, solve_assignment, CapClass, ColumnKind, MatrixParams, ObjectiveCell, SquadRow,
+};
+use screeps_combat_decision::composition::SquadCapabilities;
+use screeps_combat_decision::objective_value::{ObjectiveIntel, ObjectiveValueKind};
+
+/// One assignable squad in the auction flow: its surviving caps (structure DPS + heal) + its current
+/// objective id (for the StayPut re-score; `None` = freshly freed/forming).
+#[derive(Clone, Copy, Debug)]
+pub struct AuctionSquad {
+    pub structure_dps: u32,
+    pub heal: u32,
+    pub current_objective: Option<u32>,
+}
+
+/// One objective in the auction flow: a stable id + its energy-equivalent value + a per-row feasibility
+/// override (so the flow can model "squad B cannot reach/take objective L" — the heterogeneity that makes
+/// greedy wrong). All objectives are undefended (P(win)=1 for any dps>0) so VALUE drives the optimum, and
+/// the greedy-vs-global gap is a pure assignment effect, not a winnability artifact.
+#[derive(Clone, Debug)]
+pub struct AuctionObjective {
+    pub id: u32,
+    pub value: f32,
+    /// `feasible_per_row[r] == false` ⇒ squad `r` cannot take this objective (claimed/incompatible-tile).
+    pub feasible_per_row: Vec<bool>,
+}
+
+/// The auction-flow scenario: the fielded squads, the live objectives, and the greedy-vs-global toggle.
+#[derive(Clone, Debug)]
+pub struct AuctionFlowScenario {
+    pub squads: Vec<AuctionSquad>,
+    pub objectives: Vec<AuctionObjective>,
+    /// `true` ⇒ the GLOBAL Hungarian (`solve_assignment`); `false` ⇒ the per-squad GREEDY baseline (the
+    /// RED arm modelling the OLD v1.1 behaviour).
+    pub global_solve: bool,
+}
+
+/// The auction-flow outcome: the total EV the chosen selection achieved + the per-squad objective picks
+/// (objective id, or `None` for StayPut/Recycle), in squad order — so a test can assert both the headline
+/// total AND the assignment SHAPE.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuctionOutcome {
+    pub total_ev: i64,
+    pub picks: Vec<Option<u32>>,
+}
+
+/// Build the EV matrix for the scenario (shared by the greedy + global arms so both score the SAME cells —
+/// a fair RED→GREEN comparison: only the SELECTION differs).
+fn auction_matrix(s: &AuctionFlowScenario) -> screeps_combat_decision::assignment::EvMatrix {
+    let rows: Vec<SquadRow> = s
+        .squads
+        .iter()
+        .map(|sq| SquadRow {
+            caps: SquadCapabilities { heal_per_tick: sq.heal, structure_dps: sq.structure_dps, tank_effective_hp: 2000 },
+            class: CapClass::Offense,
+            current_objective: sq.current_objective,
+            recycle_ev: 0,
+        })
+        .collect();
+    let n_rows = rows.len();
+    let cells: Vec<ObjectiveCell> = s
+        .objectives
+        .iter()
+        .map(|o| ObjectiveCell {
+            id: o.id,
+            class: CapClass::Offense,
+            value_kind: ObjectiveValueKind::Denial,
+            // Denial value_e = denial_value × 0.5; pass 2× so value_e == o.value.
+            intel: ObjectiveIntel { denial_value: o.value * 2.0, ..Default::default() },
+            defense: Default::default(),
+            enemy: None,
+            travel_rooms_per_row: vec![0; n_rows],
+            feasible_per_row: if o.feasible_per_row.is_empty() { vec![true; n_rows] } else { o.feasible_per_row.clone() },
+        })
+        .collect();
+    build_ev_matrix(&rows, &cells, &MatrixParams::default())
+}
+
+/// The per-squad GREEDY baseline over the SAME matrix (a faithful model of the OLD v1.1 behaviour, ADR 0032
+/// §Problem #2): iterate squads in row order; each claims its own best-EV still-unclaimed OBJECTIVE column
+/// (StayPut/Recycle are per-row, never contended), marking the objective covered so a later squad cannot
+/// take it. Returns the [`AuctionOutcome`].
+fn auction_greedy(matrix: &screeps_combat_decision::assignment::EvMatrix) -> AuctionOutcome {
+    use screeps_combat_decision::assignment::INFEASIBLE_EV;
+    let mut covered = vec![false; matrix.cols()];
+    let mut total = 0i64;
+    let mut picks = vec![None; matrix.rows];
+    for (r, pick) in picks.iter_mut().enumerate() {
+        let mut best: Option<(usize, i64)> = None;
+        for (c, col) in matrix.columns.iter().enumerate() {
+            let is_obj = matches!(col, ColumnKind::Objective { .. });
+            if is_obj && covered[c] {
+                continue;
+            }
+            let ev = matrix.at(r, c);
+            if ev == INFEASIBLE_EV {
+                continue;
+            }
+            if best.map(|(_, b)| ev > b).unwrap_or(true) {
+                best = Some((c, ev));
+            }
+        }
+        if let Some((c, ev)) = best {
+            if let ColumnKind::Objective { id } = matrix.columns[c] {
+                covered[c] = true;
+                *pick = Some(id);
+            }
+            total += ev;
+        }
+    }
+    AuctionOutcome { total_ev: total, picks }
+}
+
+/// Drive the multi-squad ASSIGNMENT flow (ADR 0032 v1.2): build the shared EV matrix, then select via the
+/// GLOBAL Hungarian (`global_solve == true`) or the per-squad GREEDY baseline (`false`). Returns the total
+/// EV + the per-squad picks. The acceptance assertion (in the tests) is that GLOBAL strictly beats GREEDY
+/// on total EV for a heterogeneous scenario — the same headline the kernel test proves, now in the flow.
+pub fn run_auction_flow(s: &AuctionFlowScenario) -> AuctionOutcome {
+    let matrix = auction_matrix(s);
+    if !s.global_solve {
+        return auction_greedy(&matrix);
+    }
+    let sol = solve_assignment(&matrix);
+    let picks: Vec<Option<u32>> = sol
+        .row_to_col
+        .iter()
+        .map(|c| {
+            c.and_then(|c| match matrix.columns[c] {
+                ColumnKind::Objective { id } => Some(id),
+                _ => None,
+            })
+        })
+        .collect();
+    AuctionOutcome { total_ev: sol.total_ev, picks }
+}
+
 /// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
 /// (vs stall / wipe / never-form)? Surfaces the form-vs-fight gap the live whack-a-mole could not isolate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2612,6 +2759,79 @@ mod tests {
             !matches!(out, ChurnOutcome::Reassigned { .. }),
             "with no sibling available, the squad must NOT reassign — it falls back to retire, got {out:?}"
         );
+    }
+
+    // ── ADR 0032 v1.2: the AUCTION FLOW (multi-squad GLOBAL assignment) acceptance + RED control ──
+
+    /// A heterogeneous 2-squad × 2-objective scenario engineered so the per-squad GREEDY baseline is
+    /// STRICTLY worse than the GLOBAL Hungarian (the flow analog of the kernel headline). Squad A (row 0) is
+    /// a strong all-rounder; squad B (row 1) is weak. Objective H (id 0) and L (id 1) are both undefended +
+    /// equally winnable. The trick: B can only take H (L is infeasible for B), and H edges L in value for A,
+    /// so GREEDY (A iterated first) grabs H — stranding B with NO objective. The GLOBAL optimum routes A→L
+    /// and B→H, claiming BOTH for a higher total. Toggled by `global_solve`.
+    fn auction_greedy_suboptimal(global: bool) -> AuctionFlowScenario {
+        AuctionFlowScenario {
+            squads: vec![
+                AuctionSquad { structure_dps: 1000, heal: 50, current_objective: None }, // A (row 0)
+                AuctionSquad { structure_dps: 120, heal: 50, current_objective: None },  // B (row 1)
+            ],
+            objectives: vec![
+                // H (id 0): high value, feasible for BOTH. Value edges L so greedy-A grabs it.
+                AuctionObjective { id: 0, value: 50_001.0, feasible_per_row: vec![true, true] },
+                // L (id 1): slightly lower value, feasible ONLY for A (B cannot reach/take it).
+                AuctionObjective { id: 1, value: 50_000.0, feasible_per_row: vec![true, false] },
+            ],
+            global_solve: global,
+        }
+    }
+
+    /// THE FLOW HEADLINE (ADR 0032 §Sim — "prove global-optimality in the FLOW, not just the kernel"): the
+    /// GLOBAL solve STRICTLY beats the GREEDY baseline on total EV for the heterogeneous scenario. RED arm
+    /// (greedy) leaves B unassigned; GREEN arm (global) claims both objectives.
+    #[test]
+    fn auction_global_strictly_beats_greedy_in_the_flow() {
+        let greedy = run_auction_flow(&auction_greedy_suboptimal(false));
+        let global = run_auction_flow(&auction_greedy_suboptimal(true));
+        assert!(
+            global.total_ev > greedy.total_ev,
+            "the GLOBAL Hungarian must STRICTLY beat the per-squad GREEDY in the flow: global={} greedy={} (greedy picks={:?}, global picks={:?})",
+            global.total_ev,
+            greedy.total_ev,
+            greedy.picks,
+            global.picks
+        );
+        // Greedy: A→H, B→(stranded, L infeasible) → only H claimed. Global: A→L, B→H → BOTH claimed.
+        assert_eq!(greedy.picks, vec![Some(0), None], "greedy strands B (A grabbed H; L infeasible for B)");
+        assert_eq!(global.picks, vec![Some(1), Some(0)], "global routes A→L and B→H — the swap greedy misses");
+    }
+
+    /// The auction flow is DETERMINISTIC (ADR 0032 §Determinism): the same scenario yields a byte-identical
+    /// outcome on repeat, for BOTH arms.
+    #[test]
+    fn auction_flow_is_deterministic() {
+        for global in [false, true] {
+            let a = run_auction_flow(&auction_greedy_suboptimal(global));
+            let b = run_auction_flow(&auction_greedy_suboptimal(global));
+            assert_eq!(a, b, "the auction flow is deterministic (global={global})");
+        }
+    }
+
+    /// The EV-positive gate in the FLOW (ADR 0032 §EV-positive gate): a squad already on a high-value fight
+    /// is offered only a tiny new objective; the global optimum keeps it on StayPut (no objective pick).
+    #[test]
+    fn auction_flow_respects_the_ev_positive_gate() {
+        let s = AuctionFlowScenario {
+            // One squad currently on the high-value objective (id 0); a tiny new objective (id 1) is the only
+            // unclaimed one. The optimum is StayPut on 0, never the sub-threshold 1.
+            squads: vec![AuctionSquad { structure_dps: 1000, heal: 50, current_objective: Some(0) }],
+            objectives: vec![
+                AuctionObjective { id: 0, value: 100_000.0, feasible_per_row: vec![true] }, // current (StayPut re-scores it)
+                AuctionObjective { id: 1, value: 5.0, feasible_per_row: vec![true] },        // tiny new objective
+            ],
+            global_solve: true,
+        };
+        let out = run_auction_flow(&s);
+        assert_ne!(out.picks[0], Some(1), "must NOT take the sub-threshold objective — StayPut/high-value wins");
     }
 
     /// ADR 0027 P0: the FULL DEFENSE PRODUCTION CHAIN is sim-able — a MOVING ARMED NEIGHBOUR hostile flows
