@@ -239,6 +239,304 @@ pub struct ChurnTarget {
     pub empty_dtos_on_arrival_ticks: u32,
 }
 
+// ═══ The SPATIAL movement-stall repro (ADR 0028 K0): distinct homes → shared rally → assault ═══════════
+//
+// `run_lifecycle_churn` models travel as a pure tick COUNTER (`travel_ticks`), so it cannot reproduce the
+// MOVEMENT STALL (members spawned at DIFFERENT homes never converge because the cross-room box-formation
+// anchor freezes). This spatial driver places each member at a DISTINCT home Position and steps real
+// per-member movement: in the BUGGY model each member rallies to its OWN home behind a frozen cross-room
+// formation anchor → it never converges → travel makes no positional progress → the lease lapses MID-HOP
+// (`LapsedInTravel`). In the FIXED model each member solo-paths to ONE SHARED rally, converges, the unified
+// `rally::gather_quorum_met` kernel fires, and the anchor advances rally→target → engage. RED → GREEN.
+
+/// A point in the toy world as (world_x, world_y). Movement is one Chebyshev step/tick; room membership is
+/// `world / 50`. Pure value-math (mirrors how `should_hold_at_boundary`/`gather_quorum_met` were extracted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WPos {
+    pub wx: i32,
+    pub wy: i32,
+}
+
+impl WPos {
+    fn room(self) -> (i32, i32) {
+        (self.wx.div_euclid(50), self.wy.div_euclid(50))
+    }
+    fn step_toward(self, to: WPos) -> WPos {
+        WPos { wx: self.wx + (to.wx - self.wx).signum(), wy: self.wy + (to.wy - self.wy).signum() }
+    }
+    fn room_dist(self, o: WPos) -> u32 {
+        let (ax, ay) = self.room();
+        let (bx, by) = o.room();
+        (ax - bx).unsigned_abs().max((ay - by).unsigned_abs())
+    }
+    fn to_pos(self) -> Position {
+        let (rx, ry) = self.room();
+        let room: screeps::RoomName = format!("W{}N{}", -rx - 1, -ry - 1).parse().unwrap();
+        Position::new(
+            RoomCoordinate::new(self.wx.rem_euclid(50) as u8).unwrap(),
+            RoomCoordinate::new(self.wy.rem_euclid(50) as u8).unwrap(),
+            room,
+        )
+    }
+}
+
+/// The spatial movement scenario: distinct member HOMES, a shared RALLY on the approach to the TARGET, and
+/// whether the squad uses the FIXED shared-rally solo-travel (`true`) or the BUGGY per-member-home /
+/// frozen-cross-room-formation-anchor model (`false`).
+#[derive(Clone, Debug)]
+pub struct SpatialTravel {
+    /// Each member's home position (world coords). Distinct homes → the multi-home-spawn scatter.
+    pub homes: Vec<WPos>,
+    /// The ONE shared rally/staging point (world coords) on the approach to the target (safe, out of fire).
+    pub rally: WPos,
+    /// The target position (world coords) — a room beyond the rally.
+    pub target: WPos,
+    /// Proven-uncontested target → the gather quorum may trickle; contested → the (near-)full roster.
+    pub uncontested: bool,
+    /// `true` = the FIXED clean design (solo travel to the shared rally + the unified gather kernel + the
+    /// assault anchor advance rally→target). `false` = the BUGGY model (per-member-home rally, the
+    /// cross-room box anchor freezes for scattered members → never converges).
+    pub use_shared_rally: bool,
+}
+
+impl SpatialTravel {
+    fn pos_options(positions: &[WPos]) -> Vec<Option<Position>> {
+        positions.iter().map(|w| Some(w.to_pos())).collect()
+    }
+}
+
+/// Drive the full bot lifecycle (lease / reconcile / re-field churn + rally gate) with SPATIAL travel:
+/// members spawn at DISTINCT homes and must converge at a SHARED rally before the assault advances. The
+/// reconcile DECISION is the shared `lifecycle::reconcile` kernel; the gather decision is the shared
+/// `rally::gather_quorum_met` kernel — so there is no live/sim drift. Deterministic.
+pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTravel) -> ChurnOutcome {
+    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+
+    let n_slots = s.composition.slots.len();
+    assert_eq!(travel.homes.len(), n_slots, "one home per member slot in the spatial model");
+    let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
+
+    let mut generation: u32 = 0;
+    let mut max_present: usize = 0;
+
+    let mut filled = vec![false; n_slots];
+    let mut syncing: Vec<(u64, u32)> = Vec::new();
+    let mut completing: Vec<(u64, u32)> = Vec::new();
+    let mut avail: Vec<u32> = s.homes.iter().map(|h| h.start_energy).collect();
+    let mut busy_until: Vec<u32> = vec![0; s.homes.len()];
+    let mut deadline: u32 = COMMITMENT_BUDGET;
+    let mut prev_present: usize = 0;
+    let engaged_once = false;
+    let mut gen_start: u32 = 0;
+    let mut travel_start: u32 = 0;
+
+    // Spatial member state: each member starts AT its home; `member_pos[i]` is set when slot i is present.
+    let mut member_pos: Vec<WPos> = travel.homes.clone();
+    // The assault anchor (advances rally→target ONLY after the gather quorum fires).
+    let mut anchor = travel.rally;
+    let mut departed = false; // the rally gate released (solo travel begins)
+    let mut gathered = false; // the gather quorum fired (assault begins)
+    let mut prev_target_room_dist: Option<u32> = None;
+
+    for tick in 0..s.budget_ticks {
+        completing.retain(|&(id, at)| {
+            if at <= tick {
+                syncing.push((id, tick + MEMBER_SYNC_DELAY));
+                false
+            } else {
+                true
+            }
+        });
+        syncing.retain(|&(id, at)| {
+            if at <= tick {
+                if (id as usize) < n_slots {
+                    filled[id as usize] = true;
+                    member_pos[id as usize] = travel.homes[id as usize]; // appears AT its home
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        let present = filled.iter().filter(|f| **f).count();
+        max_present = max_present.max(present);
+        let has_members = present > 0 || !completing.is_empty() || !syncing.is_empty();
+
+        let any_queued = !fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains).is_empty();
+        let forming_in_flight = !completing.is_empty() || !syncing.is_empty() || any_queued;
+
+        // Present members' positions (in slot order) for the rally + gather kernels.
+        let present_positions: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+
+        let mut in_target_room = false;
+        let mut traveling = false;
+        let mut travel_progress = false;
+
+        if !departed {
+            // FORMING / rally gate over the present roster.
+            let positions = SpatialTravel::pos_options(&present_positions);
+            if rally::ready_to_depart_gate(&positions, n_slots, travel.uncontested) {
+                departed = true;
+                travel_start = tick;
+            }
+        }
+
+        if departed && !gathered {
+            // SOLO TRAVEL to the shared rally (FIXED) vs the BUGGY per-member-home / frozen anchor.
+            traveling = true;
+            for i in 0..n_slots {
+                if !filled[i] {
+                    continue;
+                }
+                if travel.use_shared_rally {
+                    // FIXED: each member paths SOLO to the ONE shared rally (no cross-room formation).
+                    member_pos[i] = member_pos[i].step_toward(travel.rally);
+                } else {
+                    // BUGGY: the cross-room box-formation anchor freezes for scattered members, so the
+                    // per-member target is the FROZEN anchor offset ≈ its own home → it never converges.
+                    // (Model: a scattered member does not move; only a member already co-located with the
+                    // anchor's room could advance — which scattered multi-home members never are.)
+                    if member_pos[i].room() != anchor.room() {
+                        // frozen — no movement (the live fatigue=0, d=(stalled) symptom)
+                    } else {
+                        member_pos[i] = member_pos[i].step_toward(travel.rally);
+                    }
+                }
+            }
+            // Recompute present positions after the step for the gather kernel + progress signal.
+            let stepped: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+            // Has a fighter gathered? (Slot 0 is the fighter-first spawn; treat any present member as a
+            // potential fighter for the model — the bot supplies a role-aware flag.)
+            let has_fighter = !stepped.is_empty();
+            if travel.use_shared_rally
+                && rally::gather_quorum_met(&SpatialTravel::pos_options(&stepped), travel.rally.to_pos(), n_slots, travel.uncontested, has_fighter, rally::RALLY_GATHER_RADIUS)
+            {
+                gathered = true;
+            }
+            // Travel progress = the CLOSEST present member closed room-distance to the rally this tick.
+            let cur_dist = stepped.iter().map(|p| p.room_dist(travel.rally)).min();
+            travel_progress = match (cur_dist, prev_target_room_dist) {
+                (Some(c), Some(p)) => c < p,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            prev_target_room_dist = cur_dist;
+        }
+
+        if gathered {
+            // ASSAULT: the anchor advances rally→target as a bloc; members follow it.
+            traveling = true;
+            anchor = anchor.step_toward(travel.target);
+            for i in 0..n_slots {
+                if filled[i] {
+                    member_pos[i] = member_pos[i].step_toward(anchor);
+                }
+            }
+            // ARRIVED when a member stands in the target room.
+            in_target_room = (0..n_slots).any(|i| filled[i] && member_pos[i].room() == travel.target.room());
+            if in_target_room {
+                return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+            }
+            let cur_dist = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i].room_dist(travel.target)).min();
+            travel_progress = match (cur_dist, prev_target_room_dist) {
+                (Some(c), Some(p)) => c < p,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            prev_target_room_dist = cur_dist;
+        }
+
+        // Reconcile (the shared kernel).
+        let forming = has_members && !engaged_once && !departed && present < n_slots;
+        let forming_progress = forming && present > prev_present;
+        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET;
+        let travel_budget_remaining = tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET;
+        let deadline_lapsed = tick >= deadline;
+        let snapshot = ReconcileSnapshot {
+            objective_gone: false,
+            duplicate: false,
+            is_defend: false,
+            deadline_lapsed,
+            wiped: false,
+            has_focus: false,
+            engaged_once,
+            in_target_room,
+            has_members,
+            forming,
+            forming_progress,
+            forming_in_flight: forming && forming_in_flight,
+            forming_budget_remaining,
+            traveling,
+            travel_progress,
+            travel_budget_remaining,
+        };
+        match reconcile(snapshot) {
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
+                if departed {
+                    return ChurnOutcome::LapsedInTravel { generations: generation };
+                }
+                generation += 1;
+                filled = vec![false; n_slots];
+                syncing.clear();
+                completing.clear();
+                busy_until = vec![0; s.homes.len()];
+                deadline = tick + COMMITMENT_BUDGET;
+                prev_present = 0;
+                gen_start = tick;
+                member_pos = travel.homes.clone();
+                anchor = travel.rally;
+                departed = false;
+                gathered = false;
+                prev_target_room_dist = None;
+                continue;
+            }
+            ReconcileAction::Retire { .. } => {
+                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
+            }
+            ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
+            ReconcileAction::Keep => {}
+        }
+        prev_present = present;
+
+        // Spawn step (only while forming).
+        if !departed {
+            let combat = fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains);
+            let mut in_flight: BTreeSet<u64> = completing.iter().chain(syncing.iter()).map(|&(id, _)| id).collect();
+            for h in 0..s.homes.len() {
+                avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
+                if tick < busy_until[h] {
+                    continue;
+                }
+                let mut queue: Vec<QueuedSpawn> = Vec::new();
+                if let Some((p, c)) = s.economy.hauler {
+                    queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                }
+                for cs in &combat {
+                    if !in_flight.contains(&cs.id) {
+                        queue.push(*cs);
+                    }
+                }
+                let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+                for spawned in spawn_step(&mut lane, &queue) {
+                    avail[h] = lane.available_energy;
+                    busy_until[h] = tick + spawned.completes_in;
+                    if spawned.id < ECON_MINER_ID_BASE {
+                        completing.push((spawned.id, tick + spawned.completes_in));
+                        in_flight.insert(spawned.id);
+                    }
+                }
+            }
+        }
+    }
+
+    if departed {
+        ChurnOutcome::LapsedInTravel { generations: generation }
+    } else {
+        ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present }
+    }
+}
+
 /// The outcome of the churn-modeling lifecycle (the live failure taxonomy this harness reproduces).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChurnOutcome {
@@ -915,6 +1213,85 @@ mod tests {
         let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0 };
         let s = contended(oversized_defense_comp());
         assert_eq!(run_lifecycle_churn(&s, &target), run_lifecycle_churn(&s, &target));
+    }
+
+    // ── SPATIAL movement-stall repro (ADR 0028 K0): distinct homes → shared rally → assault ──
+
+    /// A 2-slot offense roster forming across TWO DISTINCT homes (W2N9 + W3N4), a shared rally on the
+    /// approach (W3N3), targeting a room beyond it (W4N3). The homes are easily fieldable; this isolates
+    /// the MOVEMENT stall from spawn contention.
+    fn two_home_offense() -> ColonyFormingScenario {
+        // A 2-slot force (one anti-creep fighter + one healer) so there is one member per distinct home.
+        let comp = assemble_force(&RequiredForce { anti_creep_parts: 4, heal_parts: 4, ..Default::default() }, 3000)
+            .expect("a 2-slot fighter+healer force");
+        assert_eq!(comp.slots.len(), 2, "the spatial repro uses a 2-slot roster (one member per home)");
+        ColonyFormingScenario {
+            composition: comp,
+            homes: vec![
+                Home { energy_capacity: 5300, income: 300, start_energy: 3000 },
+                Home { energy_capacity: 5300, income: 300, start_energy: 3000 },
+            ],
+            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 87.5,
+            per_member_cap: 3000,
+            budget_ticks: 2000,
+            member_ttl: 1500,
+            renew: false,
+        }
+    }
+
+    /// Distinct homes a few rooms apart; a shared rally on the approach; a target a room beyond the rally.
+    fn scatter_travel(uncontested: bool, use_shared_rally: bool) -> SpatialTravel {
+        SpatialTravel {
+            // Two homes in DIFFERENT rooms (the multi-home scatter): W2N9 ≈ (world 100+25, 400+25) and
+            // W3N4. Using world coords: room (rx, ry) maps to W{-rx-1}N{-ry-1}, so W2N9 → rx=-3, ry=-10.
+            homes: vec![
+                WPos { wx: -3 * 50 + 25, wy: -10 * 50 + 25 }, // W2N9
+                WPos { wx: -4 * 50 + 25, wy: -5 * 50 + 25 },  // W3N4
+            ],
+            rally: WPos { wx: -4 * 50 + 5, wy: -4 * 50 + 25 }, // W3N3 staging (approach)
+            target: WPos { wx: -5 * 50 + 25, wy: -4 * 50 + 25 }, // W4N3 target
+            uncontested,
+            use_shared_rally,
+        }
+    }
+
+    /// RED on the BUGGY model, GREEN on the FIXED one: scattered multi-home members behind a frozen
+    /// cross-room formation anchor NEVER converge → travel makes no positional progress → the lease lapses
+    /// mid-hop (`LapsedInTravel`). The shared-rally solo-travel + the unified gather kernel converges them
+    /// and advances the anchor to the target → `DeployedAndEngaged`.
+    #[test]
+    fn scattered_squad_stalls_then_converges_with_shared_rally() {
+        // BUGGY: per-member-home / frozen cross-room formation anchor → never converges → stalls in travel.
+        let buggy = run_lifecycle_churn_spatial(&two_home_offense(), &scatter_travel(false, false));
+        assert!(
+            matches!(buggy, ChurnOutcome::LapsedInTravel { .. }),
+            "the buggy frozen-formation-anchor model must stall in travel (never converge), got {buggy:?}"
+        );
+        // FIXED: solo travel to a SHARED rally + the unified gather kernel → converge → assault → engage.
+        let fixed = run_lifecycle_churn_spatial(&two_home_offense(), &scatter_travel(false, true));
+        assert!(
+            matches!(fixed, ChurnOutcome::DeployedAndEngaged { .. }),
+            "the shared-rally solo-travel design must converge + advance + engage, got {fixed:?}"
+        );
+    }
+
+    /// An UNCONTESTED target may trickle (the gather quorum fires at a single gathered member), so even the
+    /// shared-rally model deploys + engages quickly.
+    #[test]
+    fn uncontested_scatter_trickles_in_and_engages() {
+        let out = run_lifecycle_churn_spatial(&two_home_offense(), &scatter_travel(true, true));
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "an uncontested target trickles the gathered members in + engages, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn spatial_lifecycle_is_deterministic() {
+        let s = two_home_offense();
+        let t = scatter_travel(false, true);
+        assert_eq!(run_lifecycle_churn_spatial(&s, &t), run_lifecycle_churn_spatial(&s, &t));
     }
 
     // ── End-to-end: form → engine engage → kill (ADR 0028 engage handoff) ──
