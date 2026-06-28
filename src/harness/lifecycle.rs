@@ -559,6 +559,7 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             travel_progress,
             travel_budget_remaining,
             holding_station: false, // offense spatial repro — never a Defend garrison
+            reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
@@ -590,6 +591,8 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             }
             ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
             ReconcileAction::Keep => {}
+            // This driver never feeds `reassign_available=true` (reassignment is exercised by `run_v1_flow`).
+            ReconcileAction::Reassign { .. } => unreachable!("reassign_available is always false here"),
         }
         prev_present = present;
 
@@ -667,6 +670,12 @@ pub enum ChurnOutcome {
     /// GARRISONED it (lease held) for the whole budget without churning — a single stable generation. The
     /// pre-fix outcome here was repeated GaveUp+refield (`generations` climbing).
     Garrisoned { generations: u32 },
+    /// ADR 0027 v1 (whole-squad REASSIGN): the squad reached a non-loss terminal (Resolved/ObjectiveGone)
+    /// with a compatible SIBLING objective available, and REBOUND IN PLACE to it — bodies reused, NO
+    /// Generation churn (`from_gen == to_gen`). `reassignments` counts how many in-place rebinds happened;
+    /// `engage_tick` is when the squad finally engaged the LAST (reassigned) objective. The whole point: a
+    /// freed squad reuses its invested bodies instead of retire→re-field (which would climb `generations`).
+    Reassigned { from_gen: u32, reassignments: u32, engage_tick: u32 },
 }
 
 /// One squad-generation's lifecycle phase in the churn driver.
@@ -843,6 +852,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             travel_progress,
             travel_budget_remaining,
             holding_station,
+            reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
         };
         // BUG B2 (fixed state): a defender that has GARRISONED its owned room (in-room, focus-less) and held
         // its lease until the budget elapsed without churning — a single stable generation. Detected when the
@@ -899,6 +909,8 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             }
             ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
             ReconcileAction::Keep => {}
+            // This driver never feeds `reassign_available=true` (reassignment is exercised by `run_v1_flow`).
+            ReconcileAction::Reassign { .. } => unreachable!("reassign_available is always false here"),
         }
         prev_present = present;
 
@@ -945,6 +957,357 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         Phase::Traveling { .. } => ChurnOutcome::LapsedInTravel { generations: generation },
         Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival { generations: generation },
     }
+}
+
+// ═══ ADR 0027 v1: the WHOLE-FLOW driver — multi-objective queue + a MOVING threat + the PURE defense ════
+// ═══ kernel + whole-squad REASSIGN, all offline + deterministic (the operator's #1 requirement) ════════
+//
+// The existing drivers prove ONE objective's lifecycle. This driver models the END-TO-END v1 flow the live
+// servers/Docker could not reliably validate (memory: war-lifecycle-debug):
+//   • a multi-objective QUEUE (claim / withdraw / best_unclaimed-by-priority over a `Vec`, mirroring
+//     `objective_queue::best_unclaimed_near`);
+//   • a THREAT that MOVES one room per scan along a fixed room path;
+//   • the PURE `war_decision::emit_defense` kernel called EACH SCAN — re-emit `Secure{threat_room}` at the
+//     threat's current room (asset-priority boost when in/adjacent owned + the over-extension leash) and
+//     TTL-LAPSE the stale objective the threat left;
+//   • ONE squad driven through the shared `lifecycle::reconcile` kernel + the real gather/travel/engage,
+//     and — the new behaviour — REBOUND IN PLACE when `reconcile` returns `Reassign` (bodies reused, NO
+//     Generation churn), vs the pre-reassign retire→re-field that climbs the generation counter.
+//
+// Rooms are `(i32, i32)` grid coords (Chebyshev distance), one squad-step per tick within a room and one
+// room-step per tick across rooms. Deterministic: same scenario → same outcome (no `HashMap` in any path).
+
+/// A room in the toy world (grid coords). Chebyshev distance; one room = one queue/threat unit.
+type V1Room = (i32, i32);
+
+fn v1_dist(a: V1Room, b: V1Room) -> u32 {
+    (a.0 - b.0).unsigned_abs().max((a.1 - b.1).unsigned_abs())
+}
+
+/// One entry in the toy objective queue (a faithful slice of `objective_queue::CombatObjective`):
+/// a `Secure` objective at a room, with a priority, a TTL `expires_at`, and a `claimed` flag (the
+/// ephemeral within-session claim). A monotonic `id` keys reassignment exclusion (`exclude=[current]`).
+#[derive(Clone, Copy, Debug)]
+struct V1Objective {
+    id: u32,
+    room: V1Room,
+    priority: f32,
+    expires_at: u32,
+    claimed: bool,
+}
+
+/// The toy objective queue — the multi-objective claim/withdraw/best_unclaimed surface the manager pulls.
+#[derive(Default)]
+struct V1Queue {
+    objectives: Vec<V1Objective>,
+    next_id: u32,
+}
+
+impl V1Queue {
+    /// Upsert a `Secure{room}` objective (dedup by room, like `objective_queue::request`'s kind-keyed
+    /// upsert): refresh priority (max) + extend the TTL; mint a new id if absent. Returns the id.
+    fn request(&mut self, room: V1Room, priority: f32, now: u32, ttl: u32) -> u32 {
+        let expires_at = now + ttl;
+        if let Some(o) = self.objectives.iter_mut().find(|o| o.room == room) {
+            o.priority = o.priority.max(priority);
+            o.expires_at = o.expires_at.max(expires_at);
+            o.id
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.objectives.push(V1Objective { id, room, priority, expires_at, claimed: false });
+            id
+        }
+    }
+
+    /// TTL-lapse stale objectives — but keep a CLAIMED one alive past its TTL (the commitment immunity,
+    /// `objective_queue::expire`: a squad is on it right now). The stale Secure the threat LEFT is unclaimed
+    /// (its squad reassigned to the new room), so it lapses and vanishes — the `ObjectiveGone` signal.
+    fn expire(&mut self, now: u32) {
+        self.objectives.retain(|o| o.expires_at > now || o.claimed);
+    }
+
+    fn get(&self, id: u32) -> Option<&V1Objective> {
+        self.objectives.iter().find(|o| o.id == id)
+    }
+
+    fn claim(&mut self, id: u32) {
+        if let Some(o) = self.objectives.iter_mut().find(|o| o.id == id) {
+            o.claimed = true;
+        }
+    }
+
+    fn release(&mut self, id: u32) {
+        if let Some(o) = self.objectives.iter_mut().find(|o| o.id == id) {
+            o.claimed = false;
+        }
+    }
+
+    fn withdraw(&mut self, id: u32) {
+        self.objectives.retain(|o| o.id != id);
+    }
+
+    /// Best unclaimed objective excluding `exclude` (the manager's `best_unclaimed_near_excluding`): highest
+    /// priority, then the smallest id as a deterministic tie-break (no `HashMap`).
+    fn best_unclaimed_excluding(&self, exclude: u32) -> Option<u32> {
+        self.objectives
+            .iter()
+            .filter(|o| !o.claimed && o.id != exclude)
+            .max_by(|a, b| {
+                a.priority
+                    .partial_cmp(&b.priority)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.id.cmp(&a.id)) // smaller id wins ties
+            })
+            .map(|o| o.id)
+    }
+}
+
+/// The v1-flow scenario: where the colony's homes are, the owned room(s) it defends, the threat's per-scan
+/// ROOM PATH, and whether whole-squad REASSIGN is enabled (the RED→GREEN toggle: `false` reproduces the
+/// pre-reassign retire→re-field churn; `true` is the ADR 0027 v1 in-place rebind).
+#[derive(Clone, Debug)]
+pub struct V1FlowScenario {
+    /// The owned rooms the defender protects (with strategic value for the asset-priority boost).
+    pub owned: Vec<(V1Room, f32)>,
+    /// The squad's home room (where it forms; one home = one member, kept simple — the deep forming/spawn
+    /// contention is proven by the other drivers; this driver isolates the multi-objective + reassign flow).
+    pub home: V1Room,
+    /// The threat's room at each SCAN (one room-step per scan). The defense kernel emits `Secure` at the
+    /// threat's CURRENT room each scan; as the threat advances the objective moves with it.
+    pub threat_path: Vec<V1Room>,
+    /// Ticks between defense scans (war.rs scans every ~2 ticks). The threat advances one path step per scan.
+    pub scan_period: u32,
+    /// The objective TTL (lapses a stale Secure a few scans after the threat leaves; mirrors DEFEND_TTL).
+    pub objective_ttl: u32,
+    /// Enable whole-squad reassignment (ADR 0027 v1). `false` = the pre-reassign retire→re-field control.
+    pub reassign_enabled: bool,
+    /// Ticks the squad needs to form its single member (a small fixed cost; not the contention plateau).
+    pub form_ticks: u32,
+    /// Tick budget.
+    pub budget_ticks: u32,
+}
+
+/// One squad's live state in the v1 flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V1Phase {
+    /// Forming its member at home.
+    Forming,
+    /// Roster ready; traveling toward the claimed objective's room.
+    Traveling,
+    /// In the claimed objective's room.
+    InRoom,
+}
+
+/// Drive the WHOLE ADR 0027 v1 flow offline + deterministically: a multi-objective queue, a threat that
+/// MOVES between rooms, the pure `war_decision::emit_defense` kernel re-emitting `Secure` at the threat's
+/// room each scan, and the squad's reconcile + (new) in-place REASSIGN. Returns the [`ChurnOutcome`]:
+/// `Reassigned` (the squad followed the threat via in-place rebind — `from_gen == 0`, no churn) is the GREEN
+/// acceptance result; the pre-reassign control churns (`ChurnedNeverDeployed`/`LapsedInTravel` with climbing
+/// generations) because the stale objective vanishes underneath the squad and it re-fields from scratch.
+pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
+    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+    use screeps_combat_decision::war_decision::{emit_defense, DefensePolicy, OwnedRoom, Threat};
+
+    let owned: Vec<OwnedRoom<V1Room>> = s.owned.iter().map(|&(r, v)| OwnedRoom { room: r, value: v }).collect();
+    let policy = DefensePolicy::default();
+
+    let mut queue = V1Queue::default();
+    let mut generation: u32 = 0;
+    let mut reassignments: u32 = 0;
+
+    // The squad's per-generation state.
+    let mut claimed_id: Option<u32> = None;
+    let mut phase = V1Phase::Forming;
+    let mut pos: V1Room = s.home; // the squad's current room
+    let mut form_done_at: u32 = s.form_ticks; // tick forming completes for this generation
+    let mut engaged_once = false;
+    let mut deadline: u32 = COMMITMENT_BUDGET;
+    let mut gen_start: u32 = 0;
+    let mut travel_start: u32 = 0;
+    let mut prev_dist: Option<u32> = None;
+    // The threat's index into its room path (advances one step per scan); None once the path is exhausted
+    // (the threat left the map → its last objective TTL-lapses → the squad's objective_gone fires).
+    let mut threat_step: usize = 0;
+
+    for tick in 0..s.budget_ticks {
+        // ── DEFENSE SCAN (every scan_period ticks): advance the threat one room + run the PURE kernel. ──
+        if tick % s.scan_period == 0 {
+            // The threat occupies path[threat_step] this scan (None once exhausted).
+            let threat_room = s.threat_path.get(threat_step).copied();
+            let threats: Vec<Threat<V1Room>> = threat_room.map(|r| vec![Threat { room: r, danger: 1.0 }]).into_iter().flatten().collect();
+            // PURE defense emission: Secure at the threat's current room (boost + leash applied in-kernel).
+            for emission in emit_defense(&owned, &threats, policy, v1_dist) {
+                queue.request(emission.room, emission.priority, tick, s.objective_ttl);
+            }
+            // Lapse the stale objective the threat LEFT (unclaimed → TTL drops it; claimed → immune).
+            queue.expire(tick);
+            threat_step += 1;
+        } else {
+            queue.expire(tick);
+        }
+
+        // ── Phase C (claim): an unclaimed squad claims the best objective. ──
+        if claimed_id.is_none() {
+            if let Some(id) = queue.best_unclaimed_excluding(u32::MAX) {
+                queue.claim(id);
+                claimed_id = Some(id);
+                phase = V1Phase::Forming;
+                form_done_at = tick + s.form_ticks;
+                pos = s.home;
+                engaged_once = false;
+                deadline = tick + COMMITMENT_BUDGET;
+                gen_start = tick;
+                prev_dist = None;
+            }
+        }
+
+        let Some(cur_id) = claimed_id else {
+            continue; // nothing to do this tick (no objective in the queue yet)
+        };
+
+        // Snapshot the claimed objective (it may have TTL-lapsed if the squad never claimed in time, or the
+        // threat moved + the stale one we are NOT on vanished — but a claimed objective is TTL-immune, so a
+        // gone claimed objective means it was WITHDRAWN, not lapsed).
+        let obj = queue.get(cur_id).copied();
+        let objective_gone = obj.is_none();
+        let target_room = obj.map(|o| o.room);
+
+        // ── Phase progression: form → travel → in-room → engage. ──
+        let mut in_target_room = false;
+        let mut traveling = false;
+        let mut travel_progress = false;
+        if let Some(target) = target_room {
+            match phase {
+                V1Phase::Forming => {
+                    if tick >= form_done_at {
+                        phase = if pos == target { V1Phase::InRoom } else { V1Phase::Traveling };
+                        travel_start = tick;
+                    }
+                }
+                V1Phase::Traveling => {
+                    traveling = true;
+                    // Step one room toward the target.
+                    let before = v1_dist(pos, target);
+                    pos = (pos.0 + (target.0 - pos.0).signum(), pos.1 + (target.1 - pos.1).signum());
+                    let after = v1_dist(pos, target);
+                    travel_progress = after < before;
+                    prev_dist = Some(after);
+                    if pos == target {
+                        phase = V1Phase::InRoom;
+                    }
+                }
+                V1Phase::InRoom => {
+                    in_target_room = true;
+                    // Arrived: engage. If the threat is STILL here (the objective is fresh — the threat
+                    // hasn't moved on), latch engaged_once + clear it (the squad clears the room / the threat
+                    // steps out next scan). Either way the latch marks "fought here".
+                    engaged_once = true;
+                }
+            }
+        }
+        let _ = prev_dist;
+
+        // ── REASSIGN AVAILABILITY (the snapshot input, computed exactly like holding_station). A sibling
+        //    objective exists for this squad to take over (best_unclaimed excluding the current id). The
+        //    capability gate is trivially satisfied here (all v1 objectives are the same broad Secure/Defend
+        //    class). Gated on the scenario toggle so the pre-reassign control reproduces the churn. ──
+        let reassign_available = s.reassign_enabled && queue.best_unclaimed_excluding(cur_id).is_some();
+
+        // ── RECONCILE (the shared kernel) — the SAME give-up/keep/reassign logic the bot Phase A runs. ──
+        let has_members = true; // single fielded member, always present after forming in this driver
+        let forming = phase == V1Phase::Forming && tick < form_done_at;
+        let deadline_lapsed = tick >= deadline;
+        // A clean clear (Resolved) fires when engaged_once + in-room + no-focus: model "the threat left this
+        // room" as has_focus=false once the threat has advanced past target_room (its objective will lapse).
+        let threat_here = s.threat_path.get(threat_step.saturating_sub(1)).copied() == target_room;
+        let has_focus = in_target_room && threat_here; // a focus only while the threat is actually here
+        let snapshot = ReconcileSnapshot {
+            objective_gone,
+            duplicate: false,
+            is_defend: true, // a defender (the threat-centric Secure is the defense arm)
+            deadline_lapsed,
+            wiped: false,
+            has_focus,
+            engaged_once,
+            in_target_room,
+            has_members,
+            forming,
+            forming_progress: forming,
+            forming_in_flight: forming,
+            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET,
+            traveling,
+            travel_progress,
+            travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
+            holding_station: is_defend_holding(in_target_room, has_focus),
+            reassign_available,
+        };
+        match reconcile(snapshot) {
+            ReconcileAction::Reassign { withdraw_old } => {
+                // ── IN-PLACE REBIND (no Generation churn): release/withdraw the old claim → claim the new
+                //    → reset engaged_once/state/travel clocks → reopen the lease. Bodies reused. ──
+                let new_id = queue.best_unclaimed_excluding(cur_id).expect("reassign_available implies a sibling");
+                queue.release(cur_id);
+                if withdraw_old {
+                    queue.withdraw(cur_id);
+                }
+                queue.claim(new_id);
+                claimed_id = Some(new_id);
+                phase = V1Phase::Forming; // re-gather at the new objective's rally; pos stays (bodies reused)
+                form_done_at = tick; // already-formed roster — no re-spawn; re-rally is immediate
+                engaged_once = false;
+                travel_start = tick;
+                prev_dist = None;
+                deadline = tick + COMMITMENT_BUDGET; // reopen the commitment lease (set_deadline)
+                reassignments += 1;
+                // NB: `generation` is NOT bumped — that is the whole point (reuse, not re-field).
+                continue;
+            }
+            ReconcileAction::Retire { reason, withdraw, .. } => {
+                if withdraw {
+                    queue.withdraw(cur_id);
+                } else {
+                    queue.release(cur_id);
+                }
+                // A clean Resolved with the budget remaining + no sibling: the squad is done — report it as
+                // engaged (it reached + cleared at least one objective). Otherwise this is the pre-reassign
+                // churn: re-field a fresh generation (bump the counter) and try to re-claim next tick.
+                if reason == RetireReason::Resolved && reassignments > 0 {
+                    return ChurnOutcome::Reassigned { from_gen: generation, reassignments, engage_tick: tick };
+                }
+                generation += 1;
+                claimed_id = None;
+                phase = V1Phase::Forming;
+                engaged_once = false;
+                continue;
+            }
+            ReconcileAction::KeepRefreshLease => {
+                deadline = tick + COMMITMENT_BUDGET;
+            }
+            ReconcileAction::Keep => {}
+        }
+
+        // ── ACCEPTANCE: the squad has REASSIGNED at least once AND is now engaging the new objective in its
+        //    room (it followed the threat to the neighbour, reusing its bodies — no Generation churn). ──
+        if reassignments > 0 && in_target_room && engaged_once && has_focus {
+            return ChurnOutcome::Reassigned { from_gen: generation, reassignments, engage_tick: tick };
+        }
+    }
+
+    // Budget elapsed. If the squad reassigned but the run ended mid-flight, still report the reuse (no
+    // churn) — `from_gen == 0` is the proof the bodies were reused. Otherwise classify the churn.
+    if reassignments > 0 {
+        ChurnOutcome::Reassigned { from_gen: generation, reassignments, engage_tick: s.budget_ticks }
+    } else if phase == V1Phase::Forming {
+        ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present: 0 }
+    } else {
+        ChurnOutcome::LapsedInTravel { generations: generation }
+    }
+}
+
+/// The defender hold-station signal (mirrors the manager's `is_defend && in_target_room && !has_focus`).
+fn is_defend_holding(in_target_room: bool, has_focus: bool) -> bool {
+    in_target_room && !has_focus
 }
 
 /// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
@@ -1700,5 +2063,94 @@ mod tests {
             assert_eq!(out, out2, "{name}: the regime is deterministic");
             assert!(matches!(out, LifecycleOutcome::Killed { .. }), "{name}: the assembled force should KILL the defended core, got {out:?}");
         }
+    }
+
+    // ── ADR 0027 v1: the WHOLE-FLOW offline acceptance + reassign repros (the operator's #1 requirement) ──
+    //
+    // These drive `run_v1_flow` — the multi-objective queue + a MOVING threat + the pure
+    // `war_decision::emit_defense` kernel + whole-squad REASSIGN — entirely offline + deterministically,
+    // since this class of system has been unreliable to validate on live servers / Docker (memory:
+    // war-lifecycle-debug). The acceptance test is a single deterministic run.
+
+    /// A one-owned-room base whose threat walks from the owned room out into a neighbour. `reassign` toggles
+    /// the RED (pre-reassign retire→re-field churn) vs GREEN (in-place rebind) arms.
+    fn v1_threat_walks_to_neighbour(reassign: bool) -> V1FlowScenario {
+        V1FlowScenario {
+            owned: vec![((0, 0), 1.0)],                 // one owned room at the origin
+            home: (0, 0),                               // the squad forms in the owned room
+            // The threat sits in the owned room a couple of scans (the squad forms + engages there), then
+            // steps to the neighbour (1,0) and stays — so the owned Secure resolves + a neighbour Secure
+            // appears, and the squad must FOLLOW it (reassign).
+            threat_path: vec![(0, 0), (0, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0)],
+            scan_period: 2,
+            objective_ttl: 6, // a few scans — the stale owned Secure lapses once the squad reassigns off it
+            reassign_enabled: reassign,
+            form_ticks: 2,
+            budget_ticks: 400,
+        }
+    }
+
+    /// THE END-TO-END ACCEPTANCE TEST (ADR 0027 v1): a defender forms + clears its owned room (the threat
+    /// then steps out to a neighbour) → the PURE defense kernel emits `Secure{neighbour}` → the SAME squad
+    /// (same generation — NO entity/Generation churn, `from_gen == 0`) REASSIGNS, reaches, and engages the
+    /// threat at the neighbour. Single deterministic offline run. RED before the build (no `Reassign`
+    /// action), GREEN after.
+    #[test]
+    fn defender_reassigns_to_follow_a_moving_threat_end_to_end() {
+        let out = run_v1_flow(&v1_threat_walks_to_neighbour(true));
+        match out {
+            ChurnOutcome::Reassigned { from_gen, reassignments, .. } => {
+                assert_eq!(from_gen, 0, "the SAME squad followed the threat — NO Generation churn (bodies reused)");
+                assert!(reassignments >= 1, "the squad rebound in place to the neighbour Secure at least once");
+            }
+            other => panic!("the defender must reassign + follow the moving threat end-to-end, got {other:?}"),
+        }
+        // Deterministic: a single run reproduces.
+        assert_eq!(run_v1_flow(&v1_threat_walks_to_neighbour(true)), out, "the v1 flow is deterministic");
+    }
+
+    /// REASSIGN-ON-RESOLVE = REUSE (same generation), vs the pre-reassign control that CHURNS (climbing
+    /// generations): the threat-follow scenario with reassignment DISABLED retires the freed defender +
+    /// re-fields a fresh generation each time the objective moves — `generations` climbs, no reuse.
+    #[test]
+    fn reassign_reuses_same_generation_vs_control_churns() {
+        let reused = run_v1_flow(&v1_threat_walks_to_neighbour(true));
+        assert!(
+            matches!(reused, ChurnOutcome::Reassigned { from_gen: 0, .. }),
+            "reassign reuses the same generation, got {reused:?}"
+        );
+        let churned = run_v1_flow(&v1_threat_walks_to_neighbour(false));
+        match churned {
+            ChurnOutcome::Reassigned { .. } => panic!("the control (reassign disabled) must NOT reassign — it churns"),
+            ChurnOutcome::ChurnedNeverDeployed { generations, .. } | ChurnOutcome::LapsedInTravel { generations } => {
+                assert!(generations >= 1, "the pre-reassign control re-fields a fresh generation (churn), got {generations}");
+            }
+            other => panic!("the control must churn (climbing generations), got {other:?}"),
+        }
+    }
+
+    /// REASSIGN-ON-EXPIRE + the NO-SIBLING CONTROL: when the squad's objective vanishes (the threat left
+    /// the map → no new Secure emitted → `ObjectiveGone`) AND there is NO sibling, reassignment cannot fire
+    /// and the squad falls back to the existing retire (reassign is strictly ADDITIVE). Here the threat
+    /// walks out of the owned room then off the map entirely, so the only objective vanishes with no sibling.
+    #[test]
+    fn no_sibling_falls_back_to_retire_not_reassign() {
+        let scenario = V1FlowScenario {
+            owned: vec![((0, 0), 1.0)],
+            home: (0, 0),
+            // Threat in the owned room briefly, then walks FAR off the map (beyond the leash → no Secure
+            // emitted) → the claimed objective is the only one + it resolves/vanishes with NO sibling.
+            threat_path: vec![(0, 0), (0, 0), (9, 9), (9, 9), (9, 9)],
+            scan_period: 2,
+            objective_ttl: 6,
+            reassign_enabled: true, // enabled, but there is no sibling to reassign TO
+            form_ticks: 2,
+            budget_ticks: 200,
+        };
+        let out = run_v1_flow(&scenario);
+        assert!(
+            !matches!(out, ChurnOutcome::Reassigned { .. }),
+            "with no sibling available, the squad must NOT reassign — it falls back to retire, got {out:?}"
+        );
     }
 }
