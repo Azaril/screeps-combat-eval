@@ -1422,6 +1422,7 @@ fn offense_candidate_to_objective(c: &OffenseCandidate, member_energy: u32, onsi
         EnemyCoordination::Coordinated,
         0.0,
         c.honor_verdict,
+        false, // not confirmed-undefended (this gate bed folds the enemy into `defense.enemy_dps`)
         &CompositionParams { member_energy, ..Default::default() },
     );
     comp.map(|_| priority)
@@ -2455,6 +2456,7 @@ mod tests {
             EnemyCoordination::Coordinated,
             0.0,   // importance
             false, // always-field (honor_verdict=false)
+            false, // a REAL threat (enemy_dps=30) — NOT confirmed-undefended → floor retained
             &screeps_combat_decision::composition::CompositionParams::default(),
         )
         .expect("the defense optimizer fields a roster for dps=30")

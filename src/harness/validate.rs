@@ -245,6 +245,10 @@ pub(crate) fn siege_doctrine_plan_with(
         target_value: CALIBRATION_TARGET_VALUE,
         onsite_window: budget.onsite_budget_ticks,
         params: screeps_combat_decision::composition::CompositionParams { member_energy: effective_member_energy, ..*params },
+        // The eval bed is a fully-specified, KNOWN defense (reliable intel by construction). Inert here
+        // (DismantleStructure → the gated SiegeBreach never reaches the always-field floor), but set
+        // truthfully so the field's meaning is unambiguous.
+        defense_intel_reliable: true,
     };
     let doctrines = default_doctrines();
     let doctrine = decide_doctrine(&ctx, &doctrines).expect("DismantleStructure routes to the siege-breach doctrine");
