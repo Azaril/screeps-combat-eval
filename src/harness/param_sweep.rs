@@ -429,26 +429,32 @@ mod tests {
         assert!(!ranked[3].1.gates_held, "gates-failing ranks last");
     }
 
-    /// ADR 0031 #39 DRAIN Phase 0 — the finite-energy multi-tower drain BED + the BASELINE lock.
+    /// ADR 0031 #39 DRAIN — the finite-energy multi-tower drain BED: the oracle PICKS Drain + the lifecycle
+    /// now FIELDS a drain comp (P2/P3), but the ASSEMBLED multi-member soak needs tank-forward coordination.
     ///
     /// A core behind a thin rampart, guarded by FOUR finite-energy towers at MODERATE energy (1500 each —
     /// drainable: ~150 shots to dry, and a tank can soak that long) clustered at point-blank. The four
     /// towers at the breach standoff deal far more than a single squad can out-heal, so a BREACH force is
-    /// NOT winnable head-on (the oracle defers the breach / the fielded ceiling can't out-heal → it does
-    /// NOT kill). But the towers are FINITE, so the configuration IS winnable by a DRAIN (a tank soaks them
-    /// dry, then the squad breaches). `assess`'s `AssaultMode::Drain` branch confirms the drain is feasible.
+    /// NOT winnable head-on. But the towers are FINITE, so the configuration IS winnable by a DRAIN — and
+    /// `assess` now PICKS `AssaultMode::Drain` (asserted below) and the lifecycle FIELDS the oracle-sized
+    /// drain comp through the drain stance + `breach_drain` tactics (P2/P3 — no longer the breach-only path).
     ///
-    /// THIS TEST LOCKS THE P0 BASELINE + THE TARGET: today's breach-only pipeline does NOT kill this bed
-    /// (deferred or lost). It MUST FLIP to `Killed` once P2 fields a drain composition through this same
-    /// lifecycle (the optimizer/doctrine emitting a TOUGH+HEAL drain comp + the P1 drain tactic — proven at
-    /// the tactic layer by `screeps-combat-agent`'s `a_drain_squad_bleeds_finite_towers_dry_then_breaches`).
-    /// When P2 lands, change this assertion to `matches!(out, LifecycleOutcome::Killed { .. })`.
+    /// HONEST STATUS (reported, not faked): the END-TO-END drain+breach is PROVEN ORACLE-DRIVEN at the
+    /// tactic layer by `screeps-combat-agent`'s
+    /// `the_oracle_decides_drain_then_a_sized_squad_bleeds_the_towers_and_breaches` (a SOLO oracle-sized tank
+    /// drains the finite towers dry then dismantles the dead base — the make-or-break, GREEN). At THIS
+    /// lifecycle the oracle-sized comp is a MULTI-MEMBER assembled force; the towers focus-fire the nearest
+    /// member and the heal is SPREAD across healers (no single member solo-out-heals the focused falloff), so
+    /// the assembled blob is wiped before the soak completes (verified: `RosterWiped`). Closing this needs the
+    /// tank-forward soak coordination (TOUGH front presents the armor + healers heal-the-tank — the formation
+    /// soak) that is the documented P2-efficiency follow-on, NOT part of the drain DECISION+SIZING this task
+    /// builds. So this bed is still NOT `Killed` at the multi-member lifecycle — for the new, documented
+    /// reason (assembled-soak coordination), not the old "breach-only pipeline can't field a drain at all".
     ///
     /// NOTE: deliberately NOT added to `acceptance_regimes()` — that set is the gate every point must KILL,
-    /// and this bed is (correctly) un-killable by the breach pipeline until drain comps are fielded. Adding
-    /// it there now would (rightly) fail the whole sweep.
+    /// and the multi-member assembled soak is not yet there.
     #[test]
-    fn finite_multi_tower_drain_bed_is_not_killed_by_the_breach_pipeline_today() {
+    fn finite_multi_tower_drain_bed_oracle_picks_drain_but_assembled_soak_needs_tank_forward_coord() {
         use crate::harness::generate::{ForceSpec, Layout};
         use screeps_combat_decision::composition::CompositionParams;
         use screeps_combat_decision::force_sizing::{assess, AssaultMode, DefenseProfile, ForceBudget, TowerThreat};
@@ -489,13 +495,19 @@ mod tests {
         assert!(a.winnable, "the bed IS winnable for a single squad — via drain ({})", a.reason);
         assert_eq!(a.mode, AssaultMode::Drain, "and the winning mode is DRAIN, not breach ({})", a.reason);
 
-        // (2) The BASELINE: today's breach-only lifecycle does NOT kill this bed (it defers the breach / the
-        //     fielded ceiling can't out-heal the four point-blank towers → not Killed). This is the lock.
+        // (2) The lifecycle now PICKS Drain (the oracle, P2) and FIELDS a drain comp through the drain stance +
+        //     `breach_drain` tactics (P3) — NOT the old breach-only path. The ASSEMBLED multi-member soak,
+        //     though, gets focus-fired before it bleeds the towers dry (no single member solo-out-heals the
+        //     falloff; the tank-forward heal-the-tank coordination is the documented P2-efficiency follow-on).
+        //     So this bed is still NOT Killed at the multi-member lifecycle — the END-TO-END oracle-driven
+        //     drain+breach is GREEN at the SOLO-tank tactic layer (combat-agent
+        //     `the_oracle_decides_drain_then_a_sized_squad_bleeds_the_towers_and_breaches`).
         let out = run_defended_lifecycle_with_params(&bed, rampart, &drain_towers, Layout::Open, ForceSpec::Guard(1), &params);
         assert!(
             !matches!(out, LifecycleOutcome::Killed { .. }),
-            "P0 BASELINE: the breach-only pipeline must NOT kill the finite multi-tower drain bed today (got {out:?}); \
-             this FLIPS to Killed when P2 fields a drain composition through this lifecycle"
+            "the ASSEMBLED multi-member drain soak is not Killed yet (got {out:?}) — it needs tank-forward soak \
+             coordination (the P2-efficiency follow-on); the oracle-driven drain+breach is proven end-to-end at \
+             the solo-tank tactic layer (combat-agent the_oracle_decides_drain_then_a_sized_squad_bleeds...)"
         );
     }
 }

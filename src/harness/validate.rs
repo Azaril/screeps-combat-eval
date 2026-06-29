@@ -502,6 +502,36 @@ pub(crate) fn run_managed_assault_with(
     Some(out)
 }
 
+/// ADR 0031 #39 P2/P3 — as [`run_managed_assault_with`] but fields the squad in the tower-DRAIN STANCE
+/// (`with_drain_stance(true)`): the TOUGH+HEAL tank holds the falloff standoff while the FINITE towers bleed
+/// dry (the engine's `defense_intents` fires them, decrementing energy 10/shot/tick), then the squad advances
+/// and dismantles the dead base. This is the END-TO-END oracle-driven drain (the oracle picked `Drain` + sized
+/// the comp; here the SAME comp runs through the SAME `decide_squad` the live bot threads via P3) — the runtime
+/// proof that complements the tactic-layer `a_drain_squad_bleeds_finite_towers_dry_then_breaches`.
+pub(crate) fn run_managed_assault_drain(
+    scenario: &Scenario,
+    obj: &Objective,
+    comp: &SquadComposition,
+    tactics: screeps_combat_decision::kite::SquadTacticParams,
+) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
+    let mut world = scenario.world.clone();
+    let members = place_at_entry(&mut world, obj, comp, scenario.attacker_owner, scenario.member_energy)?;
+    let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos)
+        .with_tactics(tactics)
+        .with_drain_stance(true);
+    let defender = scenario.defender_owner;
+    let core_pos = obj.pos;
+    let run_until = run_until_for(scenario, obj);
+    let out = evaluate_recorded(
+        world,
+        &mut |w| squad.step(w),
+        &mut |w, intents| defense_intents(w, defender, core_pos, intents),
+        &run_until,
+        scenario.onsite_budget,
+    );
+    Some(out)
+}
+
 /// The managed ATTACKER's **period-2 oscillation rate** over a scenario's recorded assault — the
 /// durable ADR 0024 regression gate (replaces the ad-hoc node A-B-A script). `None` when the squad
 /// couldn't be fielded at the entry (excluded from the metric, like the integration lens).

@@ -2292,12 +2292,18 @@ pub fn run_defended_lifecycle_with_params(
         params.hold_margin,
         params.over_power_margin,
     );
-    let comp = match (assessment.winnable && assessment.mode == AssaultMode::Breach, assemble_force(&required, sizing_energy)) {
-        (true, Some(assembled)) => assembled,
-        // The oracle deferred / drained / the assembler couldn't field the required force at this energy —
-        // field the ceiling so the chain still runs (the test then surfaces whether even the ceiling kills).
-        // The ceiling fallback uses the HOME capacity (not the swept per-member cap) so the Default path is
-        // byte-identical to the pre-sweep behaviour (which sized the fallback at `engage.member_energy`).
+    // ADR 0031 #39 P2/P3 — the oracle picks the MODE. A winnable BREACH (or DRAIN) fields the oracle-sized
+    // comp; otherwise the ceiling fallback keeps the chain running. The DRAIN comp carries the TOUGH+HEAL
+    // soak buffer `from_assessment` sized (P2); the engage phase below runs it through the drain stance +
+    // `breach_drain` tactics (P3 parity — the SAME `decide_squad` the live bot threads).
+    let drain = assessment.winnable && assessment.mode == AssaultMode::Drain;
+    let comp = match (assessment.winnable && assessment.mode == AssaultMode::Breach, drain, assemble_force(&required, sizing_energy)) {
+        (true, _, Some(assembled)) => assembled,
+        (_, true, Some(assembled)) => assembled,
+        // The oracle deferred / the assembler couldn't field the required force at this energy — field the
+        // ceiling so the chain still runs (the test then surfaces whether even the ceiling kills). The ceiling
+        // fallback uses the HOME capacity (not the swept per-member cap) so the Default path is byte-identical
+        // to the pre-sweep behaviour (which sized the fallback at `engage.member_energy`).
         _ => siege_ceiling(engage.member_energy),
     };
 
@@ -2317,9 +2323,16 @@ pub fn run_defended_lifecycle_with_params(
         FormingOutcome::Stalled { filled, of } => return LifecycleOutcome::NeverFormed { filled, of },
     };
 
-    // 4. Engage the FORMED + MOVING roster against the defended core (breach tactics: dismantle through the
-    //    gate while out-healing the tower + guards). The engaged comp == the formed comp.
-    match run_managed_assault_with(&engage, obj, &comp, SquadTacticParams::breach()) {
+    // 4. Engage the FORMED + MOVING roster against the defended core. A BREACH dismantles through the gate
+    //    while out-healing the tower + guards; a DRAIN (ADR 0031 #39 P3) holds the falloff standoff while the
+    //    FINITE towers bleed dry, then advances + dismantles — fielded via the drain stance + `breach_drain`
+    //    tactics (the SAME `decide_squad` the live bot threads through P3). The engaged comp == the formed comp.
+    let engaged = if drain {
+        crate::harness::validate::run_managed_assault_drain(&engage, obj, &comp, SquadTacticParams::breach_drain())
+    } else {
+        run_managed_assault_with(&engage, obj, &comp, SquadTacticParams::breach())
+    };
+    match engaged {
         None => LifecycleOutcome::CouldNotField { form_ticks },
         Some((out, _rec)) => match out.stop {
             StopReason::ObjectivesComplete => LifecycleOutcome::Killed { form_ticks, engage_ticks: out.ticks },
