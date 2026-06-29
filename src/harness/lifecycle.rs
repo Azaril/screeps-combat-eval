@@ -1036,6 +1036,24 @@ pub struct ExtendedTravel {
     /// `SOLO_TRAVEL_STALL_WINDOW` that escalates (D4) fast. Requires `escalate_on_block` to do anything (the
     /// stall window TRIGGERS the D4 escalation). Default `false` (RED).
     pub tight_stall_window: bool,
+    // ── ADR 0034 Phase 2 (RC-5/RC-6/RC-7): the lifetime-attrition axis + renew-in-transit (sim gap G4) ──
+    /// RC-6 — is the RALLY ROOM within range of a friendly spawn (so a held-at-rally member can RENEW there)?
+    /// `false` (default) = a forward rally with NO spawn — a member that arrives + holds there just ages out.
+    /// `true` models the D6c renewable-rally bias (a staging room near a friendly spawn). When set, the renew
+    /// pass (D6b) tops up members that are GATHERED at the rally, not just those holding at home.
+    pub rally_spawn: bool,
+    /// D6a FIX toggle (RC-7 — pre-departure LIFETIME GATE): `false` reproduces the pre-fix bot (a member is
+    /// committed to `MoveTo(rally)` with NO check that its TTL covers the journey + fight — a far/low-TTL
+    /// member is sent anyway and arrives below `FIGHT_BUFFER` / ages out mid-travel). `true` is the fixed bot:
+    /// before releasing a member it runs `rally::lifetime_sufficient_for_deployment`; an insufficient member
+    /// HOLDS at home (D6b renew tops it up) instead of departing doomed. Default `false` (RED).
+    pub lifetime_gate: bool,
+    /// D6b FIX toggle (RC-5 — RENEW-to-sufficiency while holding): `false` reproduces the FORMING-ONLY renew
+    /// (a held/rallying member with low TTL is NOT renewed once `filled >= requested` — RC-5). `true` extends
+    /// the renew past the forming gate: a present member with low TTL that is HOLDING at home (or GATHERED at
+    /// a `rally_spawn` rally) is topped up toward `rally::RENEW_TARGET_TTL`, energy/lane-bounded. Default
+    /// `false` (RED). Requires `member_ttl`/decay to bite (see `ColonyFormingScenario::member_ttl`).
+    pub renew_in_transit: bool,
 }
 
 impl ExtendedTravel {
@@ -1113,6 +1131,17 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
     // An ephemeral per-objective decision (no serialized state).
     let mut excluded: Vec<bool> = vec![false; n_slots];
 
+    // ── ADR 0034 Phase 2 (RC-5/RC-6/RC-7): per-member TTL + renew model (sim gap G4). EPHEMERAL runtime
+    // state — `ttl[i]` MIRRORS the live `creep.ticks_to_live()` read fresh from the world each tick (NOT a
+    // serialized field), and the renew self-heals on reload. A present member's TTL starts at `member_ttl`
+    // and decays -1/tick (the engine ages every creep); a renew tops it back up toward `RENEW_TARGET_TTL`.
+    let mut ttl: Vec<u32> = vec![0; n_slots];
+    // D6a: a member HELD at home by the pre-departure lifetime gate (its TTL can't yet cover journey+fight).
+    // It does not advance toward the rally; the D6b renew tops it up; once sufficient it is released.
+    let mut held_home: Vec<bool> = vec![false; n_slots];
+    // The rally for the lifetime gate's `dist_to_rally`/`dist_to_target` — recomputed once departed; while
+    // forming the members sit at home so the gate uses home→rally (re-derived when present changes).
+
     for tick in 0..s.budget_ticks {
         completing.retain(|&(id, at)| {
             if at <= tick {
@@ -1127,12 +1156,27 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 if (id as usize) < n_slots {
                     filled[id as usize] = true;
                     member_pos[id as usize] = travel.homes[id as usize]; // appears AT its home
+                    ttl[id as usize] = s.member_ttl; // a fresh member starts with a full life (RC-5 decay below)
                 }
                 false
             } else {
                 true
             }
         });
+
+        // ── Phase 2 TTL DECAY + AGE-OUT (RC-5): every present member ages -1/tick (the engine). A member whose
+        // TTL hits 0 while still rallying/traveling DIES of old age → drops back to unfilled (and re-spawns) —
+        // the slow-far-home churn the renew (D6b) prevents. `ttl[i]` here mirrors the live `ticks_to_live()`.
+        for i in 0..n_slots {
+            if filled[i] {
+                ttl[i] = ttl[i].saturating_sub(1);
+                if ttl[i] == 0 {
+                    filled[i] = false;
+                    member_pos[i] = travel.homes[i];
+                    held_home[i] = false;
+                }
+            }
+        }
 
         let present = filled.iter().filter(|f| **f).count();
         max_present = max_present.max(present);
@@ -1210,7 +1254,25 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                         }
                     }
                 }
-                in_target_room = (0..n_slots).any(|i| filled[i] && member_pos[i].room_name() == target_room);
+                // ARRIVAL (RC-7): a member that reaches the target room with TTL still ABOVE `FIGHT_BUFFER` can
+                // sustain the fight → engage. A member that arrives BELOW the buffer (the pre-fix far/low-TTL
+                // crawl) is dead-on-arrival — it cannot meaningfully fight; it drops to unfilled (the roster
+                // attrition that keeps the contested quorum from stabilising). The D6 renew keeps it above the
+                // buffer; without it the far member arrives spent. `ttl[i]` mirrors the live `ticks_to_live()`.
+                let mut arrived_fit = false;
+                for i in 0..n_slots {
+                    if filled[i] && member_pos[i].room_name() == target_room {
+                        if ttl[i] > rally::FIGHT_BUFFER {
+                            arrived_fit = true;
+                        } else {
+                            // Dead-on-arrival: too spent to fight → drops out (re-spawn / churn).
+                            filled[i] = false;
+                            member_pos[i] = travel.homes[i];
+                            held_home[i] = false;
+                        }
+                    }
+                }
+                in_target_room = arrived_fit;
                 if in_target_room {
                     return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
                 }
@@ -1228,14 +1290,41 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 // A member within `RALLY_GATHER_RADIUS` of the rally has ARRIVED — it holds (range 1) and
                 // counts as PROGRESS for D5 (it is done, not stalled).
                 let mut at_rally = vec![false; n_slots];
+                // D6a PRE-DEPARTURE LIFETIME GATE (RC-7): rally→target room-distance (the assault leg cost).
+                let rally_to_target = ExtendedTravel::room_dist(rally, travel.target);
                 for i in 0..n_slots {
                     if !filled[i] || excluded[i] {
                         continue; // unspawned, or re-assessed out (left behind / recalled)
                     }
                     if member_pos[i].get_range_to(rally) <= rally::RALLY_GATHER_RADIUS {
                         at_rally[i] = true;
+                        held_home[i] = false;
                         block_streak[i] = 0;
                         continue; // already gathered at the rally — hold (range 1)
+                    }
+                    // D6a (RC-7): before stepping a member toward the rally, gate on whether its TTL can cover
+                    // the journey (dist→rally + rally→target) + the fight buffer. PRE-FIX (`lifetime_gate`
+                    // off) it is sent regardless → it arrives below `FIGHT_BUFFER` / ages out mid-travel. FIXED
+                    // (on) an insufficient-but-renewable member HOLDS at home (D6b tops it up); once sufficient
+                    // it is released to travel. A hopeless member is held too (the bot would recycle it; the
+                    // sim just keeps it home so it can't feed the oscillation — recycle is bot-side).
+                    if travel.lifetime_gate {
+                        let dist_to_rally = ExtendedTravel::room_dist(member_pos[i], rally);
+                        match rally::lifetime_sufficient_for_deployment(
+                            ttl[i],
+                            dist_to_rally,
+                            rally_to_target,
+                            rally::FIGHT_BUFFER,
+                            rally::RENEW_TARGET_TTL,
+                        ) {
+                            rally::CommitDecision::Commit => held_home[i] = false,
+                            // Insufficient (renewable or hopeless) → HOLD at home, do not advance this tick.
+                            _ => {
+                                held_home[i] = true;
+                                block_streak[i] = 0;
+                                continue;
+                            }
+                        }
                     }
                     let next = ExtendedTravel::step_toward(member_pos[i], rally);
                     if blocked.contains(&next.room_name()) {
@@ -1307,6 +1396,42 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
             }
         }
 
+        // ── D6b RENEW-TO-SUFFICIENCY while holding (RC-5/RC-6). The bot's Phase-B-renew tops up a present
+        // member with low TTL that is HOLDING at a free spawn — extended PAST the forming-only `filled >=
+        // requested` gate. A member is RENEWABLE here when it is either (a) HELD AT HOME by the D6a gate (a
+        // home spawn is free to top it up), OR (b) GATHERED at the rally AND `rally_spawn` (the D6c renewable-
+        // rally bias — a forward staging room near a friendly spawn). Each renew adds `RENEW_PER_TICK` toward
+        // `RENEW_TARGET_TTL`, bounded by ONE renew per home spawn lane per tick (no spawn monopolization — the
+        // economy lane is preserved exactly as the pre-fix model). PRE-FIX (`renew_in_transit` off) only the
+        // forming-renew below fires, so a held/rallying member with low TTL just ages out (RC-5). The renew
+        // self-heals on reload — `ttl[i]` mirrors the live creep, no serialized state.
+        if travel.renew_in_transit {
+            // Which present members are eligible for a top-up this tick (low TTL + renewable location)?
+            let renewable = |i: usize| -> bool {
+                if !filled[i] || ttl[i] >= rally::RENEW_TARGET_TTL {
+                    return false;
+                }
+                let at_home = held_home[i] || (!departed && member_pos[i] == travel.homes[i]);
+                let at_renewable_rally = departed && travel.rally_spawn && {
+                    let r = screeps_combat_decision::rally::shared_rally_point_for_members(
+                        &ExtendedTravel::pos_options(&present_positions),
+                        travel.target,
+                        travel.uncontested,
+                    );
+                    member_pos[i].get_range_to(r) <= rally::RALLY_GATHER_RADIUS
+                };
+                at_home || at_renewable_rally
+            };
+            // One renew per home spawn lane per tick (the bounded, no-monopolization model). Lowest-TTL first
+            // (the most urgent member), deterministic (slot order tie-break, no `HashMap`).
+            let free_lanes = (0..s.homes.len()).filter(|&h| tick >= busy_until[h]).count();
+            let mut order: Vec<usize> = (0..n_slots).filter(|&i| renewable(i)).collect();
+            order.sort_by_key(|&i| (ttl[i], i));
+            for &i in order.iter().take(free_lanes) {
+                ttl[i] = (ttl[i] + RENEW_PER_TICK).min(rally::RENEW_TARGET_TTL);
+            }
+        }
+
         // Reconcile (the shared kernel).
         let forming = has_members && !engaged_once && !departed && present < n_slots;
         let forming_progress = forming && present > prev_present;
@@ -1357,6 +1482,8 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 prev_member_dist = vec![None; n_slots];
                 block_streak = vec![0; n_slots];
                 excluded = vec![false; n_slots];
+                ttl = vec![0; n_slots];
+                held_home = vec![false; n_slots];
                 continue;
             }
             ReconcileAction::Retire { .. } => {
@@ -3320,6 +3447,9 @@ mod tests {
             escalate_on_block: false,
             majority_progress: false,
             tight_stall_window: false,
+            rally_spawn: false,
+            lifetime_gate: false,
+            renew_in_transit: false,
         }
     }
 
@@ -3341,6 +3471,108 @@ mod tests {
         // (RC-3 silent NO_PATH). Slot 0 (lead, rx=-7) + slots 2.. (rx=-8) never touch the blocked room.
         t.blocked_rooms = vec![wpos(-12, -6, 25, 25).room_name()]; // W11N5 — squarely on slot-1's corridor
         t
+    }
+
+    // ── ADR 0034 Phase 2: S3 RENEW-IN-TRANSIT (RC-5/RC-6/RC-7) ───────────────────────────────────────────
+    //
+    // A SLOW far-home form against a far CONTESTED target with a FINITE member life. The members spawn far
+    // from the rally and must crawl ~12 rooms (~600 ticks at one world-tile/tick); the assault then adds the
+    // rally→target leg. With a member life SHORT of (journey + fight), the pre-fix bot commits them anyway —
+    // they arrive BELOW `FIGHT_BUFFER` (dead-on-arrival, drop out → re-spawn → churn) and never engage. D6
+    // (the pre-departure lifetime gate + renew-to-sufficiency) holds them at home until a renew tops them up,
+    // then they depart fit and arrive ABOVE the buffer → engage.
+
+    /// A 3-slot offense roster with a SHORT member life (Phase-2 S3). Same fieldable homes as
+    /// `three_slot_offense` (so forming is fast — the failure is LIFETIME, not spawn contention), but
+    /// `member_ttl = 700` — short of the ~750-tick (12-room crawl + assault + fight) journey, so a renew is
+    /// REQUIRED to deploy fit. Generous budget so the renew-hold + the long crawl both fit.
+    fn s3_short_life_offense() -> ColonyFormingScenario {
+        let mut s = three_slot_offense(3000);
+        s.member_ttl = 700; // SHORT of journey(650) + FIGHT_BUFFER(100) = 750 → renew required (RC-5/RC-7)
+        s
+    }
+
+    /// S3 geometry: all three members home ~12 rooms from the contested target's one-room-short rally, so the
+    /// journey eats most of a member's life. All at the SAME far home (the lifetime axis is isolated from the
+    /// lead-pins-the-min RC-4 axis S1 covers). `rally_spawn` is left default-`false` (the home-renew D6a/D6b
+    /// fully carries S3; the renewable-rally D6c is exercised separately + is the documented follow-up).
+    fn far_home_s3(n_slots: usize) -> ExtendedTravel {
+        let homes = (0..n_slots).map(|_| wpos(-19, -6, 25, 25)).collect(); // W18N5 — ~12 rooms from the rally
+        ExtendedTravel {
+            homes,
+            target: wpos(-6, -6, 25, 25), // W5N5 (contested) → rally one room short at W6N5
+            uncontested: false,
+            blocked_rooms: vec![],
+            escalate_on_block: false,
+            majority_progress: true, // isolate the LIFETIME axis (the long uniform crawl needs D5 to not min-pin)
+            tight_stall_window: false,
+            rally_spawn: false,
+            lifetime_gate: false,
+            renew_in_transit: false,
+        }
+    }
+
+    /// RC-5/RC-6/RC-7 RED→GREEN: S3 renew-in-transit. PRE-FIX (no lifetime gate, no renew-in-transit) the
+    /// short-lived members are committed to the long crawl anyway and arrive BELOW `FIGHT_BUFFER`
+    /// (dead-on-arrival → drop out → churn) → never `DeployedAndEngaged`. FIXED (D6a lifetime gate + D6b
+    /// renew-to-sufficiency) they HOLD at home, renew up to sufficiency, then depart fit and arrive ABOVE the
+    /// buffer → `DeployedAndEngaged`.
+    #[test]
+    fn far_home_s3_short_life_churns_then_renew_deploys() {
+        let s = s3_short_life_offense();
+        let n = s.composition.slots.len();
+        // RED: short-lived members sent on the long crawl arrive spent → no engage (churn / travel lapse).
+        let red = run_lifecycle_churn_extended(&s, &far_home_s3(n));
+        // The short-lived members crawl the long corridor but arrive BELOW FIGHT_BUFFER (dead-on-arrival →
+        // drop out → the contested quorum never stabilises) → the travel lease lapses. Specifically NOT
+        // DeployedAndEngaged — the lifetime attrition (RC-5/RC-7) blocks the engage.
+        assert!(
+            matches!(red, ChurnOutcome::LapsedInTravel { .. } | ChurnOutcome::OscillatedNeverGathered { .. } | ChurnOutcome::ChurnedNeverDeployed { .. }),
+            "RC-5/RC-7: short-lived far members committed without a lifetime gate must NOT engage, got {red:?}"
+        );
+        // GREEN: D6a (pre-departure lifetime gate) + D6b (renew-to-sufficiency while holding at home) keep the
+        // roster fit → it departs above sufficiency + arrives above FIGHT_BUFFER → engage.
+        let green_travel = ExtendedTravel {
+            lifetime_gate: true,
+            renew_in_transit: true,
+            ..far_home_s3(n)
+        };
+        let green = run_lifecycle_churn_extended(&s, &green_travel);
+        assert!(
+            matches!(green, ChurnOutcome::DeployedAndEngaged { .. }),
+            "D6 lifetime gate + renew-to-sufficiency must deploy the roster fit → engage, got {green:?}"
+        );
+    }
+
+    /// The lifetime GATE alone (no renew) cannot rescue a too-short member — proving D6b (renew) is
+    /// load-bearing, not redundant with D6a. With the gate ON but renew OFF, the held members never get topped
+    /// up → they hold at home forever (TTL keeps decaying) → never deploy.
+    #[test]
+    fn far_home_s3_gate_without_renew_still_fails() {
+        let s = s3_short_life_offense();
+        let n = s.composition.slots.len();
+        let out = run_lifecycle_churn_extended(&s, &ExtendedTravel { lifetime_gate: true, ..far_home_s3(n) });
+        assert!(
+            !matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "D6a gate alone (no renew to top up the held members) can't deploy a too-short roster, got {out:?}"
+        );
+    }
+
+    /// D6c (renewable-rally bias): with a `rally_spawn` rally, a member that REACHES the rally with low TTL is
+    /// renewed THERE (not only at home) — the forward-staging top-up. Exercises the `rally_spawn` arm of the
+    /// renew pass. (The home-renew path already carries S3; this pins the rally-spawn branch.)
+    #[test]
+    fn far_home_s3_renewable_rally_also_deploys() {
+        let s = s3_short_life_offense();
+        let n = s.composition.slots.len();
+        let green = run_lifecycle_churn_extended(
+            &s,
+            &ExtendedTravel { lifetime_gate: true, renew_in_transit: true, rally_spawn: true, ..far_home_s3(n) },
+        );
+        assert!(
+            matches!(green, ChurnOutcome::DeployedAndEngaged { .. }),
+            "D6 with a renewable rally must deploy + engage, got {green:?}"
+        );
     }
 
     /// RC-4/RC-8 RED→GREEN: S1 far-home stall. Pre-fix (min-distance progress, no D5) the held lead pins the
@@ -3414,6 +3646,12 @@ mod tests {
         let n = s.composition.slots.len();
         let t = far_home_s1_blocked(n);
         assert_eq!(run_lifecycle_churn_extended(&s, &t), run_lifecycle_churn_extended(&s, &t));
+        // Phase 2: the TTL/renew/lifetime-gate path is equally deterministic (integer math, no float branch,
+        // no HashMap) — same (scenario, travel) → same outcome.
+        let s3 = s3_short_life_offense();
+        let n3 = s3.composition.slots.len();
+        let t3 = ExtendedTravel { lifetime_gate: true, renew_in_transit: true, rally_spawn: true, ..far_home_s3(n3) };
+        assert_eq!(run_lifecycle_churn_extended(&s3, &t3), run_lifecycle_churn_extended(&s3, &t3));
     }
 
     // ── End-to-end: form → engine engage → kill (ADR 0028 engage handoff) ──
