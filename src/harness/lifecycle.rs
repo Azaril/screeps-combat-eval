@@ -961,6 +961,455 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
     }
 }
 
+// ═══ ADR 0034 Phase 1: run_lifecycle_churn_EXTENDED — the PRODUCTION-PATH far-home stall (RC-3/4/8/10) ═══
+//
+// `run_lifecycle_churn` models travel as a pure TICK COUNTER (`Phase::Traveling { arrives_at }`); the
+// SPATIAL driver (`run_lifecycle_churn_spatial`) positions members but over a TOY `WPos` grid with a GIVEN
+// rally + a hand-rolled stepper — neither calls the PRODUCTION geometry. So the far-home stall (the rally is
+// mis-computed for a far/cross-quadrant scatter, then a wrong/blocked rally turns into a SILENT PERMANENT
+// stall) is invisible offline (sim gap G3/G5/G6).
+//
+// This EXTENDED driver folds spatial positioning into the production path and exercises the REAL geometry:
+//   (a) per-member REAL `screeps::Position`s seeded at distinct cross-quadrant homes (not a `WPos` grid);
+//   (b) the PRODUCTION rally — `cohesion::centroid` → `rally::shared_rally_point_for_members` (the SAME calls
+//       `squad_manager` makes), re-derived FRESH each tick over the present members (no stored field);
+//   (c) a SOLO step: each member steps one world-tile toward the rally per tick;
+//   (d) per-tick `rally::gather_quorum_met` + the FIX-A assault latch (committed once the quorum first fires);
+//   (e) `Arrived` is GATED on `gathered` (NOT a bare tick counter) — the assault advances rally→target only
+//       after the gather quorum, and arrival = a member actually IN the target room;
+//   (f) BOTH the min-over-members distance AND per-member distances are tracked, so RC-4 (one stuck member
+//       pins the min / one moving lead masks a stuck bulk) and RC-8 (the lease lapses on a pinned min) are
+//       assertable.
+//
+// THE BLOCKED-PATH MODEL (RC-3, sim gap G5): a `blocked_rooms` set the solo stepper checks. A member whose
+// next world-step would ENTER a blocked room CANNOT advance (the live NO_PATH / impassable-terrain / hostile
+// room a `MoveToRoom::move_to(rally)` silently retries). Pre-fix the manager has NO member-side movement
+// feedback (RC-3): a blocked member sits forever, the min-distance never closes (RC-4/RC-8), and the squad
+// gives up only when the coarse 1000-tick travel budget lapses — a SILENT permanent stall masquerading as a
+// clean give-up.
+//
+// THE FIXES (D4/D5/D8), modeled by the `escalate` + `majority_progress` + `stall_window` flags:
+//   • D4 (member-side failure detection + escalation, RC-3): a blocked member surfaces a `Blocked` signal;
+//     after a BOUNDED stall the driver ESCALATES by RE-ASSESSING that member OUT of the gather quorum (it is
+//     dropped from the quorum denominator) so the REACHABLE subset masses and the contested quorum fires,
+//     rather than waiting forever on a member that cannot path. The rally is NOT moved — the blocked member
+//     is excluded. No silent retry loop.
+//   • D5 (per-member + MAJORITY travel progress, RC-4/RC-8): the travel lease refreshes while a MAJORITY of
+//     present members are closing (per-member distances), NOT while the single closest is (the min). One
+//     straggler can't pin the squad "stalled"; one moving lead can't mask a stuck bulk.
+//   • D8 (tighter per-member stall window, RC-8): a SOLO-travel stall of `STALL_WINDOW` ticks with ZERO
+//     members EVER gathered ESCALATES (D4) BEFORE the coarse `MAX_TRAVEL_BUDGET` — a wrong/blocked rally is
+//     caught fast, not 1000 ticks later. The absolute `MAX_TRAVEL_BUDGET` bound is preserved as the backstop.
+
+/// ADR 0034 D8: the TIGHTER per-member solo-travel stall window — ticks of solo travel with ZERO members ever
+/// gathered after which the driver ESCALATES (D4), well before the coarse `MAX_TRAVEL_BUDGET` (1000). In the
+/// 50–150 band per the ADR (RC-8 fast-catch). Ephemeral runtime state (a per-objective tracker like
+/// `assault_latched`) — NOT serialized, no `WORLD_FORMAT_VERSION` bump.
+pub const SOLO_TRAVEL_STALL_WINDOW: u32 = 100;
+
+/// The PRODUCTION-PATH far-home travel scenario (ADR 0034 Phase 1). Real cross-quadrant member homes, the
+/// production rally geometry, an optional blocked-room set, and the D4/D5/D8 fix toggles (RED with them off,
+/// GREEN with them on).
+#[derive(Clone, Debug)]
+pub struct ExtendedTravel {
+    /// Each member's home `Position` (real room names, cross-quadrant). One per composition slot.
+    pub homes: Vec<Position>,
+    /// The assault TARGET position (a room beyond the rally).
+    pub target: Position,
+    /// Proven-uncontested target → the gather quorum may trickle; contested → the near-full roster.
+    pub uncontested: bool,
+    /// RC-3 BLOCKED-PATH MODEL (sim gap G5): rooms a member CANNOT enter (impassable terrain / hostile /
+    /// NO_PATH). A member whose next world-step toward the rally would land in one of these rooms does NOT
+    /// advance — it surfaces a `Blocked` signal. Empty ⇒ the clean path (S1 plain far-home stall).
+    pub blocked_rooms: Vec<screeps::RoomName>,
+    /// D4 FIX toggle (RC-3 — member-side movement-failure detection + escalation): `false` reproduces the
+    /// pre-fix bot (a blocked member silently retries `MoveTo(rally)` forever — no feedback); `true` is the
+    /// fixed bot (a blocked member surfaces `Blocked`; after a bounded stall the driver re-assesses it OUT of
+    /// the gather quorum so the reachable subset proceeds — the rally is unchanged). Default `false` (RED).
+    pub escalate_on_block: bool,
+    /// D5 FIX toggle (RC-4/RC-8 — majority travel progress): `false` reproduces the pre-fix MIN-over-members
+    /// progress signal (one stuck member pins it / one moving lead masks a stuck bulk); `true` refreshes the
+    /// travel lease while a MAJORITY of present members are closing. Default `false` (RED).
+    pub majority_progress: bool,
+    /// D8 FIX toggle (RC-8 — tighter stall window): `false` keeps ONLY the coarse `MAX_TRAVEL_BUDGET` (a
+    /// wrong/blocked rally lapses ~1000 ticks later, looking like a clean give-up); `true` adds the tighter
+    /// `SOLO_TRAVEL_STALL_WINDOW` that escalates (D4) fast. Requires `escalate_on_block` to do anything (the
+    /// stall window TRIGGERS the D4 escalation). Default `false` (RED).
+    pub tight_stall_window: bool,
+}
+
+impl ExtendedTravel {
+    /// The world-coord room of a `Position` as `(rx, ry)` (room-grid coords; Chebyshev room-distance).
+    fn room_xy(p: Position) -> (i32, i32) {
+        let (wx, wy) = p.world_coords();
+        (wx.div_euclid(50), wy.div_euclid(50))
+    }
+    /// Chebyshev ROOM-distance between two positions — the SAME signal production's `target_dist` /
+    /// `travel_progress` use (`room_distance(member_room, target_room)`).
+    fn room_dist(a: Position, b: Position) -> u32 {
+        let (ax, ay) = Self::room_xy(a);
+        let (bx, by) = Self::room_xy(b);
+        (ax - bx).unsigned_abs().max((ay - by).unsigned_abs())
+    }
+    /// One Chebyshev world-tile step from `from` toward `to` (a member's per-tick solo move).
+    fn step_toward(from: Position, to: Position) -> Position {
+        let (fx, fy) = from.world_coords();
+        let (tx, ty) = to.world_coords();
+        Position::from_world_coords(fx + (tx - fx).signum(), fy + (ty - fy).signum())
+    }
+    fn pos_options(members: &[Position]) -> Vec<Option<Position>> {
+        members.iter().map(|p| Some(*p)).collect()
+    }
+}
+
+/// ADR 0034 Phase 1 — drive the FULL bot lifecycle (lease / reconcile / re-field churn + the real rally gate)
+/// with PRODUCTION-PATH spatial travel: members spawn at DISTINCT cross-quadrant homes (real `Position`s),
+/// the rally is derived FRESH each tick by the production `cohesion::centroid` → `shared_rally_point_for_members`
+/// geometry, each member steps SOLO toward it, the gather quorum + FIX-A latch are re-evaluated each tick, and
+/// `Arrived` is gated on `gathered`. The reconcile DECISION is the shared `lifecycle::reconcile` kernel — no
+/// live/sim drift. Deterministic: same (scenario, travel) → same outcome (integer world-coord math, no float
+/// branch, no `HashMap`).
+pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &ExtendedTravel) -> ChurnOutcome {
+    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+
+    let n_slots = s.composition.slots.len();
+    assert_eq!(travel.homes.len(), n_slots, "one home per member slot in the extended spatial model");
+    let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
+    let blocked: BTreeSet<screeps::RoomName> = travel.blocked_rooms.iter().copied().collect();
+
+    let mut generation: u32 = 0;
+    let mut max_present: usize = 0;
+    let mut max_gathered: usize = 0;
+    let mut oscillations: u32 = 0;
+    let mut prev_gathered = false;
+
+    let mut filled = vec![false; n_slots];
+    let mut syncing: Vec<(u64, u32)> = Vec::new();
+    let mut completing: Vec<(u64, u32)> = Vec::new();
+    let mut avail: Vec<u32> = s.homes.iter().map(|h| h.start_energy).collect();
+    let mut busy_until: Vec<u32> = vec![0; s.homes.len()];
+    let mut deadline: u32 = COMMITMENT_BUDGET;
+    let mut prev_present: usize = 0;
+    let engaged_once = false;
+    let mut gen_start: u32 = 0;
+    let mut travel_start: u32 = 0;
+
+    // Spatial member state: each member starts AT its home `Position`; `member_pos[i]` is its live tile.
+    let mut member_pos: Vec<Position> = travel.homes.clone();
+    let mut departed = false; // the rally gate released (solo travel begins)
+    let mut gathered = false; // the gather quorum fired (assault begins)
+    // RC-4/RC-8: track the MIN-over-members room-distance (the pre-fix production signal) — used when
+    // `majority_progress` is OFF, so RED reproduces the min-pinning.
+    let mut prev_min_dist: Option<u32> = None;
+    // D5: per-member previous room-distance to the rally (for the majority-closing signal).
+    let mut prev_member_dist: Vec<Option<u32>> = vec![None; n_slots];
+    // RC-3 / D8: per-member consecutive BLOCKED-tick counter (how long the member has surfaced `Blocked` from
+    // `check_movement_failure` with no advance — the tight D8 stall window keys on this). Pre-fix the manager
+    // IGNORES it (the silent retry loop, RC-3); D4 reads it to escalate.
+    let mut block_streak: Vec<u32> = vec![0; n_slots];
+    // D4 (RC-3) escalation latch: a member whose block streak exceeds the tight window is RE-ASSESSED OUT of
+    // the gather quorum — the manager surfaces `Blocked`, concludes the member cannot path to the rally, and
+    // proceeds with the REACHABLE subset (the ADR's "re-assess" escalation) rather than waiting on it forever.
+    // An ephemeral per-objective decision (no serialized state).
+    let mut excluded: Vec<bool> = vec![false; n_slots];
+
+    for tick in 0..s.budget_ticks {
+        completing.retain(|&(id, at)| {
+            if at <= tick {
+                syncing.push((id, tick + MEMBER_SYNC_DELAY));
+                false
+            } else {
+                true
+            }
+        });
+        syncing.retain(|&(id, at)| {
+            if at <= tick {
+                if (id as usize) < n_slots {
+                    filled[id as usize] = true;
+                    member_pos[id as usize] = travel.homes[id as usize]; // appears AT its home
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        let present = filled.iter().filter(|f| **f).count();
+        max_present = max_present.max(present);
+        let has_members = present > 0 || !completing.is_empty() || !syncing.is_empty();
+
+        let any_queued =
+            !fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains).is_empty();
+        let forming_in_flight = !completing.is_empty() || !syncing.is_empty() || any_queued;
+
+        let present_positions: Vec<Position> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+
+        let mut in_target_room = false;
+        let mut traveling = false;
+        let mut travel_progress = false;
+
+        if !departed {
+            // FORMING / rally gate over the present roster.
+            let positions = ExtendedTravel::pos_options(&present_positions);
+            if rally::ready_to_depart_gate(&positions, n_slots, travel.uncontested) {
+                departed = true;
+                travel_start = tick;
+            }
+        }
+
+        if departed {
+            traveling = true;
+            // PRODUCTION RALLY GEOMETRY (item (b)): the manager derives the rally FRESH each tick from the
+            // present members' positions via `cohesion::centroid` (inside) + the scatter-robust selector. D4
+            // escalation does NOT move this rally — it drops a persistently-blocked member from the gather
+            // quorum below, so the reachable subset masses at this same rally instead.
+            let present_opts = ExtendedTravel::pos_options(&present_positions);
+            let rally =
+                screeps_combat_decision::rally::shared_rally_point_for_members(&present_opts, travel.target, travel.uncontested);
+
+            // GATHER DECISION (item (d)): the unified kernel over the CURRENT positions; FIX-A also counts an
+            // in-target-room member as gathered.
+            let pre_step: Vec<Position> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+            let has_fighter = !pre_step.is_empty();
+            let target_room = travel.target.room_name();
+            let in_room_count = (0..n_slots).filter(|&i| filled[i] && member_pos[i].room_name() == target_room).count();
+            // D4 RE-ASSESS: a member RE-ASSESSED OUT (`excluded`, persistently blocked from the rally) is
+            // dropped from the gather denominator — the manager proceeds with the REACHABLE subset rather
+            // than waiting forever on the unreachable one. `effective_slots` = the roster minus the excluded
+            // (and the gather positions exclude them too), so the contested quorum can fire over who can mass.
+            let excluded_count = excluded.iter().filter(|e| **e).count();
+            let effective_slots = n_slots.saturating_sub(excluded_count);
+            let reachable: Vec<Position> = (0..n_slots).filter(|&i| filled[i] && !excluded[i]).map(|i| member_pos[i]).collect();
+            let quorum_now = rally::gather_quorum_met(
+                &ExtendedTravel::pos_options(&reachable),
+                rally,
+                effective_slots,
+                travel.uncontested,
+                has_fighter,
+                rally::RALLY_GATHER_RADIUS,
+            ) || (in_room_count > 0 && has_fighter);
+            let gathered_now = rally::members_gathered_at(&ExtendedTravel::pos_options(&pre_step), rally, rally::RALLY_GATHER_RADIUS);
+            max_gathered = max_gathered.max(gathered_now);
+            // FIX-A LATCH: commit the assault on the FIRST quorum.
+            gathered |= quorum_now;
+            if prev_gathered && !gathered {
+                oscillations += 1;
+            }
+            prev_gathered = gathered;
+
+            if gathered {
+                // ASSAULT: advance toward the target as a bloc; members follow (gated on `gathered`, item (e)).
+                for i in 0..n_slots {
+                    if filled[i] {
+                        // The assault crosses toward the target room centre; a blocked room still blocks the
+                        // step (so a blocked-corridor assault can't teleport through — but escalation has
+                        // already re-routed the rally off it by here).
+                        let next = ExtendedTravel::step_toward(member_pos[i], travel.target);
+                        if !blocked.contains(&next.room_name()) {
+                            member_pos[i] = next;
+                        }
+                    }
+                }
+                in_target_room = (0..n_slots).any(|i| filled[i] && member_pos[i].room_name() == target_room);
+                if in_target_room {
+                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                }
+                let cur = (0..n_slots).filter(|&i| filled[i]).map(|i| ExtendedTravel::room_dist(member_pos[i], travel.target)).min();
+                travel_progress = match (cur, prev_min_dist) {
+                    (Some(c), Some(p)) => c < p,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                prev_min_dist = cur;
+            } else {
+                // SOLO TRAVEL (item (c)): each member steps toward the rally. RC-3 BLOCKED-PATH: a step that
+                // would ENTER a blocked room does NOT advance — the member surfaces a `Blocked` signal
+                // (tracked per-member in `block_streak`). An EXCLUDED member (re-assessed out, D4) holds.
+                // A member within `RALLY_GATHER_RADIUS` of the rally has ARRIVED — it holds (range 1) and
+                // counts as PROGRESS for D5 (it is done, not stalled).
+                let mut at_rally = vec![false; n_slots];
+                for i in 0..n_slots {
+                    if !filled[i] || excluded[i] {
+                        continue; // unspawned, or re-assessed out (left behind / recalled)
+                    }
+                    if member_pos[i].get_range_to(rally) <= rally::RALLY_GATHER_RADIUS {
+                        at_rally[i] = true;
+                        block_streak[i] = 0;
+                        continue; // already gathered at the rally — hold (range 1)
+                    }
+                    let next = ExtendedTravel::step_toward(member_pos[i], rally);
+                    if blocked.contains(&next.room_name()) {
+                        // RC-3: the direct step is into a blocked room — surface `Blocked`. The member is
+                        // wedged; pre-fix the manager IGNORES this (the silent retry loop) until D4 re-assesses
+                        // it out. No advance.
+                        block_streak[i] += 1;
+                    } else {
+                        block_streak[i] = 0;
+                        member_pos[i] = next;
+                    }
+                }
+
+                // RC-4/RC-8 — TRAVEL-PROGRESS signal. Per-member distances to the RALLY (excluded members
+                // are out of the signal — the squad no longer waits on them).
+                let dists: Vec<Option<u32>> = (0..n_slots)
+                    .map(|i| if filled[i] && !excluded[i] { Some(ExtendedTravel::room_dist(member_pos[i], rally)) } else { None })
+                    .collect();
+                if travel.majority_progress {
+                    // D5: refresh the lease while a MAJORITY of present members are MAKING PROGRESS — either
+                    // CLOSING distance (per-member) OR already AT the rally (arrived = done). So one straggler
+                    // doesn't pin "stalled", and (conversely) a lead that arrived + holds at the rally doesn't
+                    // pin the MIN at 0 and mask a still-closing bulk (RC-4/RC-8). Per-member, not the min.
+                    let mut progressing = 0usize;
+                    let mut counted = 0usize;
+                    for i in 0..n_slots {
+                        if dists[i].is_none() {
+                            continue;
+                        }
+                        counted += 1;
+                        let closing = match (dists[i], prev_member_dist[i]) {
+                            (Some(c), Some(p)) => c < p,
+                            (Some(_), None) => true, // first reading — assume progress for one reconcile
+                            _ => false,
+                        };
+                        if closing || at_rally[i] {
+                            progressing += 1;
+                        }
+                    }
+                    travel_progress = counted > 0 && progressing * 2 > counted;
+                } else {
+                    // PRE-FIX (RC-4): the MIN-over-members signal. A lead that arrived + holds pins the min at
+                    // 0 (flat) while the bulk still closes → `travel_progress=false` → the lease lapses though
+                    // members ARE advancing (the masking failure). Symmetrically a single stuck member pins it.
+                    let cur = dists.iter().filter_map(|d| *d).min();
+                    travel_progress = match (cur, prev_min_dist) {
+                        (Some(c), Some(p)) => c < p,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    prev_min_dist = cur;
+                }
+                prev_member_dist = dists;
+
+                // D8 + D4 — the TIGHTER stall window → ESCALATE. A member whose `block_streak` exceeds the
+                // tight `SOLO_TRAVEL_STALL_WINDOW` (D8) has been DETECTED (RC-3 — `check_movement_failure`
+                // surfaced `Blocked`) as unable to path to the rally. D4 escalates: RE-ASSESS it OUT of the
+                // gather quorum (`excluded`) so the squad proceeds with the REACHABLE subset instead of the
+                // pre-fix silent forever-wait. Bounded; fires WELL BEFORE the coarse `MAX_TRAVEL_BUDGET` (the
+                // backstop, preserved). Without `tight_stall_window` the manager never re-assesses → the
+                // member sits, the contested quorum never fires, and the squad lapses at the budget (RED).
+                if travel.escalate_on_block && travel.tight_stall_window {
+                    for i in 0..n_slots {
+                        if filled[i] && !excluded[i] && block_streak[i] >= SOLO_TRAVEL_STALL_WINDOW {
+                            excluded[i] = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reconcile (the shared kernel).
+        let forming = has_members && !engaged_once && !departed && present < n_slots;
+        let forming_progress = forming && present > prev_present;
+        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET;
+        let travel_budget_remaining = tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET;
+        let deadline_lapsed = tick >= deadline;
+        let snapshot = ReconcileSnapshot {
+            objective_gone: false,
+            duplicate: false,
+            is_defend: false,
+            deadline_lapsed,
+            wiped: false,
+            has_focus: false,
+            engaged_once,
+            in_target_room,
+            has_members,
+            forming,
+            forming_progress,
+            forming_in_flight: forming && forming_in_flight,
+            forming_budget_remaining,
+            traveling,
+            travel_progress,
+            travel_budget_remaining,
+            holding_station: false,
+            declaiming: false,
+            reassign_available: false,
+        };
+        match reconcile(snapshot) {
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
+                if departed {
+                    if oscillations > 0 {
+                        return ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered };
+                    }
+                    return ChurnOutcome::LapsedInTravel { generations: generation };
+                }
+                generation += 1;
+                filled = vec![false; n_slots];
+                syncing.clear();
+                completing.clear();
+                busy_until = vec![0; s.homes.len()];
+                deadline = tick + COMMITMENT_BUDGET;
+                prev_present = 0;
+                gen_start = tick;
+                member_pos = travel.homes.clone();
+                departed = false;
+                gathered = false;
+                prev_min_dist = None;
+                prev_member_dist = vec![None; n_slots];
+                block_streak = vec![0; n_slots];
+                excluded = vec![false; n_slots];
+                continue;
+            }
+            ReconcileAction::Retire { .. } => {
+                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
+            }
+            ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
+            ReconcileAction::Keep => {}
+            ReconcileAction::Reassign { .. } => unreachable!("reassign_available is always false here"),
+        }
+        prev_present = present;
+
+        // Spawn step (only while forming).
+        if !departed {
+            let combat = fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains);
+            let mut in_flight: BTreeSet<u64> = completing.iter().chain(syncing.iter()).map(|&(id, _)| id).collect();
+            for h in 0..s.homes.len() {
+                avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
+                if tick < busy_until[h] {
+                    continue;
+                }
+                let mut queue: Vec<QueuedSpawn> = Vec::new();
+                if let Some((p, c)) = s.economy.hauler {
+                    queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                }
+                for cs in &combat {
+                    if !in_flight.contains(&cs.id) {
+                        queue.push(*cs);
+                    }
+                }
+                let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+                for spawned in spawn_step(&mut lane, &queue) {
+                    avail[h] = lane.available_energy;
+                    busy_until[h] = tick + spawned.completes_in;
+                    if spawned.id < ECON_MINER_ID_BASE {
+                        completing.push((spawned.id, tick + spawned.completes_in));
+                        in_flight.insert(spawned.id);
+                    }
+                }
+            }
+        }
+    }
+
+    if departed {
+        if oscillations > 0 {
+            ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered }
+        } else {
+            ChurnOutcome::LapsedInTravel { generations: generation }
+        }
+    } else {
+        ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present }
+    }
+}
+
 // ═══ ADR 0027 v1: the WHOLE-FLOW driver — multi-objective queue + a MOVING threat + the PURE defense ════
 // ═══ kernel + whole-squad REASSIGN, all offline + deterministic (the operator's #1 requirement) ════════
 //
@@ -2804,6 +3253,167 @@ mod tests {
             matches!(fixed, ChurnOutcome::DeployedAndEngaged { .. }),
             "Fix A: latch the assault on the first quorum → commit + reach the target despite attrition, got {fixed:?}"
         );
+    }
+
+    // ── ADR 0034 Phase 1: the PRODUCTION-PATH far-home stall (RC-3/RC-4/RC-8/RC-10) ──────────────────────
+    //
+    // These drive `run_lifecycle_churn_extended` — REAL cross-quadrant `Position`s + the PRODUCTION
+    // `cohesion::centroid` → `rally::shared_rally_point_for_members` geometry + a solo step + per-tick
+    // gather + the FIX-A latch + `Arrived` gated on `gathered`. The RC-1/RC-2 headline (wrong-room rally)
+    // is already fixed in Phase 0, so the remaining far-home failures are RC-4/RC-8 (the min-distance
+    // progress signal mis-reads a converging squad as "stalled") and RC-3 (a blocked member silently
+    // retries forever → a budget-lapse give-up). Each is RED with the D4/D5/D8 toggles OFF, GREEN with
+    // them ON.
+
+    /// A 3-slot offense roster (one anti-creep fighter + two healers) — three members for a clean MAJORITY
+    /// progress test (D5): one lead + a two-member bulk.
+    fn three_slot_offense(budget: u32) -> ColonyFormingScenario {
+        // Three DISTINCT roles → three slots (a ranged fighter for the gather quorum's fighter requirement,
+        // a dismantler, and a healer) so we have a clean lead + two-member bulk for the D5 majority test.
+        let comp = assemble_force(
+            &RequiredForce { anti_creep_parts: 4, dismantle_parts: 4, heal_parts: 4, ..Default::default() },
+            3000,
+        )
+        .expect("a 3-slot ranged+dismantler+healer force");
+        assert!(comp.slots.len() >= 3, "the far-home repro wants a >=3-slot roster, got {}", comp.slots.len());
+        let n = comp.slots.len();
+        ColonyFormingScenario {
+            composition: comp,
+            // One easily-fieldable home per slot — isolate the MOVEMENT stall from spawn contention.
+            homes: (0..n).map(|_| Home { energy_capacity: 5300, income: 400, start_energy: 3000 }).collect(),
+            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 87.5,
+            per_member_cap: 3000,
+            budget_ticks: budget,
+            member_ttl: 1500,
+            renew: false,
+        }
+    }
+
+    /// A real `Position` at the centre (25,25) of room `(rx,ry)` in world-room coords, with an in-room
+    /// offset. `rx,ry` map to the W/N quadrant the same way the spatial driver's `to_pos` does.
+    fn wpos(rx: i32, ry: i32, x: i32, y: i32) -> Position {
+        Position::from_world_coords(rx * 50 + x, ry * 50 + y)
+    }
+
+    /// S1 — FAR-HOME CONVERGENCE STALL (RC-4/RC-8, no blocking): a CONTESTED far target with a lead that
+    /// reaches the one-room-short rally and HOLDS while a far two-member bulk is still closing. The pre-fix
+    /// MIN-over-members progress signal reads the held lead's distance 0 (flat) as "stalled" — masking the
+    /// bulk that IS advancing — so the travel lease lapses BEFORE the bulk gathers (the contested quorum
+    /// needs all three). The fields are tuned so the bulk takes longer than `COMMITMENT_BUDGET` to arrive.
+    fn far_home_s1(n_slots: usize) -> ExtendedTravel {
+        // Axis-aligned corridor (same N row, ry=-6 = N5) so the bulk's solo step is a clean horizontal line
+        // and a blocked room can be placed exactly ON it. Target at the far-left (rx=-6 = W5); the bulk far
+        // to the right (rx=-18 = W17), the lead just off the rally.
+        let mut homes = Vec::with_capacity(n_slots);
+        // Slot 0 = the LEAD: one room past the rally toward the target side (arrives + holds quickly).
+        homes.push(wpos(-7, -6, 25, 25)); // W6N5 — adjacent to the rally corridor
+                                          // The BULK: far cross-quadrant homes, many rooms down the +x corridor (a long solo crawl).
+        for _ in 1..n_slots {
+            homes.push(wpos(-18, -6, 25, 25)); // W17N5 — far along the corridor
+        }
+        ExtendedTravel {
+            homes,
+            target: wpos(-6, -6, 25, 25), // W5N5 target (contested)
+            uncontested: false,
+            blocked_rooms: vec![],
+            escalate_on_block: false,
+            majority_progress: false,
+            tight_stall_window: false,
+        }
+    }
+
+    /// S1-BLOCKED — RC-3 (silent NO_PATH stall): a far cross-quadrant scatter where ONE member's only path
+    /// to the rally is through a BLOCKED room (impassable / hostile). Pre-fix the bot has no member-side
+    /// movement feedback: the blocked member sits forever, the contested quorum never fires, and the squad
+    /// gives up only when the coarse 1000-tick travel budget lapses — a SILENT permanent stall.
+    fn far_home_s1_blocked(n_slots: usize) -> ExtendedTravel {
+        let mut t = far_home_s1(n_slots);
+        // Keep ONE member (slot 1) far down the corridor behind a wall, but put the OTHER bulk member
+        // (slots 2..) on the rally's side so the squad can still reach a 2-member contested quorum once the
+        // blocked one is re-assessed out (D4). Slot 1 stays at the far home W17N5; relocate the rest near
+        // the rally corridor.
+        for i in 2..n_slots {
+            t.homes[i] = wpos(-8, -6, 25, 25); // W7N5 — on the rally's side of the wall (reachable)
+        }
+        // Block a room ON slot-1's horizontal corridor between its home (rx=-18) and the rally (~rx=-7):
+        // rx=-12, ry=-6 = W11N5. Slot 1's clean horizontal solo step must cross it; pre-fix it sits forever
+        // (RC-3 silent NO_PATH). Slot 0 (lead, rx=-7) + slots 2.. (rx=-8) never touch the blocked room.
+        t.blocked_rooms = vec![wpos(-12, -6, 25, 25).room_name()]; // W11N5 — squarely on slot-1's corridor
+        t
+    }
+
+    /// RC-4/RC-8 RED→GREEN: S1 far-home stall. Pre-fix (min-distance progress, no D5) the held lead pins the
+    /// min flat and the lease lapses mid-travel before the bulk gathers → `LapsedInTravel`. D5 (majority
+    /// progress) keeps the lease alive while the bulk closes → the quorum fires → `DeployedAndEngaged`.
+    #[test]
+    fn far_home_s1_min_progress_lapses_then_majority_deploys() {
+        let s = three_slot_offense(2000);
+        let n = s.composition.slots.len();
+        // RED: the pre-fix MIN signal mis-reads the converging squad as stalled.
+        let red = run_lifecycle_churn_extended(&s, &far_home_s1(n));
+        assert!(
+            matches!(red, ChurnOutcome::LapsedInTravel { .. } | ChurnOutcome::OscillatedNeverGathered { .. }),
+            "RC-4/RC-8: the pre-fix min-distance progress signal must lapse the far-home squad in travel, got {red:?}"
+        );
+        // GREEN: D5 majority progress carries the lease until the bulk gathers + the quorum fires.
+        let green_travel = ExtendedTravel { majority_progress: true, ..far_home_s1(n) };
+        let green = run_lifecycle_churn_extended(&s, &green_travel);
+        assert!(
+            matches!(green, ChurnOutcome::DeployedAndEngaged { .. }),
+            "D5 majority-progress must keep the lease alive while the bulk closes → deploy + engage, got {green:?}"
+        );
+    }
+
+    /// RC-3 RED→GREEN: S1-BLOCKED. Pre-fix (no member-side feedback, no D4/D8) a blocked member silently
+    /// retries forever — the contested quorum never fires and the squad lapses at the coarse travel budget
+    /// → `LapsedInTravel`. D4 (escalate on block) + D8 (tight stall window) detect the block fast and
+    /// re-assess the blocked member OUT of the gather quorum → the reachable subset masses + `DeployedAndEngaged`.
+    #[test]
+    fn far_home_s1_blocked_silent_stall_then_escalation_deploys() {
+        let s = three_slot_offense(2000);
+        let n = s.composition.slots.len();
+        // RED: a blocked member with no feedback → silent stall → budget-lapse give-up.
+        let red = run_lifecycle_churn_extended(&s, &far_home_s1_blocked(n));
+        assert!(
+            matches!(red, ChurnOutcome::LapsedInTravel { .. } | ChurnOutcome::OscillatedNeverGathered { .. }),
+            "RC-3: a blocked member with no member-side feedback must SILENTLY stall → budget lapse, got {red:?}"
+        );
+        // GREEN: D4 + D8 (+ D5) detect the block within the tight stall window + re-assess the blocked member
+        // OUT of the gather quorum → the reachable subset masses → deploy + engage.
+        let green_travel = ExtendedTravel {
+            escalate_on_block: true,
+            tight_stall_window: true,
+            majority_progress: true,
+            ..far_home_s1_blocked(n)
+        };
+        let green = run_lifecycle_churn_extended(&s, &green_travel);
+        assert!(
+            matches!(green, ChurnOutcome::DeployedAndEngaged { .. }),
+            "D4+D8 must detect the block fast + escalate to a reachable rally → deploy + engage, got {green:?}"
+        );
+    }
+
+    /// D5 ALONE cannot resolve the blocked stall (proving D4/D8 are load-bearing, not redundant with D5): a
+    /// blocked member with majority-progress ON but escalation OFF still lapses — the contested quorum needs
+    /// the member that can never reach the rally.
+    #[test]
+    fn far_home_s1_blocked_d5_alone_still_lapses() {
+        let s = three_slot_offense(2000);
+        let n = s.composition.slots.len();
+        let out = run_lifecycle_churn_extended(&s, &ExtendedTravel { majority_progress: true, ..far_home_s1_blocked(n) });
+        assert!(
+            matches!(out, ChurnOutcome::LapsedInTravel { .. } | ChurnOutcome::OscillatedNeverGathered { .. }),
+            "D5 alone can't unblock a NO_PATH member — D4/D8 escalation is required, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn extended_lifecycle_is_deterministic() {
+        let s = three_slot_offense(2000);
+        let n = s.composition.slots.len();
+        let t = far_home_s1_blocked(n);
+        assert_eq!(run_lifecycle_churn_extended(&s, &t), run_lifecycle_churn_extended(&s, &t));
     }
 
     // ── End-to-end: form → engine engage → kill (ADR 0028 engage handoff) ──
