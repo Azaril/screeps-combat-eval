@@ -480,7 +480,6 @@ mod tests {
             repair_per_tick: 0.0,
             // Four energized finite towers, evaluated at the falloff standoff (range 20 → 150/tower).
             towers: drain_towers.iter().map(|&(_, e)| TowerThreat { range_to_assault: 20, energy: e }).collect(),
-            enemy_dps: 0.0,
             safe_mode: false,
         };
         // A single squad budget whose heal beats 4×150 falloff (drain) but not 4×150×1.3 with the hold
@@ -491,7 +490,7 @@ mod tests {
             tank_effective_hp: 20_000.0,
             onsite_budget_ticks: 1500,
         };
-        let a = assess(&profile, &budget);
+        let a = assess(&profile, 0.0, &budget); // drain bed has no defender creeps (structure-only)
         assert!(a.winnable, "the bed IS winnable for a single squad — via drain ({})", a.reason);
         assert_eq!(a.mode, AssaultMode::Drain, "and the winning mode is DRAIN, not breach ({})", a.reason);
 

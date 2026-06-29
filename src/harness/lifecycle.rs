@@ -1412,7 +1412,8 @@ fn offense_candidate_to_objective(c: &OffenseCandidate, member_energy: u32, onsi
 
     // The WINNABILITY/ROI gate: run the SAME EV optimizer war.rs's `plan_engagement` runs. A gated doctrine
     // (`honor_verdict`) defers (`None`) a hopeless / negative-EV room; an always-field doctrine fields the
-    // best regardless. The enemy creep force is folded into the defense profile's `enemy_dps`.
+    // best regardless. These offense-flow beds carry no defender creeps (`enemy` = `None`), so the candidate's
+    // STRUCTURE defense alone drives the gate (ADR 0031 #41 — the enemy-creep dps is the `enemy` arg now).
     let comp = optimize_composition(
         c.objective,
         &c.defense,
@@ -1422,7 +1423,7 @@ fn offense_candidate_to_objective(c: &OffenseCandidate, member_energy: u32, onsi
         EnemyCoordination::Coordinated,
         0.0,
         c.honor_verdict,
-        false, // not confirmed-undefended (this gate bed folds the enemy into `defense.enemy_dps`)
+        false, // not confirmed-undefended (these gate beds have no scouted defender creeps)
         &CompositionParams { member_energy, ..Default::default() },
     );
     comp.map(|_| priority)
@@ -2458,7 +2459,9 @@ mod tests {
         use screeps_combat_decision::composition::optimize_composition;
         use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination, EnemyForce};
         use screeps_combat_decision::force_sizing::DefenseProfile;
-        let defense = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 0, enemy_dps: 30.0, repair_per_tick: 0.0, safe_mode: false };
+        let defense = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 0, repair_per_tick: 0.0, safe_mode: false };
+        // ADR 0031 #41: the threat creep dps the optimizer prices comes from this single `EnemyForce` (dps=30),
+        // not a co-resident `defense.enemy_dps` (removed).
         let enemy = EnemyForce { dps: 30.0, heal: 0.0, hits: 600, count: 2, boosted: false };
         optimize_composition(
             DoctrineObjective::ClearCreeps,
@@ -2469,7 +2472,7 @@ mod tests {
             EnemyCoordination::Coordinated,
             0.0,   // importance
             false, // always-field (honor_verdict=false)
-            false, // a REAL threat (enemy_dps=30) — NOT confirmed-undefended → floor retained
+            false, // a REAL threat (enemy.dps=30) — NOT confirmed-undefended → floor retained
             &screeps_combat_decision::composition::CompositionParams::default(),
         )
         .expect("the defense optimizer fields a roster for dps=30")

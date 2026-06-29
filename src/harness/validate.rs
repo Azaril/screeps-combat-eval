@@ -154,9 +154,9 @@ impl Validator for OracleCalibration {
 
 /// Derive the oracle [`DefenseProfile`] FROM the bed (consistency by construction): attackers = ALL
 /// energized defender towers (the kill-phase worst case, when no tower repairs); `repair_per_tick` =
-/// the maintainer's (last energized) `tower_repair_at_range` to the breach rampart; `enemy_dps` = Σ the
-/// defender creeps' attack+ranged power; safe-mode from the world. Tower ranges measured to the
-/// objective's assault tile.
+/// the maintainer's (last energized) `tower_repair_at_range` to the breach rampart; safe-mode from the world.
+/// Tower ranges measured to the objective's assault tile. ADR 0031 #41 — STRUCTURE-only: the defender CREEP
+/// dps is carried separately on the single [`EnemyForce`] channel (`defender_force`), not on this profile.
 pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Objective) -> DefenseProfile {
     let energized: Vec<(Position, u32)> = world
         .towers
@@ -176,17 +176,15 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
         (true, Some((rampart_pos, _)), Some((maintainer_pos, _))) => tower_repair_at_range(maintainer_pos.get_range_to(*rampart_pos)) as f32,
         _ => 0.0,
     };
-    let enemy_dps: u32 = world
-        .creeps
-        .iter()
-        .filter(|c| c.owner == defender && c.is_alive())
-        .map(|c| c.body.attack_power() + c.body.ranged_attack_power())
-        .sum();
     DefenseProfile {
         towers: energized.iter().map(|(p, e)| TowerThreat { range_to_assault: p.get_range_to(obj.assault_pos), energy: *e }).collect(),
         breach_hits,
         objective_hits,
-        enemy_dps: enemy_dps as f32,
+        // ADR 0031 #41: the defender CREEP dps is no longer carried on the profile — it lives on the single
+        // [`EnemyForce`] channel (`defender_force`), threaded into `assess` via `siege_doctrine_plan`'s
+        // `enemy_force` arg. `derive_profile` is now STRUCTURE-only (towers / breach / objective / repair /
+        // safe-mode); `defender_force` (and `enemy_force_of`) derive the SAME defender attack+ranged power,
+        // so the value `assess` reads is read-equivalent — the calibration input is unchanged.
         repair_per_tick,
         safe_mode: world.safe_mode_owner == Some(defender),
     }
