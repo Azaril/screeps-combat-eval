@@ -261,6 +261,38 @@ pub struct ChurnTarget {
     /// in-room defender past its lease GaveUp → Phase C re-fields the SAME defender → Gen churn). The KERNEL
     /// is unchanged either way — this only controls whether the adapter feeds it the signal (no drift).
     pub garrison_holds: bool,
+    /// ADR 0035 H1 (the VACUOUS-INTEL commit). At COMMIT time the room's combat DTOs are EMPTY (an
+    /// empty-Cached snapshot — no towers were VISIBLE last scout), so during Forming/Travel the squad is
+    /// classified UNCONTESTED off this empty view (`uncontested_intel = false` ⇒ but the boolean logic still
+    /// yields `uncontested=true` when no hostiles/towers + reliable; D3's fix makes the manager pass
+    /// `uncontested_intel=false` ⇒ `uncontested=false`). The harness threads `uncontested` from the EMPTY
+    /// commit view while traveling and FLIPS to the REAL view (`!arrival_has_towers`) on arrival.
+    pub commit_intel_empty: bool,
+    /// ADR 0035 H1 (cannot-win-on-arrival). On arrival the room's LIVE DTOs reveal REAL towers, so the
+    /// in-room P(win) = LOSE: `engaged_once` latches (a member is in-room + engages) but
+    /// `present_force_wins_or_stalls = false` ⇒ `retreated_from_contact = true` ⇒ the squad retreats.
+    /// Combined with `commit_intel_empty` this is the W4N5 vacuous-commit cascade.
+    pub arrival_has_towers: bool,
+    /// ADR 0035 D3/D4/D5 TOGGLE (RED→GREEN). `false` reproduces the PRE-FIX bot: the uncontested classifier
+    /// trusts the empty commit view (`uncontested=true` ⇒ trickle into the towers), the reconcile kernel is
+    /// fed `retreated_from_contact=false` (a retreat mis-resolves as a clean clear → withdraw → re-field),
+    /// and the producer does NOT consult the backoff (instant re-upsert) ⇒ `LapsedOnVacuousCommit`,
+    /// generations climbing. `true` is the FIXED bot: D3 classifies contested off the vacuous view (stage
+    /// short), D4 feeds the real `retreated_from_contact` (abandon with backoff, NOT resolve), D5 suppresses
+    /// the re-field via `is_unwinnable_now` ⇒ `AbandonedOnContact`, generations stable.
+    pub abandon_fixes_enabled: bool,
+    /// ADR 0035 D4 (E1 false-abandon fix) — the WINNABLE-RETREAT case. On arrival the squad is IN the
+    /// target room and `decide_squad` would enter the Retreating STATE (a focus-fired member dipped to
+    /// critical HP / the squad-average is low), BUT the real in-room `present_force_wins_or_stalls = TRUE`:
+    /// the present force still WINS-OR-STALLS — it is NOT losing. The bot stamps the GENUINE lose verdict
+    /// `lost_in_room = engaged_once && in_room_any && !present_force_wins_or_stalls`, so
+    /// `retreated_from_contact = FALSE` even though the squad is Retreating. Pre-fix the bot derived
+    /// `retreated_from_contact` from `ctx.state == Retreating` (a SUPERSET of the lose verdict) → it would
+    /// have read TRUE → the kernel would ABANDON a winning room mid-fight (the false-abandon). With the fix
+    /// the kernel sees `retreated_from_contact = false` → it does NOT abandon (the squad holds/wins →
+    /// `DeployedAndEngaged`). Models the divergence the kernel unit test
+    /// `winnable_fight_with_critical_member_retreats_but_does_not_lose_so_does_not_abandon` proves.
+    pub winnable_retreat_in_room: bool,
 }
 
 impl Default for ChurnTarget {
@@ -273,6 +305,10 @@ impl Default for ChurnTarget {
             target_visible_with_hostile_en_route: false,
             latch_engaged_in_room_only: true, // default to the FIXED bot behaviour
             garrison_holds: true,             // default to the FIXED bot behaviour
+            commit_intel_empty: false,
+            arrival_has_towers: false,
+            abandon_fixes_enabled: true, // default to the FIXED bot behaviour
+            winnable_retreat_in_room: false,
         }
     }
 }
@@ -561,6 +597,7 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             holding_station: false, // offense spatial repro — never a Defend garrison
             declaiming: false,      // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
+            retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
@@ -677,6 +714,20 @@ pub enum ChurnOutcome {
     /// `engage_tick` is when the squad finally engaged the LAST (reassigned) objective. The whole point: a
     /// freed squad reuses its invested bodies instead of retire→re-field (which would climb `generations`).
     Reassigned { from_gen: u32, reassignments: u32, engage_tick: u32 },
+    /// ADR 0035 (RED — the vacuous-intel engage cascade). The squad COMMITTED to a towered room on an EMPTY
+    /// commit view (classified uncontested → trickled in), REACHED it, found real towers (P(win)=LOSE), and
+    /// RETREATED — but the pre-fix reconcile MIS-RESOLVED the retreat as a clean clear → withdraw (no
+    /// backoff) → the producer instantly re-upserted (no `is_unwinnable_now` consult) → Phase C re-fielded
+    /// the same squad on the same vacuous intel. `generations > 1` is the oscillation (false-resolve →
+    /// re-upsert → re-field). Fixed by D3 (contested classification) + D4 (abandon-not-resolve) + D5
+    /// (producer backoff consult).
+    LapsedOnVacuousCommit { generations: u32 },
+    /// ADR 0035 (GREEN — abandon-on-contact). With the fixes, the reached-and-losing squad ABANDONS the
+    /// objective: the reconcile kernel returns `GaveUp + mark_unwinnable` (NOT a clean resolve), the producer
+    /// suppresses re-upsert via `is_unwinnable_now`, and NO re-field happens within the backoff window —
+    /// `generations` STABLE (the room sits in backoff, to be re-scouted when it expires). The de-commit is
+    /// clean and bounded, ending the oscillation.
+    AbandonedOnContact { generations: u32 },
 }
 
 /// One squad-generation's lifecycle phase in the churn driver.
@@ -726,6 +777,24 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
     let mut gen_start: u32 = 0; // tick this generation started forming (the forming-budget clock)
     let mut travel_start: u32 = 0; // tick the squad departed home (the travel-budget clock)
 
+    // ── ADR 0035 H1/D3 — the COMMIT-TIME uncontested view (vacuous intel). During Forming/Travel the squad
+    // commits on the (possibly EMPTY) cached snapshot; the manager's D3 fix decides `uncontested` from the
+    // REAL-intel notion (`uncontested_intel = !hostiles.is_empty() || !structures.is_empty() || LiveVisible`).
+    // For a `commit_intel_empty` room that is empty-Cached (NOT live-visible), `uncontested_intel = false`,
+    // so the FIXED bot classifies it CONTESTED (stages short + masses) even though no hostiles/towers are in
+    // the view. The PRE-FIX bot (the bug) used `is_reliable()` → uncontested=true → trickled in. We model the
+    // RED/GREEN split via `abandon_fixes_enabled`: fixed ⇒ contested on the vacuous view; pre-fix ⇒ honor the
+    // declared `target.uncontested` (the empty view looked clear). On ARRIVAL the view flips to LIVE — see the
+    // `Arrived` branch (`arrival_has_towers`).
+    let commit_uncontested = if target.commit_intel_empty {
+        if target.abandon_fixes_enabled {
+            false // D3: empty-Cached towered room is NOT real intel → contested → stage short, mass
+        } else {
+            target.uncontested // pre-fix: trusted the empty view (is_reliable) → trickled in
+        }
+    } else {
+        target.uncontested
+    };
     for tick in 0..s.budget_ticks {
         // 1. Complete spawns due this tick → they enter the 2-tick position-sync pipeline (NOT present yet).
         completing.retain(|&(id, at)| {
@@ -767,12 +836,18 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         let mut has_focus = false;
         let mut traveling = false;
         let mut travel_progress = false;
+        // ADR 0035 D4 — the in-room LOST-FIGHT signal fed to the reconcile snapshot (the inverse of
+        // `present_force_wins_or_stalls` over the REAL arrival DTOs). Set only in the `Arrived` branch on a
+        // towered room; false otherwise (en route / clear room).
+        let mut retreated_from_contact = false;
         match phase {
             Phase::Forming => {
                 // The REAL rally gate over the present roster (full roster, or min-viable quorum if the
-                // target is proven-uncontested). Releasing starts the travel phase.
+                // target is proven-uncontested). ADR 0035 D3: the COMMIT-time view (`commit_uncontested`)
+                // drives the gate — for a `commit_intel_empty` room the FIXED bot classifies it CONTESTED
+                // (holds for the full roster + stages short) rather than trickling a sub-roster into towers.
                 let positions: Vec<Option<Position>> = vec![Some(dummy_home_pos()); present];
-                if rally::ready_to_depart_gate(&positions, n_slots, target.uncontested) {
+                if rally::ready_to_depart_gate(&positions, n_slots, commit_uncontested) {
                     travel_start = tick;
                     phase = Phase::Traveling { arrives_at: tick + target.travel_ticks };
                 }
@@ -811,9 +886,40 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                     // (built below) refreshes its lease while the Defend objective persists. The kernel
                     // verdict (KeepRefreshLease vs Retire{GaveUp}) below decides which — no early return here.
                 } else if tick >= dtos_clear_at {
-                    // OFFENSE: once the room DTOs are readable (the focus-on-arrival fix forces this on
-                    // arrival), a focus is computed and the squad ENGAGES — the deep bug is absent.
-                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                    // ADR 0035 H3 — ARRIVAL flips to the LIVE view. The room's real DTOs are now readable.
+                    if target.winnable_retreat_in_room {
+                        // ADR 0035 D4 (E1 false-abandon REGRESSION GUARD) — the WINNABLE-RETREAT case. A
+                        // member is in-room and engages (`engaged_once` LATCHES), and `decide_squad` enters
+                        // the Retreating STATE (a focus-fired member dipped to critical HP). The DANGER: the
+                        // pre-fix bot derived `retreated_from_contact` from `ctx.state == Retreating` (a
+                        // SUPERSET of the lose verdict), so it would feed the kernel TRUE here → the kernel
+                        // would ABANDON a WINNABLE room mid-fight. The FIX carries the GENUINE lose verdict
+                        // `lost_in_room = engaged_once && in_room_any && !present_force_wins_or_stalls`; here
+                        // `present_force_wins_or_stalls = TRUE` (the present force still wins-or-stalls) ⇒
+                        // `retreated_from_contact = FALSE`. So the kernel does NOT abandon — the squad holds
+                        // + wins. Modeled as DeployedAndEngaged (it engaged and is winning, not abandoned).
+                        // NOTE: `retreated_from_contact` stays FALSE (the lose-verdict signal, NOT the
+                        // Retreating state) — that is the whole point; we short-circuit to the winning
+                        // terminal rather than feeding the kernel an abandon signal.
+                        return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                    } else if target.arrival_has_towers {
+                        // CANNOT-WIN-ON-ARRIVAL (the W4N5 case). A member is in-room and engages, so
+                        // `engaged_once` LATCHES — but the LIVE assessment over the REAL towers is
+                        // `present_force_wins_or_stalls = false`, so the squad RETREATS. This is the ground
+                        // truth the commit was missing. Set `retreated_from_contact` and FALL THROUGH to the
+                        // reconcile kernel (NO short-circuit DeployedAndEngaged) — the kernel decides
+                        // abandon-vs-mis-resolve. PRE-FIX (`abandon_fixes_enabled=false`) we feed the kernel
+                        // `retreated_from_contact=false`, so it mis-resolves the retreat as a clean clear →
+                        // withdraw → re-field (LapsedOnVacuousCommit). FIXED we feed the real signal → the
+                        // kernel returns GaveUp+mark_unwinnable (AbandonedOnContact).
+                        engaged_once = true;
+                        retreated_from_contact = target.abandon_fixes_enabled;
+                        // (when fixes disabled, the kernel sees a focus-less in-room engaged squad = a "clear")
+                    } else {
+                        // OFFENSE, clear room: once the room DTOs are readable a focus is computed and the
+                        // squad ENGAGES — the deep bug is absent.
+                        return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                    }
                 }
                 // Still no focus this tick — feed the kernel `has_focus = false` so the lease behaviour
                 // reflects the in-room-no-focus state.
@@ -855,6 +961,9 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             holding_station,
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
+            // ADR 0035 D4 — the in-room LOST-FIGHT signal. Set only on arrival at a towered room with the
+            // fixes enabled (the kernel then ABANDONS-with-backoff instead of mis-resolving the retreat).
+            retreated_from_contact,
         };
         // BUG B2 (fixed state): a defender that has GARRISONED its owned room (in-room, focus-less) and held
         // its lease until the budget elapsed without churning — a single stable generation. Detected when the
@@ -864,7 +973,17 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             return ChurnOutcome::Garrisoned { generations: generation };
         }
         match reconcile(snapshot) {
-            ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, mark_unwinnable, .. } => {
+                // ADR 0035 D4/D5 (GREEN — ABANDON-ON-CONTACT). The reached squad engaged a towered room it
+                // cannot win and is retreating; the kernel returned GaveUp + mark_unwinnable (NOT a clean
+                // resolve). The PRODUCER then SUPPRESSES the re-upsert via `is_unwinnable_now` (D5) — so NO
+                // re-field happens within the backoff. The de-commit is clean + bounded: report
+                // `AbandonedOnContact` with the generation count STABLE (the oscillation is ended).
+                if engaged_once && in_target_room && retreated_from_contact && mark_unwinnable {
+                    // The producer (re-field path) is SUPPRESSED by `is_unwinnable_now` (D5) — modeled by
+                    // returning here with the generation count STABLE (no re-field within the backoff window).
+                    return ChurnOutcome::AbandonedOnContact { generations: generation };
+                }
                 // RE-FIELD: drop the partial roster, orphan in-flight spawns, bump the generation, reopen
                 // the lease — the live churn loop. The new generation re-forms from scratch.
                 if phase != Phase::Forming {
@@ -904,6 +1023,38 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 phase = Phase::Forming;
                 gen_start = tick; // restart the forming-budget clock for the new generation
                 continue;
+            }
+            ReconcileAction::Retire { reason: RetireReason::Resolved, .. } => {
+                // ADR 0035 (RED — the VACUOUS-INTEL spiral). PRE-FIX (`abandon_fixes_enabled=false`), a squad
+                // that REACHED a towered room, engaged, and is RETREATING presents to the kernel as
+                // engaged_once + in_room + focus-less with `retreated_from_contact=false` (the manager never
+                // computed it) → the kernel MIS-RESOLVES the retreat as a CLEAN CLEAR → withdraw. The producer
+                // (no D5 backoff consult) RE-UPSERTS the objective → Phase C RE-FIELDS the same squad on the
+                // same vacuous intel → it reaches, retreats, mis-resolves again. The generation count CLIMBS
+                // — the reach↔retreat oscillation. Model the re-upsert + re-field: loop back to Forming,
+                // bumping the generation. After several cycles (the oscillation is established) report
+                // `LapsedOnVacuousCommit`. (A GENUINE clear — a clear room, `arrival_has_towers=false` —
+                // returns `DeployedAndEngaged` from the Arrived branch BEFORE reaching here, so this arm only
+                // fires on the false-resolve of a towered-room retreat.)
+                if engaged_once && in_target_room && target.arrival_has_towers {
+                    generation += 1;
+                    if generation >= 3 {
+                        return ChurnOutcome::LapsedOnVacuousCommit { generations: generation };
+                    }
+                    filled = vec![false; n_slots];
+                    syncing.clear();
+                    completing.clear();
+                    busy_until = vec![0; s.homes.len()];
+                    deadline = tick + COMMITMENT_BUDGET;
+                    prev_present = 0;
+                    engaged_once = false;
+                    phase = Phase::Forming;
+                    gen_start = tick;
+                    continue;
+                }
+                // A genuine resolve with no commit-cascade context (shouldn't occur in this driver) ends as
+                // never-deployed.
+                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
             }
             ReconcileAction::Retire { .. } => {
                 // Any other terminal retire in this single-objective model ends the run as never-deployed.
@@ -1458,6 +1609,7 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
             holding_station: false,
             declaiming: false,
             reassign_available: false,
+            retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
@@ -1854,6 +2006,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             holding_station: is_defend_holding(in_target_room, has_focus),
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available,
+            retreated_from_contact: false, // ADR 0035 D4 — not exercised by the v1 reassign flow
         };
         match reconcile(snapshot) {
             ReconcileAction::Reassign { withdraw_old } => {
@@ -2115,6 +2268,7 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             holding_station: false,
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // offense reassign is v1.2+; this driver isolates production→engage
+            retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire { reason, withdraw, .. } => {
@@ -2317,6 +2471,7 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             holding_station: false,
             declaiming,
             reassign_available: false,
+            retreated_from_contact: false, // ADR 0035 D4 — not exercised by the declaim flow
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire { reason, withdraw, .. } => {
@@ -3149,6 +3304,147 @@ mod tests {
             matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
             "an arrived squad must force a DTO re-read + engage, not lapse on empty DTOs, got {out:?}"
         );
+    }
+
+    /// ADR 0035 (E1, the VACUOUS-INTEL ENGAGE CASCADE — RED→GREEN). A squad COMMITS to a TOWERED room
+    /// (W4N5) on an EMPTY commit snapshot (`commit_intel_empty`), REACHES it, finds REAL towers
+    /// (`arrival_has_towers` ⇒ in-room P(win)=LOSE), and RETREATS.
+    ///
+    /// RED (`abandon_fixes_enabled=false`): the commit view looked clear so it trickled in; on arrival the
+    /// retreat MIS-RESOLVES as a clean clear → withdraw → the producer re-upserts (no `is_unwinnable_now`
+    /// consult) → Phase C re-fields → reach↔retreat. `LapsedOnVacuousCommit`, generations climbing.
+    ///
+    /// GREEN (`abandon_fixes_enabled=true`): D3 classifies the empty-Cached towered room CONTESTED (masses,
+    /// stages short); on arrival D4 feeds the real `retreated_from_contact` → the kernel returns
+    /// GaveUp+mark_unwinnable (ABANDON, not resolve); D5's producer backoff suppresses the re-field.
+    /// `AbandonedOnContact`, generations STABLE.
+    fn vacuous_commit_scenario() -> ColonyFormingScenario {
+        // A 2-slot offense roster that forms readily (not the focus of this test — the commit/abandon
+        // cascade is). Two healthy homes so the full roster banks well within the lease.
+        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
+            .expect("an offense force");
+        ColonyFormingScenario {
+            composition: comp,
+            homes: vec![
+                Home { energy_capacity: 5300, income: 300, start_energy: 5300 },
+                Home { energy_capacity: 5300, income: 300, start_energy: 5300 },
+            ],
+            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 85.0,
+            per_member_cap: 3000,
+            budget_ticks: 4000,
+            member_ttl: 1500,
+            renew: false,
+        }
+    }
+
+    #[test]
+    fn vacuous_commit_lapses_pre_fix() {
+        let s = vacuous_commit_scenario();
+        // RED: the commit view declared the room uncontested (empty-Cached looked clear); fixes OFF.
+        let target = ChurnTarget {
+            travel_ticks: 30,
+            uncontested: true,
+            commit_intel_empty: true,
+            arrival_has_towers: true,
+            abandon_fixes_enabled: false,
+            ..Default::default()
+        };
+        let out = run_lifecycle_churn(&s, &target);
+        match out {
+            ChurnOutcome::LapsedOnVacuousCommit { generations } => {
+                assert!(generations > 1, "the vacuous-commit oscillation must climb generations, got {generations}");
+            }
+            other => panic!("pre-fix must LapsedOnVacuousCommit (the reach<->retreat spiral), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vacuous_commit_abandons_on_contact_post_fix() {
+        let s = vacuous_commit_scenario();
+        // GREEN: the SAME towered room + empty commit intel, but the D3/D4/D5 fixes are ON.
+        let target = ChurnTarget {
+            travel_ticks: 30,
+            uncontested: true, // the declared (legacy) view; D3 overrides it to contested off the vacuous intel
+            commit_intel_empty: true,
+            arrival_has_towers: true,
+            abandon_fixes_enabled: true,
+            ..Default::default()
+        };
+        let out = run_lifecycle_churn(&s, &target);
+        match out {
+            ChurnOutcome::AbandonedOnContact { generations } => {
+                // Stable: a single de-commit, no re-field within the backoff (the producer suppressed it).
+                assert!(generations <= 1, "abandon-on-contact must NOT oscillate (stable generations), got {generations}");
+            }
+            other => panic!("post-fix must AbandonedOnContact (clean de-commit + backoff), got {other:?}"),
+        }
+    }
+
+    /// ADR 0035 PRESERVE: a LEGITIMATE LiveVisible-empty room (genuinely clear, no towers on arrival) still
+    /// deploys + engages even with the fixes ON — no false-abandon. `commit_intel_empty=false` (we have real
+    /// intel it is clear) and `arrival_has_towers=false`.
+    #[test]
+    fn legitimate_clear_room_still_deploys_with_fixes_on() {
+        let s = vacuous_commit_scenario();
+        let target = ChurnTarget {
+            travel_ticks: 30,
+            uncontested: true,
+            commit_intel_empty: false,
+            arrival_has_towers: false,
+            abandon_fixes_enabled: true,
+            ..Default::default()
+        };
+        let out = run_lifecycle_churn(&s, &target);
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "a genuinely-clear room must still deploy + engage (no false-abandon), got {out:?}"
+        );
+    }
+
+    /// ADR 0035 D4 (E1 false-abandon REGRESSION) — the WINNABLE-RETREAT case. A squad reaches the target,
+    /// engages, and `decide_squad` enters the Retreating STATE (a focus-fired member dipped to critical HP)
+    /// — BUT the real in-room `present_force_wins_or_stalls = TRUE`: the present force is still WINNING.
+    /// Because the bot now carries the GENUINE lose verdict (`!present_force_wins_or_stalls`) rather than the
+    /// `ctx.state == Retreating` SUPERSET, `retreated_from_contact = FALSE` → the kernel does NOT abandon.
+    /// The squad holds + wins (`DeployedAndEngaged`), NOT `AbandonedOnContact`. The pre-fix `ctx.state ==
+    /// Retreating` signal would have read TRUE here and falsely abandoned a winnable room mid-fight.
+    #[test]
+    fn winnable_retreat_does_not_abandon_a_winning_room() {
+        let s = vacuous_commit_scenario();
+        let target = ChurnTarget {
+            travel_ticks: 30,
+            uncontested: true,
+            // In-room + would-be Retreating (critical-HP member) but present_force_wins_or_stalls=TRUE — so
+            // NOT a towered/unwinnable room (arrival_has_towers stays false) and the abandon fixes are ON.
+            winnable_retreat_in_room: true,
+            arrival_has_towers: false,
+            abandon_fixes_enabled: true,
+            ..Default::default()
+        };
+        let out = run_lifecycle_churn(&s, &target);
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "a WINNING-but-Retreating (critical-HP) squad must HOLD + win, NOT be abandoned mid-fight, got {out:?}"
+        );
+        assert!(
+            !matches!(out, ChurnOutcome::AbandonedOnContact { .. }),
+            "the winnable-retreat case must NOT trip AbandonedOnContact (the false-abandon regression), got {out:?}"
+        );
+    }
+
+    #[test]
+    fn vacuous_commit_is_deterministic() {
+        let s = vacuous_commit_scenario();
+        let target = ChurnTarget {
+            travel_ticks: 30,
+            uncontested: true,
+            commit_intel_empty: true,
+            arrival_has_towers: true,
+            abandon_fixes_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(run_lifecycle_churn(&s, &target), run_lifecycle_churn(&s, &target));
     }
 
     #[test]
