@@ -187,6 +187,9 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
         // so the value `assess` reads is read-equivalent — the calibration input is unchanged.
         repair_per_tick,
         safe_mode: world.safe_mode_owner == Some(defender),
+        // ADR 0035 D1: the harness derives a profile FROM a known scenario world, so the towers are always
+        // genuinely SEEN (empty ⇒ ScoutedEmpty, non-empty ⇒ Seen) — never the vacuous never-confirmed case.
+        tower_intel: screeps_combat_decision::force_sizing::tower_intel_from(energized.is_empty(), true),
     }
 }
 

@@ -476,6 +476,7 @@ mod tests {
             // Four energized finite towers, evaluated at the falloff standoff (range 20 → 150/tower).
             towers: drain_towers.iter().map(|&(_, e)| TowerThreat { range_to_assault: 20, energy: e }).collect(),
             safe_mode: false,
+            ..Default::default()
         };
         // A single squad budget whose heal beats 4×150 falloff (drain) but not 4×150×1.3 with the hold
         // margin (breach), and whose tank HP + heal over the drain ticks ≥ the falloff damage over them.

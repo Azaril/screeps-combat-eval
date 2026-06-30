@@ -3190,7 +3190,7 @@ mod tests {
         use screeps_combat_decision::composition::optimize_composition;
         use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination, EnemyForce};
         use screeps_combat_decision::force_sizing::DefenseProfile;
-        let defense = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 0, repair_per_tick: 0.0, safe_mode: false };
+        let defense = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 0, repair_per_tick: 0.0, safe_mode: false, ..Default::default() };
         // ADR 0031 #41: the threat creep dps the optimizer prices comes from this single `EnemyForce` (dps=30),
         // not a co-resident `defense.enemy_dps` (removed).
         let enemy = EnemyForce { dps: 30.0, heal: 0.0, hits: 600, count: 2, boosted: false };
