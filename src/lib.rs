@@ -611,4 +611,140 @@ mod tests {
         assert!(s.contains("10/10 experiments passed"), "{s}");
         assert!(s.contains("EXP-FOUND-1") && s.contains("EXP-COHESION-1") && s.contains("EXP-POS-SELFPLAY-1"));
     }
+
+    // ── ADR 0036 — opportunistic structure targeting: a managed RANGED squad RAZES a hostile core ──
+    // REGRESSION GUARD for the DECISION-crate raze path — NOT a RED→GREEN proof for S1's bot-crate wiring.
+    // The engine-backed, bit-deterministic sim drives decide_squad_with_pathing → per-member combat/movement
+    // → resolve_tick (real damage). A force-sized ranged quad vs a BARE level-0 invader core (modeled as the
+    // engine's `Spawn` kind — the engine has no `InvaderCore`; the lifecycle harness already models a core as
+    // a hits-only spawn) closes range and razes it to 0.
+    // SCOPE (honest): this exercises D1/D2 (struct_target_value pricing/ordering) + the pre-existing kernel
+    // approach gradient. It does NOT — and structurally CANNOT — exercise S1's LIVE fixes D3 (bot-crate
+    // `resolve_focus`, squad.rs) or D4 (bot-crate `should_drop_anchor_for_structure_siege`, squad_manager.rs):
+    // the eval crate does not depend on the bot crate, and the ManagedSimSquad path is ANCHORLESS by
+    // construction (it never builds a formation anchor, so there is nothing for D4 to drop). The live bug
+    // (G1 member_intents discarded / G2 structure focus dropped / G3 formation anchor) lives in the bot-crate
+    // plumbing the eval cannot reach — the same sim-gap as RC-11 — so D3/D4 are verified by code-trace + the
+    // LIVE soak, not here. This test passes on master too (master already priced the core + this path is
+    // anchorless), so it is a GUARD, not a delta.
+
+    /// A `count`-strong fully-MOVE'd ranged quad (10 RANGED + 5 MOVE) of `owner`, filed at column `x`.
+    fn ranged_quad(owner: PlayerId, first_id: u32, x: u8, y0: u8, count: u8) -> Vec<SimCreep> {
+        let body: Vec<Part> = std::iter::repeat_n(Part::RangedAttack, 10).chain(std::iter::repeat_n(Part::Move, 5)).collect();
+        (0..count)
+            .map(|i| SimCreep { id: first_id + i as u32, owner, pos: pos(x, y0 + i), body: SimBody::unboosted(&body), fatigue: 0 })
+            .collect()
+    }
+
+    #[test]
+    fn a_ranged_quad_razes_a_bare_level0_core() {
+        use screeps_combat_engine::StructureKind;
+        // A bare core (no towers, no creeps) at (25,25). 6000-hit core ⇒ 4×100 = 400 dmg/tick ⇒ ~15 ticks
+        // once in range; budget 60 ticks covers the approach (start at x=10, range 15) + the raze.
+        let core_pos = pos(25, 25);
+        let mut b = ScenarioBuilder::empty(room());
+        let core_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 6000, 6000);
+        let mut world = b.build();
+        for c in ranged_quad(0, 1, 10, 23, 4) {
+            world.creeps.push(c);
+        }
+        let hits0 = world.structures.iter().find(|s| s.id == core_id).unwrap().hits;
+        let mut squad = ManagedSimSquad::new(0, vec![1, 2, 3, 4], core_pos);
+        let mut prev = hits0;
+        let mut closed = false;
+        let mut razed = false;
+        for _ in 0..60 {
+            let intents = squad.step(&world);
+            resolve_tick(&mut world, &intents);
+            let hits = world.structures.iter().find(|s| s.id == core_id).map(|s| s.hits).unwrap_or(0);
+            // Monotonic: structure hits never INCREASE (no enemy repair here) — a strict-decrease-or-equal
+            // ledger, so any progress is real raze progress (the determinism + no-regression guard).
+            assert!(hits <= prev, "core hits must never increase: {prev} -> {hits}");
+            if !closed && world.creeps.iter().any(|c| c.owner == 0 && c.is_alive() && c.pos.get_range_to(core_pos) <= 3) {
+                closed = true;
+            }
+            if hits == 0 {
+                razed = true;
+                break;
+            }
+            prev = hits;
+        }
+        let hits1 = world.structures.iter().find(|s| s.id == core_id).map(|s| s.hits).unwrap_or(0);
+        assert!(closed, "the ranged quad closed to weapon range of the bare core");
+        assert!(hits1 < hits0, "the squad dealt real damage to the core ({hits0} -> {hits1})");
+        assert!(razed, "the squad razed the bare core to 0 within the budget (final {hits1})");
+    }
+
+    /// A `count`-strong ranged+sustain siege body (8 RANGED + 8 HEAL + 4 TOUGH + 8 MOVE) — enough self-
+    /// heal to out-last a single finite tower's falloff fire while it bleeds dry, then raze (the oracle
+    /// would size this for a towered assault; here we hand-build a survivable siege force).
+    fn ranged_heal_quad(owner: PlayerId, first_id: u32, x: u8, y0: u8, count: u8) -> Vec<SimCreep> {
+        let mut body = vec![Part::Tough; 4];
+        body.extend(std::iter::repeat_n(Part::RangedAttack, 8));
+        body.extend(std::iter::repeat_n(Part::Heal, 8));
+        body.extend(std::iter::repeat_n(Part::Move, 8));
+        (0..count)
+            .map(|i| SimCreep { id: first_id + i as u32, owner, pos: pos(x, y0 + i), body: SimBody::unboosted(&body), fatigue: 0 })
+            .collect()
+    }
+
+    #[test]
+    fn a_towered_core_is_threat_neutralized_before_the_core_value_is_taken() {
+        use screeps_combat_engine::StructureKind;
+        // A TOWERED variant — the THREAT-BEFORE-VALUE proof. A finite energized tower defends the core.
+        // The EV target value (D1) prices the LIVE tower by its real incoming dps and the core by its
+        // strategic value; the squad must neutralize the TOWER THREAT before it spends fire on the core's
+        // value. The EV-correct realization (the sim shows it): the squad holds off the energized tower,
+        // bleeds it DRY (the finite-energy drain — neutralizing the threat: a drained tower's threat_removed
+        // is 0, so it is no longer the priority), and ONLY THEN closes and razes the core. The decisive
+        // invariant is the ORDERING: the core takes ZERO damage while the tower is a live threat (energized),
+        // and the core is razed after. The scripted `tower_intents` fires + bleeds the defender's tower.
+        let core_pos = pos(25, 25);
+        let mut b = ScenarioBuilder::empty(room());
+        let core_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 6000, 6000);
+        // A finite-energy tower so the siege can neutralize the threat by draining it (300 energy ⇒ 30 shots).
+        let tower_id = b.tower(1, 27, 25, 300);
+        let mut world = b.build();
+        for c in ranged_heal_quad(0, 1, 18, 22, 4) {
+            world.creeps.push(c);
+        }
+        let core_hits0 = world.structures.iter().find(|s| s.id == core_id).unwrap().hits;
+        let mut squad = ManagedSimSquad::new(0, vec![1, 2, 3, 4], core_pos);
+        let mut tower_drained_at: Option<u32> = None;
+        let mut core_first_damaged_at: Option<u32> = None;
+        let mut core_gone = false;
+        let tower_energy = |w: &CombatWorld| w.towers.iter().find(|t| t.id == tower_id).map(|t| t.energy).unwrap_or(0);
+        let core_hits = |w: &CombatWorld| w.structures.iter().find(|s| s.id == core_id).map(|s| s.hits).unwrap_or(0);
+        for tick in 0..160u32 {
+            let mut intents = squad.step(&world);
+            tower_intents(&world, &mut intents); // the defender's tower shoots back + bleeds energy
+            resolve_tick(&mut world, &intents);
+            if tower_drained_at.is_none() && tower_energy(&world) == 0 {
+                tower_drained_at = Some(tick);
+            }
+            if core_first_damaged_at.is_none() && core_hits(&world) < core_hits0 {
+                core_first_damaged_at = Some(tick);
+            }
+            if world.creeps.iter().filter(|c| c.owner == 0).all(|c| !c.is_alive()) {
+                break;
+            }
+            if core_hits(&world) == 0 {
+                core_gone = true;
+                break;
+            }
+        }
+        let survivors = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).count();
+        let core_hits1 = core_hits(&world);
+        assert!(survivors > 0, "the sustaining siege out-lasted the finite tower (it didn't get wiped)");
+        assert_eq!(tower_energy(&world), 0, "the tower threat is neutralized (drained to 0)");
+        let drained = tower_drained_at.expect("the tower was bled dry");
+        // THREAT BEFORE VALUE: the core's value is untouched until the tower threat is neutralized. The
+        // squad razes the core only AFTER draining the tower (no fire wasted on the core under live tower
+        // fire). A core that took damage before the drain would mean value-before-threat (the bug).
+        if let Some(cd) = core_first_damaged_at {
+            assert!(cd >= drained, "the core takes damage only AFTER the tower threat is neutralized: core@{cd} drained@{drained}");
+        }
+        assert!(core_first_damaged_at.is_some(), "the squad eventually bit into the core's value");
+        assert!(core_gone, "and razed the core to 0 once the threat was gone (final {core_hits1})");
+    }
 }
