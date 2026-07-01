@@ -17,8 +17,14 @@ screeps-combat-engine = { git = "https://github.com/Azaril/screeps-combat-engine
 screeps-combat-decision = { git = "https://github.com/Azaril/screeps-combat-decision" }
 screeps-combat-agent = { git = "https://github.com/Azaril/screeps-combat-agent" }
 # The shared movement kernel — used directly for its seeded RNG (`rng::Rng`, ADR 0033); the scenario
-# generators previously carried a private copy.
-screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core" }
+# generators previously carried a private copy. `rover` = `MoverConfig`, the rover-tunables unit the
+# combat-corpus movement adjudication sweeps (harness/mover_adjudication.rs; already unified on by
+# combat-agent's dep, so this adds no new build surface).
+screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core", features = ["rover"] }
+# Rover's pure headless core (the same dep shape as combat-agent): `StuckThresholds`, the escalation
+# ladder the adjudication rebuilds locally (rover-eval's `tuning.rs::ladder` — rover-eval depends ON
+# this crate, so the helper cannot be imported back without a cycle).
+screeps-rover = { git = "https://github.com/Azaril/screeps-rover" }
 # The bot's backend-agnostic structure-shape primitives, reused for the replay player's typed
 # buildings (host-only; the root [patch] redirects to the local working tree).
 screeps-visual = { git = "https://github.com/Azaril/screeps-visual" }

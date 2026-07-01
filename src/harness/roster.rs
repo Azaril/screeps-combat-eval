@@ -130,7 +130,8 @@ pub fn sample_squad(seed: u32, energy: u32, n: u8) -> Vec<Vec<Part>> {
 }
 
 /// Place a squad's bodies as a vertical file of `owner` creeps at column `x`, ids from `first_id`.
-fn place(
+/// `pub(crate)`: the mover adjudication reuses the exact roster placement geometry.
+pub(crate) fn place(
     world: &mut CombatWorld,
     owner: PlayerId,
     first_id: u32,
@@ -185,8 +186,8 @@ fn predict_for(world: &CombatWorld, owner: PlayerId) -> EnginePrediction {
     predict_engage(&view, centroid)
 }
 
-/// Total living HP of `owner` in `world`.
-fn living_hp(world: &CombatWorld, owner: PlayerId) -> i64 {
+/// Total living HP of `owner` in `world`. `pub(crate)`: shared with the mover adjudication.
+pub(crate) fn living_hp(world: &CombatWorld, owner: PlayerId) -> i64 {
     world
         .movement
         .creeps
