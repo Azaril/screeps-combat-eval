@@ -16,6 +16,7 @@
 
 use crate::harness::roster::{living_hp, place, random_squad};
 use screeps::{Position, RoomCoordinate, RoomName};
+use screeps_combat_agent::pathing::combat_mover_config;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_engine::{resolve_tick, CombatWorld, Intents};
 use screeps_rover::StuckThresholds;
@@ -226,9 +227,11 @@ mod tests {
     /// The candidate under adjudication: `ladder(8)` + the (already-default) reuse 20 — exactly the
     /// haul tournament's H=0.851 point (rover-eval `tuning.rs`, ADR 0033 M5).
     fn ladder8() -> MoverConfig {
+        // Rebased on the COMBAT default (idle registration OFF — holding combat creeps are not
+        // parked junk; see combat_mover_config): the candidate axis is the ladder alone.
         MoverConfig {
             stuck_thresholds: ladder(8),
-            ..Default::default()
+            ..combat_mover_config()
         }
     }
 
@@ -238,8 +241,8 @@ mod tests {
     #[test]
     fn mover_config_reaches_the_combat_bed_and_is_deterministic() {
         let seeds = 0..2u32; // seed 0 = open field, seed 1 = pinch
-        let a1 = run_corpus(seeds.clone(), &MoverConfig::default(), 80);
-        let a2 = run_corpus(seeds.clone(), &MoverConfig::default(), 80);
+        let a1 = run_corpus(seeds.clone(), &combat_mover_config(), 80);
+        let a2 = run_corpus(seeds.clone(), &combat_mover_config(), 80);
         assert_eq!(a1, a2, "same seeds + config ⇒ bit-identical outcomes");
         let b = run_corpus(seeds, &ladder8(), 80);
         assert_eq!(b.len(), 2);
@@ -254,7 +257,7 @@ mod tests {
     /// THE ADJUDICATION (on demand):
     /// `cargo test -p screeps-combat-eval mover_adjudication --release -- --ignored --nocapture`
     /// 60 seeded matchups (30 open + 30 pinch), run-until-wipe cap 300, under
-    ///   A = `MoverConfig::default()` (reuse 20, ladder(2) — the shipped default),
+    ///   A = `combat_mover_config()` (reuse 20, ladder(2) — the shipped default),
     ///   B = `ladder(8)` + reuse 20   (the haul-tournament candidate),
     ///   C = default but `report_failure` 12→48 ONLY (the job-layer-contract axis isolated).
     /// Prints the paired number sheet; the asserts are the adjudication's ratchets (loose bounds
@@ -274,14 +277,17 @@ mod tests {
     fn adjudicate_ladder8_on_the_combat_corpus() {
         const CAP: u32 = 300;
         let seeds = 0..60u32;
-        let a = run_corpus(seeds.clone(), &MoverConfig::default(), CAP);
+        let a = run_corpus(seeds.clone(), &combat_mover_config(), CAP);
         let b = run_corpus(seeds.clone(), &ladder8(), CAP);
         let c_cfg = MoverConfig {
             stuck_thresholds: StuckThresholds {
                 report_failure: 48,
                 ..Default::default()
             },
-            ..Default::default()
+            // Rebased on the COMBAT default like every arm here — `..Default::default()` would
+            // silently flip register_idle_creeps ON and this assert would compare registration
+            // modes instead of the report_failure axis (which is exactly what it once did).
+            ..combat_mover_config()
         };
         let c = run_corpus(seeds.clone(), &c_cfg, CAP);
 
