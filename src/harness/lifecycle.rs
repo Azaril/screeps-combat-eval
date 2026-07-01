@@ -1878,7 +1878,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             // OWNED-ROOM threats (emit_defense directly): the threat is in an owned room this scan.
             let owned_threats: Vec<Threat<V1Room>> = threat_room
                 .filter(|r| owned_set.contains(r))
-                .map(|r| vec![Threat { room: r, danger: 30.0 }])
+                .map(|r| vec![Threat { room: r, danger: 30.0, tower_danger: 0.0 }])
                 .into_iter()
                 .flatten()
                 .collect();
@@ -1890,7 +1890,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
                 .filter(|r| !owned_set.contains(r))
                 .map(|r| {
                     let nearest = owned_set.iter().map(|&o| v1_dist(o, r)).min();
-                    vec![RawObservation { room: r, hostile_bodies: &bodies, visible: true, is_owned: false, nearest_owned_dist: nearest }]
+                    vec![RawObservation { room: r, hostile_bodies: &bodies, visible: true, is_owned: false, nearest_owned_dist: nearest, tower_danger: 0.0 }]
                 })
                 .into_iter()
                 .flatten()
