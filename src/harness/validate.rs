@@ -927,7 +927,8 @@ pub fn self_play_replay_data(scenario: &Scenario) -> (screeps_combat_engine::Com
                 StopReason::SideWiped(_) => "defender wiped",
                 StopReason::Timeout => "timed out",
             };
-            (rec, ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks))))
+            let meta = ReplayMeta::from_world_and_recording(&scenario.world, Some(&rec), &scenario.label, Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks)));
+            (rec, meta)
         }
         None => (
             screeps_combat_engine::CombatRecording::new(),
@@ -940,6 +941,133 @@ pub fn self_play_replay_data(scenario: &Scenario) -> (screeps_combat_engine::Com
 pub fn render_self_play_replay(scenario: &Scenario) -> String {
     let (rec, meta) = self_play_replay_data(scenario);
     replay_to_html(&rec, &meta)
+}
+
+/// Run a self-play engagement where the ATTACKER's composition is supplied explicitly (`att_bodies`,
+/// a free-form roster — e.g. `roster::random_squad`) instead of the fixed ranged quad. BOTH sides are
+/// still driven by the real `ManagedSimSquad` brain over the scenario's world (the defender is the
+/// pre-placed defender creeps); the defender's towers fire. This is the seam the render corpus uses to
+/// VARY both sides' compositions on real terrain (ADR 0038 P1) while keeping the fight fully real. `None`
+/// ⇒ the attacker roster wouldn't field at the entry (too crowded / all walls).
+pub fn run_self_play_bodies(
+    scenario: &Scenario,
+    att_bodies: &[Vec<screeps::Part>],
+) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording, Vec<CreepId>)> {
+    let obj = &scenario.objectives[0];
+    let mut world = scenario.world.clone();
+    // Place the supplied attacker roster at the objective's entry (distinct, non-wall tiles), then run
+    // the same both-sides-managed loop `run_self_play` uses.
+    let att_ids = place_bodies_at_entry(&mut world, obj, att_bodies, scenario.attacker_owner)?;
+    let def_ids: Vec<CreepId> =
+        world.creeps.iter().filter(|c| c.is_alive() && c.owner == scenario.defender_owner).map(|c| c.id).collect();
+    let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos);
+    let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids.clone(), obj.pos);
+    let mut conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> =
+        vec![Box::new(ObjectivesDestroyed(vec![obj.id])), Box::new(SideWiped(scenario.attacker_owner))];
+    if !def_ids.is_empty() {
+        conditions.push(Box::new(SideWiped(scenario.defender_owner)));
+    }
+    let run_until = AnyOf(conditions);
+    let (outcome, rec) = evaluate_recorded(
+        world,
+        &mut |w| att.step(w),
+        &mut |w, intents| {
+            let d = def.step(w);
+            merge_intents(intents, d);
+            tower_intents(w, intents);
+        },
+        &run_until,
+        scenario.onsite_budget,
+    );
+    Some((outcome, rec, def_ids))
+}
+
+/// Place already-built bodies (not a `SquadComposition`) as `owner` creeps at the objective's entry,
+/// reusing the collision-free ring placement of [`place_at_entry`]. Ids from 1 (attacker) never collide
+/// with the defender creeps (placed from 10_000). `None` ⇒ not enough free tiles near the entry.
+fn place_bodies_at_entry(world: &mut CombatWorld, obj: &Objective, bodies: &[Vec<screeps::Part>], owner: PlayerId) -> Option<Vec<CreepId>> {
+    let (ex, ey, rm) = (obj.entry.x().u8() as i32, obj.entry.y().u8() as i32, obj.entry.room_name());
+    const OFF: [(i32, i32); 9] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+    let need = bodies.len();
+    let tiles: Vec<(u8, u8)> = {
+        let terrain = world.terrain_for(rm);
+        let mut taken: std::collections::HashSet<(u8, u8)> =
+            world.creeps.iter().filter(|c| c.pos.room_name() == rm).map(|c| (c.pos.x().u8(), c.pos.y().u8())).collect();
+        let mut offsets: Vec<(i32, i32)> = OFF.to_vec();
+        for r in 2..=12i32 {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs().max(dy.abs()) == r {
+                        offsets.push((dx, dy));
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(u8, u8)> = Vec::with_capacity(need);
+        for (dx, dy) in offsets {
+            if out.len() == need {
+                break;
+            }
+            let (x, y) = (ex + dx, ey + dy);
+            if !(0..=49).contains(&x) || !(0..=49).contains(&y) {
+                continue;
+            }
+            let (x, y) = (x as u8, y as u8);
+            if terrain.is_wall(x, y) || !taken.insert((x, y)) {
+                continue;
+            }
+            out.push((x, y));
+        }
+        out
+    };
+    if tiles.len() < need {
+        return None;
+    }
+    let mut ids = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        let (x, y) = tiles[i];
+        let id = i as u32 + 1;
+        let pos = Position::new(screeps::RoomCoordinate::new(x).unwrap(), screeps::RoomCoordinate::new(y).unwrap(), rm);
+        world.creeps.push(SimCreep { id, owner, pos, body: SimBody::unboosted(body), fatigue: 0 });
+        ids.push(id);
+    }
+    Some(ids)
+}
+
+/// The recording + a one-line outcome descriptor for a self-play match with an EXPLICIT attacker roster
+/// (`att_bodies`). The corpus driver uses the descriptor (`objective destroyed` / `attacker wiped` /
+/// `defender wiped` / `timed out` / `could not field`) as the per-render outcome label.
+pub fn self_play_bodies_replay_data(scenario: &Scenario, att_bodies: &[Vec<screeps::Part>]) -> (screeps_combat_engine::CombatRecording, ReplayMeta, String) {
+    match run_self_play_bodies(scenario, att_bodies) {
+        Some((outcome, rec, _)) => {
+            let result = match outcome.stop {
+                StopReason::ObjectivesComplete => "objective destroyed",
+                StopReason::ControllerNeutralized => "controller neutralized",
+                StopReason::SideWiped(o) if o == scenario.attacker_owner => "attacker wiped",
+                StopReason::SideWiped(_) => "defender wiped",
+                StopReason::Timeout => "timed out",
+            };
+            let meta = ReplayMeta::from_world_and_recording(
+                &scenario.world,
+                Some(&rec),
+                &scenario.label,
+                Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks)),
+            );
+            (rec, meta, format!("{result} @ t{}", outcome.ticks))
+        }
+        None => (
+            screeps_combat_engine::CombatRecording::new(),
+            ReplayMeta::from_world(&scenario.world, &scenario.label, Some("self-play — could not field the attacker".into())),
+            "could not field".into(),
+        ),
+    }
+}
+
+/// Render an interactive single-file HTML replay of a self-play match with an explicit attacker roster,
+/// returning the HTML paired with the one-line outcome descriptor (for the corpus index).
+pub fn render_self_play_replay_bodies(scenario: &Scenario, att_bodies: &[Vec<screeps::Part>]) -> (String, String) {
+    let (rec, meta, outcome) = self_play_bodies_replay_data(scenario, att_bodies);
+    (replay_to_html(&rec, &meta), outcome)
 }
 
 /// Render an interactive HTML replay of a MOVING managed assault on `scenario` — the real squad brain
@@ -955,7 +1083,7 @@ pub fn render_managed_replay(scenario: &Scenario) -> String {
                 StopReason::SideWiped(_) => "attackers wiped",
                 StopReason::Timeout => "held (timed out)",
             };
-            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("managed ranged assault → {result} @ t{}", outcome.ticks)));
+            let meta = ReplayMeta::from_world_and_recording(&scenario.world, Some(&rec), &scenario.label, Some(format!("managed ranged assault → {result} @ t{}", outcome.ticks)));
             replay_to_html(&rec, &meta)
         }
         None => {
@@ -996,7 +1124,7 @@ pub fn calibration_replay_data(scenario: &Scenario) -> (screeps_combat_engine::C
         StopReason::SideWiped(_) => "attackers wiped",
         StopReason::Timeout => "held (timed out)",
     };
-    let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("{decision} → {result} @ t{}", outcome.ticks)));
+    let meta = ReplayMeta::from_world_and_recording(&scenario.world, Some(&rec), &scenario.label, Some(format!("{decision} → {result} @ t{}", outcome.ticks)));
     (rec, meta)
 }
 

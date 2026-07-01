@@ -37,6 +37,20 @@ pub struct ReplayMeta {
 impl ReplayMeta {
     /// Build the per-room terrain backdrops by scanning a world for the rooms its entities occupy.
     pub fn from_world(world: &CombatWorld, title: impl Into<String>, verdict: Option<String>) -> Self {
+        Self::from_world_and_recording(world, None, title, verdict)
+    }
+
+    /// As [`from_world`](Self::from_world), but ALSO unions in every room that appears anywhere in a
+    /// recording's frames (multi-room replays). Without this the room panel list is built only from the
+    /// STATIC world — which, for a MOVING assault fielded at runtime, holds only the target room's
+    /// defenders, so the attacker's home + transit rooms (where it forms and travels) never render. Pass
+    /// the recording so the full cross-room journey is drawn.
+    pub fn from_world_and_recording(
+        world: &CombatWorld,
+        rec: Option<&CombatRecording>,
+        title: impl Into<String>,
+        verdict: Option<String>,
+    ) -> Self {
         let mut names: BTreeSet<String> = BTreeSet::new();
         for c in &world.creeps {
             names.insert(c.pos.room_name().to_string());
@@ -46,6 +60,19 @@ impl ReplayMeta {
         }
         for t in &world.towers {
             names.insert(t.pos.room_name().to_string());
+        }
+        if let Some(rec) = rec {
+            for f in &rec.frames {
+                for c in &f.creeps {
+                    names.insert(c.room.to_string());
+                }
+                for s in &f.structures {
+                    names.insert(s.room.to_string());
+                }
+                for t in &f.towers {
+                    names.insert(t.room.to_string());
+                }
+            }
         }
         let rooms = names
             .into_iter()

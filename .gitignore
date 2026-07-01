@@ -2,3 +2,7 @@
 /target
 # Resolved lockfile (this crate is a library; consumers pin their own)
 Cargo.lock
+
+# temp render outputs (not committed)
+foreman-replay-*.html
+combat-renders/

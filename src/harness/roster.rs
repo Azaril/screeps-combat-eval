@@ -107,9 +107,19 @@ pub(crate) fn random_body(rng: &mut Rng, energy: u32) -> Vec<Part> {
     body
 }
 
-/// Sample a squad of `n` random creeps, each within `energy`.
+/// Sample a squad of `n` random creeps, each within `energy`. Crate-internal (takes the `pub(crate)`
+/// `Rng`); out-of-crate callers use [`sample_squad`] (seed-only).
 pub(crate) fn random_squad(rng: &mut Rng, energy: u32, n: u8) -> Vec<Vec<Part>> {
     (0..n).map(|_| random_body(rng, energy)).collect()
+}
+
+/// Deterministic, seed-only squad sampler (the public entry point for out-of-crate drivers, e.g. the
+/// render corpus example): construct the SplitMix64 RNG from `seed` internally and sample `n` free-form
+/// bodies within `energy`. Same seed → identical squad (respects the sim-determinism fence: no
+/// wall-clock, no ambient RNG). Prefer this over exposing `Rng` when a caller only needs a reproducible
+/// composition.
+pub fn sample_squad(seed: u32, energy: u32, n: u8) -> Vec<Vec<Part>> {
+    random_squad(&mut Rng::seeded(seed), energy, n)
 }
 
 /// Place a squad's bodies as a vertical file of `owner` creeps at column `x`, ids from `first_id`.
