@@ -2,5 +2,8 @@
 //! `cargo run --example run_register -p screeps-combat-eval`
 
 fn main() {
-    print!("{}", screeps_combat_eval::report(&screeps_combat_eval::register()));
+    print!(
+        "{}",
+        screeps_combat_eval::report(&screeps_combat_eval::register())
+    );
 }

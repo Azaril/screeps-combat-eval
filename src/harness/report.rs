@@ -3,12 +3,16 @@
 //! validator verdict in one place. Host-only; writes to a directory the operator opens.
 
 use crate::harness::generate::{Designed, Generator, Permutations, RandomDefendedBase};
-use crate::harness::validate::{calibration_replay_data, self_play_replay_data, OracleCalibration, SelfPlay, Validator};
+use crate::harness::validate::{
+    calibration_replay_data, self_play_replay_data, OracleCalibration, SelfPlay, Validator,
+};
 use crate::harness::visualize::write_replay;
 use std::fmt::Write as _;
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 struct Entry {
@@ -37,7 +41,13 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
             let (rec, meta) = self_play_replay_data(&s);
             write_replay(dir, &name, &rec, &meta)?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file: format!("{name}.html"), title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry {
+                file: format!("{name}.html"),
+                title: s.label,
+                lens: "self-play",
+                verdict: verdict.detail,
+                pass: verdict.pass,
+            });
         }
     }
     // A few permutations — self-play over the enumerated layout grid.
@@ -50,7 +60,13 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
             let (rec, meta) = self_play_replay_data(&s);
             write_replay(dir, &name, &rec, &meta)?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file: format!("{name}.html"), title: s.label, lens: "self-play", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry {
+                file: format!("{name}.html"),
+                title: s.label,
+                lens: "self-play",
+                verdict: verdict.detail,
+                pass: verdict.pass,
+            });
         }
     }
     // RandomDefendedBase — the sizing-pure calibration lens.
@@ -63,7 +79,13 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
             let (rec, meta) = calibration_replay_data(&s);
             write_replay(dir, &name, &rec, &meta)?;
             let verdict = v.validate(&s);
-            entries.push(Entry { file: format!("{name}.html"), title: s.label, lens: "calibration", verdict: verdict.detail, pass: verdict.pass });
+            entries.push(Entry {
+                file: format!("{name}.html"),
+                title: s.label,
+                lens: "calibration",
+                verdict: verdict.detail,
+                pass: verdict.pass,
+            });
         }
     }
 
@@ -75,7 +97,11 @@ pub fn write_dashboard(dir: &str) -> std::io::Result<usize> {
     idx.push_str("<h1>Combat harness replays — open any scenario to scrub the engagement</h1>");
     idx.push_str("<table><tr><th>scenario</th><th>lens</th><th>verdict</th></tr>");
     for e in &entries {
-        let mark = if e.pass { "<span class=\"ok\">●</span>" } else { "<span class=\"no\">●</span>" };
+        let mark = if e.pass {
+            "<span class=\"ok\">●</span>"
+        } else {
+            "<span class=\"no\">●</span>"
+        };
         let _ = write!(
             idx,
             "<tr><td>{mark} <a href=\"{}\">{}</a></td><td class=\"lens\">{}</td><td>{}</td></tr>",

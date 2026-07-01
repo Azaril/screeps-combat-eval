@@ -78,7 +78,11 @@ const RENEW_PER_TICK: u32 = 20;
 const RENEW_THRESHOLD: u32 = 100;
 
 fn dummy_home_pos() -> Position {
-    Position::new(RoomCoordinate::new(25).unwrap(), RoomCoordinate::new(25).unwrap(), "W1N1".parse().unwrap())
+    Position::new(
+        RoomCoordinate::new(25).unwrap(),
+        RoomCoordinate::new(25).unwrap(),
+        "W1N1".parse().unwrap(),
+    )
 }
 
 /// Simulate the colony forming the squad. Deterministic: same scenario → same outcome.
@@ -123,7 +127,14 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
         }
 
         // 3. Field the unfilled combat slots once (K3) — same body broadcast to every home.
-        let combat = fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains);
+        let combat = fielding::slots_to_spawn(
+            &s.composition,
+            &filled,
+            best_capacity,
+            s.per_member_cap,
+            s.combat_priority,
+            MoveProfile::Plains,
+        );
 
         // Cross-home de-dup within this tick: a slot already in flight (or spawned this tick) is excluded.
         let mut in_flight: BTreeSet<u64> = completing.iter().map(|&(id, _)| id).collect();
@@ -141,7 +152,11 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
             // given member per tick; a home with no aging member to renew falls through to spawning.
             if s.renew {
                 if let Some(slot) = (0..n_slots)
-                    .filter(|&i| filled[i] && !renewed_this_tick.contains(&i) && dies_at[i].saturating_sub(tick) < RENEW_THRESHOLD)
+                    .filter(|&i| {
+                        filled[i]
+                            && !renewed_this_tick.contains(&i)
+                            && dies_at[i].saturating_sub(tick) < RENEW_THRESHOLD
+                    })
                     .min_by_key(|&i| dies_at[i])
                 {
                     dies_at[slot] = (dies_at[slot] + RENEW_PER_TICK).min(tick + s.member_ttl);
@@ -153,11 +168,21 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
             let mut queue: Vec<QueuedSpawn> = Vec::new();
             if let Some((p, c)) = s.economy.miner {
                 if s.economy.miner_period > 0 && tick % s.economy.miner_period == 0 {
-                    queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_MINER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                    queue.push(QueuedSpawn {
+                        priority: p,
+                        body_cost: c,
+                        part_count: (c / 100).max(1),
+                        id: ECON_MINER_ID_BASE + (tick as u64) * 100 + h as u64,
+                    });
                 }
             }
             if let Some((p, c)) = s.economy.hauler {
-                queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                queue.push(QueuedSpawn {
+                    priority: p,
+                    body_cost: c,
+                    part_count: (c / 100).max(1),
+                    id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64,
+                });
             }
             for cs in &combat {
                 if !in_flight.contains(&cs.id) {
@@ -165,7 +190,11 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
                 }
             }
 
-            let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+            let mut lane = HomeLanes {
+                idle_spawns: 1,
+                available_energy: avail[h],
+                energy_capacity: s.homes[h].energy_capacity,
+            };
             for spawned in spawn_step(&mut lane, &queue) {
                 avail[h] = lane.available_energy;
                 busy_until[h] = tick + spawned.completes_in;
@@ -178,7 +207,10 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
         }
     }
 
-    FormingOutcome::Stalled { filled: filled.iter().filter(|f| **f).count(), of: n_slots }
+    FormingOutcome::Stalled {
+        filled: filled.iter().filter(|f| **f).count(),
+        of: n_slots,
+    }
 }
 
 // ═══ The CHURN-MODELING lifecycle driver (the live bot wiring `run_forming` bypasses) ═════════════════════
@@ -336,7 +368,10 @@ impl WPos {
         (self.wx.div_euclid(50), self.wy.div_euclid(50))
     }
     fn step_toward(self, to: WPos) -> WPos {
-        WPos { wx: self.wx + (to.wx - self.wx).signum(), wy: self.wy + (to.wy - self.wy).signum() }
+        WPos {
+            wx: self.wx + (to.wx - self.wx).signum(),
+            wy: self.wy + (to.wy - self.wy).signum(),
+        }
     }
     fn room_dist(self, o: WPos) -> u32 {
         let (ax, ay) = self.room();
@@ -396,11 +431,20 @@ impl SpatialTravel {
 /// members spawn at DISTINCT homes and must converge at a SHARED rally before the assault advances. The
 /// reconcile DECISION is the shared `lifecycle::reconcile` kernel; the gather decision is the shared
 /// `rally::gather_quorum_met` kernel — so there is no live/sim drift. Deterministic.
-pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTravel) -> ChurnOutcome {
-    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+pub fn run_lifecycle_churn_spatial(
+    s: &ColonyFormingScenario,
+    travel: &SpatialTravel,
+) -> ChurnOutcome {
+    use screeps_combat_decision::lifecycle::{
+        reconcile, ReconcileAction, ReconcileSnapshot, RetireReason,
+    };
 
     let n_slots = s.composition.slots.len();
-    assert_eq!(travel.homes.len(), n_slots, "one home per member slot in the spatial model");
+    assert_eq!(
+        travel.homes.len(),
+        n_slots,
+        "one home per member slot in the spatial model"
+    );
     let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
 
     let mut generation: u32 = 0;
@@ -458,11 +502,22 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
         max_present = max_present.max(present);
         let has_members = present > 0 || !completing.is_empty() || !syncing.is_empty();
 
-        let any_queued = !fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains).is_empty();
+        let any_queued = !fielding::slots_to_spawn(
+            &s.composition,
+            &filled,
+            best_capacity,
+            s.per_member_cap,
+            s.combat_priority,
+            MoveProfile::Plains,
+        )
+        .is_empty();
         let forming_in_flight = !completing.is_empty() || !syncing.is_empty() || any_queued;
 
         // Present members' positions (in slot order) for the rally + gather kernels.
-        let present_positions: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+        let present_positions: Vec<WPos> = (0..n_slots)
+            .filter(|&i| filled[i])
+            .map(|i| member_pos[i])
+            .collect();
 
         let mut in_target_room = false;
         let mut traveling = false;
@@ -481,14 +536,23 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             traveling = true;
             // ── GATHER DECISION (evaluated EVERY tick so the buggy non-latched model can OSCILLATE). The
             // gather quorum over the CURRENT positions; FIX A also counts in-target-room members as gathered.
-            let pre_step: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+            let pre_step: Vec<WPos> = (0..n_slots)
+                .filter(|&i| filled[i])
+                .map(|i| member_pos[i])
+                .collect();
             let has_fighter = !pre_step.is_empty();
-            let in_room_count = (0..n_slots).filter(|&i| filled[i] && member_pos[i].room() == travel.target.room()).count();
+            let in_room_count = (0..n_slots)
+                .filter(|&i| filled[i] && member_pos[i].room() == travel.target.room())
+                .count();
             let quorum_now = (travel.use_shared_rally
                 && rally::gather_quorum_met(&SpatialTravel::pos_options(&pre_step), travel.rally.to_pos(), n_slots, travel.uncontested, has_fighter, rally::RALLY_GATHER_RADIUS))
                 // FIX A: members already IN the target room count as gathered (arrived members can't fail it).
                 || (travel.latch_assault && in_room_count > 0 && has_fighter);
-            max_gathered = max_gathered.max(rally::members_gathered_at(&SpatialTravel::pos_options(&pre_step), travel.rally.to_pos(), rally::RALLY_GATHER_RADIUS));
+            max_gathered = max_gathered.max(rally::members_gathered_at(
+                &SpatialTravel::pos_options(&pre_step),
+                travel.rally.to_pos(),
+                rally::RALLY_GATHER_RADIUS,
+            ));
             if travel.latch_assault {
                 // FIXED: LATCH the assault on the FIRST quorum — members dying/lagging can't un-commit it
                 // (the bot stops re-evaluating `gather_quorum_met` once it latches the assault state).
@@ -522,11 +586,18 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
                         }
                     }
                 }
-                in_target_room = (0..n_slots).any(|i| filled[i] && member_pos[i].room() == travel.target.room());
+                in_target_room =
+                    (0..n_slots).any(|i| filled[i] && member_pos[i].room() == travel.target.room());
                 if in_target_room && travel.latch_assault {
-                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                    return ChurnOutcome::DeployedAndEngaged {
+                        generations: generation,
+                        engage_tick: tick,
+                    };
                 }
-                let cur_dist = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i].room_dist(travel.target)).min();
+                let cur_dist = (0..n_slots)
+                    .filter(|&i| filled[i])
+                    .map(|i| member_pos[i].room_dist(travel.target))
+                    .min();
                 travel_progress = match (cur_dist, prev_target_room_dist) {
                     (Some(c), Some(p)) => c < p,
                     (Some(_), None) => true,
@@ -560,7 +631,10 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
                         member_pos[i] = travel.homes[i]; // the slot reopens; a fresh member re-spawns at home
                     }
                 }
-                let stepped: Vec<WPos> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+                let stepped: Vec<WPos> = (0..n_slots)
+                    .filter(|&i| filled[i])
+                    .map(|i| member_pos[i])
+                    .collect();
                 let cur_dist = stepped.iter().map(|p| p.room_dist(travel.rally)).min();
                 travel_progress = match (cur_dist, prev_target_room_dist) {
                     (Some(c), Some(p)) => c < p,
@@ -595,19 +669,27 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
             travel_progress,
             travel_budget_remaining,
             holding_station: false, // offense spatial repro — never a Defend garrison
-            declaiming: false,      // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
+            declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
         };
         match reconcile(snapshot) {
-            ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
+            ReconcileAction::Retire {
+                reason: RetireReason::GaveUp,
+                ..
+            } => {
                 if departed {
                     // BUG A: an oscillating contested squad that never committed the assault → classify the
                     // thrash distinctly from a clean mid-hop travel lapse.
                     if oscillations > 0 {
-                        return ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered };
+                        return ChurnOutcome::OscillatedNeverGathered {
+                            generations: generation,
+                            max_gathered,
+                        };
                     }
-                    return ChurnOutcome::LapsedInTravel { generations: generation };
+                    return ChurnOutcome::LapsedInTravel {
+                        generations: generation,
+                    };
                 }
                 generation += 1;
                 filled = vec![false; n_slots];
@@ -625,19 +707,35 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
                 continue;
             }
             ReconcileAction::Retire { .. } => {
-                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
+                return ChurnOutcome::ChurnedNeverDeployed {
+                    generations: generation,
+                    max_present,
+                };
             }
             ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
             ReconcileAction::Keep => {}
             // This driver never feeds `reassign_available=true` (reassignment is exercised by `run_v1_flow`).
-            ReconcileAction::Reassign { .. } => unreachable!("reassign_available is always false here"),
+            ReconcileAction::Reassign { .. } => {
+                unreachable!("reassign_available is always false here")
+            }
         }
         prev_present = present;
 
         // Spawn step (only while forming).
         if !departed {
-            let combat = fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains);
-            let mut in_flight: BTreeSet<u64> = completing.iter().chain(syncing.iter()).map(|&(id, _)| id).collect();
+            let combat = fielding::slots_to_spawn(
+                &s.composition,
+                &filled,
+                best_capacity,
+                s.per_member_cap,
+                s.combat_priority,
+                MoveProfile::Plains,
+            );
+            let mut in_flight: BTreeSet<u64> = completing
+                .iter()
+                .chain(syncing.iter())
+                .map(|&(id, _)| id)
+                .collect();
             for h in 0..s.homes.len() {
                 avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
                 if tick < busy_until[h] {
@@ -645,14 +743,23 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
                 }
                 let mut queue: Vec<QueuedSpawn> = Vec::new();
                 if let Some((p, c)) = s.economy.hauler {
-                    queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                    queue.push(QueuedSpawn {
+                        priority: p,
+                        body_cost: c,
+                        part_count: (c / 100).max(1),
+                        id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64,
+                    });
                 }
                 for cs in &combat {
                     if !in_flight.contains(&cs.id) {
                         queue.push(*cs);
                     }
                 }
-                let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+                let mut lane = HomeLanes {
+                    idle_spawns: 1,
+                    available_energy: avail[h],
+                    energy_capacity: s.homes[h].energy_capacity,
+                };
                 for spawned in spawn_step(&mut lane, &queue) {
                     avail[h] = lane.available_energy;
                     busy_until[h] = tick + spawned.completes_in;
@@ -670,12 +777,20 @@ pub fn run_lifecycle_churn_spatial(s: &ColonyFormingScenario, travel: &SpatialTr
         // oscillated (the buggy non-latched re-eval thrashing) → `OscillatedNeverGathered`. A clean
         // non-oscillating travel lapse stays `LapsedInTravel`.
         if oscillations > 0 {
-            ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered }
+            ChurnOutcome::OscillatedNeverGathered {
+                generations: generation,
+                max_gathered,
+            }
         } else {
-            ChurnOutcome::LapsedInTravel { generations: generation }
+            ChurnOutcome::LapsedInTravel {
+                generations: generation,
+            }
         }
     } else {
-        ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present }
+        ChurnOutcome::ChurnedNeverDeployed {
+            generations: generation,
+            max_present,
+        }
     }
 }
 
@@ -687,7 +802,10 @@ pub enum ChurnOutcome {
     DeployedAndEngaged { generations: u32, engage_tick: u32 },
     /// The roster never released the rally gate before its lease lapsed, RE-FIELDING `generations` times —
     /// the live `GaveUp engaged_once=false in_room=false` churn (Break #1: oversized roster never completes).
-    ChurnedNeverDeployed { generations: u32, max_present: usize },
+    ChurnedNeverDeployed {
+        generations: u32,
+        max_present: usize,
+    },
     /// The squad RELEASED the gate + started traveling but the lease lapsed MID-HOP (it never arrived) —
     /// the live W7N7 1-slot travel-phase lapse (Break #2 travel half).
     LapsedInTravel { generations: u32 },
@@ -703,7 +821,10 @@ pub enum ChurnOutcome {
     /// enemy-held neighbours → `present` oscillates, and the gather is re-evaluated every tick, never
     /// latched) → it oscillated in_room<->travel and never committed the assault within the budget. Fixed by
     /// LATCHING the assault once the quorum first fires + counting in-room members as gathered.
-    OscillatedNeverGathered { generations: u32, max_gathered: usize },
+    OscillatedNeverGathered {
+        generations: u32,
+        max_gathered: usize,
+    },
     /// BUG B2 (fixed state): a Defend squad ARRIVED in its clear owned room, found no in-room focus, and
     /// GARRISONED it (lease held) for the whole budget without churning — a single stable generation. The
     /// pre-fix outcome here was repeated GaveUp+refield (`generations` climbing).
@@ -713,7 +834,11 @@ pub enum ChurnOutcome {
     /// Generation churn (`from_gen == to_gen`). `reassignments` counts how many in-place rebinds happened;
     /// `engage_tick` is when the squad finally engaged the LAST (reassigned) objective. The whole point: a
     /// freed squad reuses its invested bodies instead of retire→re-field (which would climb `generations`).
-    Reassigned { from_gen: u32, reassignments: u32, engage_tick: u32 },
+    Reassigned {
+        from_gen: u32,
+        reassignments: u32,
+        engage_tick: u32,
+    },
     /// ADR 0035 (RED — the vacuous-intel engage cascade). The squad COMMITTED to a towered room on an EMPTY
     /// commit view (classified uncontested → trickled in), REACHED it, found real towers (P(win)=LOSE), and
     /// RETREATED — but the pre-fix reconcile MIS-RESOLVED the retreat as a clean clear → withdraw (no
@@ -751,7 +876,9 @@ enum Phase {
 /// `screeps_combat_decision::lifecycle::reconcile` kernel — the same one the bot's Phase A runs — so there
 /// is no live/sim drift in the give-up-vs-keep logic.
 pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> ChurnOutcome {
-    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+    use screeps_combat_decision::lifecycle::{
+        reconcile, ReconcileAction, ReconcileSnapshot, RetireReason,
+    };
 
     let n_slots = s.composition.slots.len();
     let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
@@ -825,7 +952,15 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         // refresh signal, Break #1). A slot is in flight if a spawn is completing/syncing; it is queued if an
         // unfilled slot can still be built at an in-range home (the fielding kernel would emit it). Mirrors
         // the bot adapter's "a slot has a queued/in-flight spawn".
-        let any_queued = !fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains).is_empty();
+        let any_queued = !fielding::slots_to_spawn(
+            &s.composition,
+            &filled,
+            best_capacity,
+            s.per_member_cap,
+            s.combat_priority,
+            MoveProfile::Plains,
+        )
+        .is_empty();
         let forming_in_flight = !completing.is_empty() || !syncing.is_empty() || any_queued;
 
         // 2. Phase progression (travel → arrive → engage) once the squad has departed home. A squad in this
@@ -849,21 +984,24 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 let positions: Vec<Option<Position>> = vec![Some(dummy_home_pos()); present];
                 if rally::ready_to_depart_gate(&positions, n_slots, commit_uncontested) {
                     travel_start = tick;
-                    phase = Phase::Traveling { arrives_at: tick + target.travel_ticks };
+                    phase = Phase::Traveling {
+                        arrives_at: tick + target.travel_ticks,
+                    };
                 }
             }
             Phase::Traveling { arrives_at } => {
                 traveling = true;
                 travel_progress = true; // closing distance every tick in this model (no blockage)
-                // ── BUG B1 (engaged-en-route latch). The target room is kept VISIBLE (a HIGH OBSERVE) and has
-                // a hostile, so the proximity-free `select_focus_target` returns a focus while we are STILL
-                // traveling (in_room=false, dist>0). The bot's `decide_squad` sets `state=Engaged` from
-                // `focus.is_some()` with NO proximity gate; `apply_squad_decision` then latches
-                // `engaged_once=true`. PRE-FIX (`latch_engaged_in_room_only == false`) it latches HERE,
-                // en route, with no member in the room → the travel lease dies (`traveling` needs
-                // `!engaged_once`) → the squad FREEZES mid-hop. The FIX gates the latch on in-room presence,
-                // so a far defender with a visible target-room hostile does NOT latch + keeps its lease.
-                if target.target_visible_with_hostile_en_route && !target.latch_engaged_in_room_only {
+                                        // ── BUG B1 (engaged-en-route latch). The target room is kept VISIBLE (a HIGH OBSERVE) and has
+                                        // a hostile, so the proximity-free `select_focus_target` returns a focus while we are STILL
+                                        // traveling (in_room=false, dist>0). The bot's `decide_squad` sets `state=Engaged` from
+                                        // `focus.is_some()` with NO proximity gate; `apply_squad_decision` then latches
+                                        // `engaged_once=true`. PRE-FIX (`latch_engaged_in_room_only == false`) it latches HERE,
+                                        // en route, with no member in the room → the travel lease dies (`traveling` needs
+                                        // `!engaged_once`) → the squad FREEZES mid-hop. The FIX gates the latch on in-room presence,
+                                        // so a far defender with a visible target-room hostile does NOT latch + keeps its lease.
+                if target.target_visible_with_hostile_en_route && !target.latch_engaged_in_room_only
+                {
                     engaged_once = true; // the pre-fix unconditional latch (no in_room_any gate)
                 }
                 if tick >= arrives_at {
@@ -871,7 +1009,9 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                     // re-read (ensures `mapping.get_room` + `room_data` are populated that tick) instead of
                     // just logging IN_ROOM_NO_FOCUS and lapsing. So the focus is computable on the arrival
                     // tick — the empty-DTO window is closed by the forced re-read.
-                    phase = Phase::Arrived { dtos_clear_at: tick };
+                    phase = Phase::Arrived {
+                        dtos_clear_at: tick,
+                    };
                     let _ = target.empty_dtos_on_arrival_ticks; // the pre-fix lapse window — closed by the re-read
                 }
             }
@@ -901,7 +1041,10 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                         // NOTE: `retreated_from_contact` stays FALSE (the lose-verdict signal, NOT the
                         // Retreating state) — that is the whole point; we short-circuit to the winning
                         // terminal rather than feeding the kernel an abandon signal.
-                        return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                        return ChurnOutcome::DeployedAndEngaged {
+                            generations: generation,
+                            engage_tick: tick,
+                        };
                     } else if target.arrival_has_towers {
                         // CANNOT-WIN-ON-ARRIVAL (the W4N5 case). A member is in-room and engages, so
                         // `engaged_once` LATCHES — but the LIVE assessment over the REAL towers is
@@ -918,7 +1061,10 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                     } else {
                         // OFFENSE, clear room: once the room DTOs are readable a focus is computed and the
                         // squad ENGAGES — the deep bug is absent.
-                        return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                        return ChurnOutcome::DeployedAndEngaged {
+                            generations: generation,
+                            engage_tick: tick,
+                        };
                     }
                 }
                 // Still no focus this tick — feed the kernel `has_focus = false` so the lease behaviour
@@ -940,7 +1086,8 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         // while the Defend objective persists. (`is_defend && in_target_room && !has_focus` — the manager's
         // exact signal.) `garrison_holds` toggles whether the adapter SUPPLIES the signal (RED→GREEN); for an
         // offense squad this is always false. The shared kernel is unchanged either way.
-        let holding_station = target.garrison_holds && target.is_defend && in_target_room && !has_focus;
+        let holding_station =
+            target.garrison_holds && target.is_defend && in_target_room && !has_focus;
         let snapshot = ReconcileSnapshot {
             objective_gone: false,
             duplicate: false,
@@ -970,10 +1117,16 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         // garrison reaches the final tick still in-room (no re-field happened). Checked before reconcile so
         // the stable-hold case reports `Garrisoned` rather than running the loop to the bottom-of-fn classify.
         if holding_station && tick + 1 >= s.budget_ticks {
-            return ChurnOutcome::Garrisoned { generations: generation };
+            return ChurnOutcome::Garrisoned {
+                generations: generation,
+            };
         }
         match reconcile(snapshot) {
-            ReconcileAction::Retire { reason: RetireReason::GaveUp, mark_unwinnable, .. } => {
+            ReconcileAction::Retire {
+                reason: RetireReason::GaveUp,
+                mark_unwinnable,
+                ..
+            } => {
                 // ADR 0035 D4/D5 (GREEN — ABANDON-ON-CONTACT). The reached squad engaged a towered room it
                 // cannot win and is retreating; the kernel returned GaveUp + mark_unwinnable (NOT a clean
                 // resolve). The PRODUCER then SUPPRESSES the re-upsert via `is_unwinnable_now` (D5) — so NO
@@ -982,7 +1135,9 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 if engaged_once && in_target_room && retreated_from_contact && mark_unwinnable {
                     // The producer (re-field path) is SUPPRESSED by `is_unwinnable_now` (D5) — modeled by
                     // returning here with the generation count STABLE (no re-field within the backoff window).
-                    return ChurnOutcome::AbandonedOnContact { generations: generation };
+                    return ChurnOutcome::AbandonedOnContact {
+                        generations: generation,
+                    };
                 }
                 // RE-FIELD: drop the partial roster, orphan in-flight spawns, bump the generation, reopen
                 // the lease — the live churn loop. The new generation re-forms from scratch.
@@ -991,7 +1146,9 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                     // `engaged_once` EN ROUTE, it froze mid-travel (the travel lease needs `!engaged_once`) —
                     // report `LatchedEnRoute`. A defender that GaveUp in-room is the B2 churn (re-field).
                     if engaged_once && !in_target_room {
-                        return ChurnOutcome::LatchedEnRoute { generations: generation };
+                        return ChurnOutcome::LatchedEnRoute {
+                            generations: generation,
+                        };
                     }
                     if target.is_defend && in_target_room {
                         // BUG B2 pre-fix: the garrison gave up in-room → it RE-FIELDS (Phase C immediately
@@ -1009,8 +1166,12 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                         continue;
                     }
                     return match phase {
-                        Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival { generations: generation },
-                        _ => ChurnOutcome::LapsedInTravel { generations: generation },
+                        Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival {
+                            generations: generation,
+                        },
+                        _ => ChurnOutcome::LapsedInTravel {
+                            generations: generation,
+                        },
                     };
                 }
                 generation += 1;
@@ -1024,7 +1185,10 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 gen_start = tick; // restart the forming-budget clock for the new generation
                 continue;
             }
-            ReconcileAction::Retire { reason: RetireReason::Resolved, .. } => {
+            ReconcileAction::Retire {
+                reason: RetireReason::Resolved,
+                ..
+            } => {
                 // ADR 0035 (RED — the VACUOUS-INTEL spiral). PRE-FIX (`abandon_fixes_enabled=false`), a squad
                 // that REACHED a towered room, engaged, and is RETREATING presents to the kernel as
                 // engaged_once + in_room + focus-less with `retreated_from_contact=false` (the manager never
@@ -1039,7 +1203,9 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 if engaged_once && in_target_room && target.arrival_has_towers {
                     generation += 1;
                     if generation >= 3 {
-                        return ChurnOutcome::LapsedOnVacuousCommit { generations: generation };
+                        return ChurnOutcome::LapsedOnVacuousCommit {
+                            generations: generation,
+                        };
                     }
                     filled = vec![false; n_slots];
                     syncing.clear();
@@ -1054,24 +1220,43 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 }
                 // A genuine resolve with no commit-cascade context (shouldn't occur in this driver) ends as
                 // never-deployed.
-                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
+                return ChurnOutcome::ChurnedNeverDeployed {
+                    generations: generation,
+                    max_present,
+                };
             }
             ReconcileAction::Retire { .. } => {
                 // Any other terminal retire in this single-objective model ends the run as never-deployed.
-                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
+                return ChurnOutcome::ChurnedNeverDeployed {
+                    generations: generation,
+                    max_present,
+                };
             }
             ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
             ReconcileAction::Keep => {}
             // This driver never feeds `reassign_available=true` (reassignment is exercised by `run_v1_flow`).
-            ReconcileAction::Reassign { .. } => unreachable!("reassign_available is always false here"),
+            ReconcileAction::Reassign { .. } => {
+                unreachable!("reassign_available is always false here")
+            }
         }
         prev_present = present;
 
         // 4. Spawn step — ONLY while forming (a departed squad does not keep spawning its own slots). Same
         //    per-home head-of-line lane contest as `run_forming` (economy + the unfilled combat slots).
         if phase == Phase::Forming {
-            let combat = fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains);
-            let mut in_flight: BTreeSet<u64> = completing.iter().chain(syncing.iter()).map(|&(id, _)| id).collect();
+            let combat = fielding::slots_to_spawn(
+                &s.composition,
+                &filled,
+                best_capacity,
+                s.per_member_cap,
+                s.combat_priority,
+                MoveProfile::Plains,
+            );
+            let mut in_flight: BTreeSet<u64> = completing
+                .iter()
+                .chain(syncing.iter())
+                .map(|&(id, _)| id)
+                .collect();
             for h in 0..s.homes.len() {
                 avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
                 if tick < busy_until[h] {
@@ -1080,18 +1265,32 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 let mut queue: Vec<QueuedSpawn> = Vec::new();
                 if let Some((p, c)) = s.economy.miner {
                     if s.economy.miner_period > 0 && tick % s.economy.miner_period == 0 {
-                        queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_MINER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                        queue.push(QueuedSpawn {
+                            priority: p,
+                            body_cost: c,
+                            part_count: (c / 100).max(1),
+                            id: ECON_MINER_ID_BASE + (tick as u64) * 100 + h as u64,
+                        });
                     }
                 }
                 if let Some((p, c)) = s.economy.hauler {
-                    queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                    queue.push(QueuedSpawn {
+                        priority: p,
+                        body_cost: c,
+                        part_count: (c / 100).max(1),
+                        id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64,
+                    });
                 }
                 for cs in &combat {
                     if !in_flight.contains(&cs.id) {
                         queue.push(*cs);
                     }
                 }
-                let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+                let mut lane = HomeLanes {
+                    idle_spawns: 1,
+                    available_energy: avail[h],
+                    energy_capacity: s.homes[h].energy_capacity,
+                };
                 for spawned in spawn_step(&mut lane, &queue) {
                     avail[h] = lane.available_energy;
                     busy_until[h] = tick + spawned.completes_in;
@@ -1106,9 +1305,16 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
 
     // The budget elapsed without engaging — classify by the furthest phase reached.
     match phase {
-        Phase::Forming => ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present },
-        Phase::Traveling { .. } => ChurnOutcome::LapsedInTravel { generations: generation },
-        Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival { generations: generation },
+        Phase::Forming => ChurnOutcome::ChurnedNeverDeployed {
+            generations: generation,
+            max_present,
+        },
+        Phase::Traveling { .. } => ChurnOutcome::LapsedInTravel {
+            generations: generation,
+        },
+        Phase::Arrived { .. } => ChurnOutcome::LapsedOnArrival {
+            generations: generation,
+        },
     }
 }
 
@@ -1238,11 +1444,20 @@ impl ExtendedTravel {
 /// `Arrived` is gated on `gathered`. The reconcile DECISION is the shared `lifecycle::reconcile` kernel — no
 /// live/sim drift. Deterministic: same (scenario, travel) → same outcome (integer world-coord math, no float
 /// branch, no `HashMap`).
-pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &ExtendedTravel) -> ChurnOutcome {
-    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+pub fn run_lifecycle_churn_extended(
+    s: &ColonyFormingScenario,
+    travel: &ExtendedTravel,
+) -> ChurnOutcome {
+    use screeps_combat_decision::lifecycle::{
+        reconcile, ReconcileAction, ReconcileSnapshot, RetireReason,
+    };
 
     let n_slots = s.composition.slots.len();
-    assert_eq!(travel.homes.len(), n_slots, "one home per member slot in the extended spatial model");
+    assert_eq!(
+        travel.homes.len(),
+        n_slots,
+        "one home per member slot in the extended spatial model"
+    );
     let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
     let blocked: BTreeSet<screeps::RoomName> = travel.blocked_rooms.iter().copied().collect();
 
@@ -1267,8 +1482,8 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
     let mut member_pos: Vec<Position> = travel.homes.clone();
     let mut departed = false; // the rally gate released (solo travel begins)
     let mut gathered = false; // the gather quorum fired (assault begins)
-    // RC-4/RC-8: track the MIN-over-members room-distance (the pre-fix production signal) — used when
-    // `majority_progress` is OFF, so RED reproduces the min-pinning.
+                              // RC-4/RC-8: track the MIN-over-members room-distance (the pre-fix production signal) — used when
+                              // `majority_progress` is OFF, so RED reproduces the min-pinning.
     let mut prev_min_dist: Option<u32> = None;
     // D5: per-member previous room-distance to the rally (for the majority-closing signal).
     let mut prev_member_dist: Vec<Option<u32>> = vec![None; n_slots];
@@ -1333,11 +1548,21 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
         max_present = max_present.max(present);
         let has_members = present > 0 || !completing.is_empty() || !syncing.is_empty();
 
-        let any_queued =
-            !fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains).is_empty();
+        let any_queued = !fielding::slots_to_spawn(
+            &s.composition,
+            &filled,
+            best_capacity,
+            s.per_member_cap,
+            s.combat_priority,
+            MoveProfile::Plains,
+        )
+        .is_empty();
         let forming_in_flight = !completing.is_empty() || !syncing.is_empty() || any_queued;
 
-        let present_positions: Vec<Position> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+        let present_positions: Vec<Position> = (0..n_slots)
+            .filter(|&i| filled[i])
+            .map(|i| member_pos[i])
+            .collect();
 
         let mut in_target_room = false;
         let mut traveling = false;
@@ -1359,22 +1584,33 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
             // escalation does NOT move this rally — it drops a persistently-blocked member from the gather
             // quorum below, so the reachable subset masses at this same rally instead.
             let present_opts = ExtendedTravel::pos_options(&present_positions);
-            let rally =
-                screeps_combat_decision::rally::shared_rally_point_for_members(&present_opts, travel.target, travel.uncontested);
+            let rally = screeps_combat_decision::rally::shared_rally_point_for_members(
+                &present_opts,
+                travel.target,
+                travel.uncontested,
+            );
 
             // GATHER DECISION (item (d)): the unified kernel over the CURRENT positions; FIX-A also counts an
             // in-target-room member as gathered.
-            let pre_step: Vec<Position> = (0..n_slots).filter(|&i| filled[i]).map(|i| member_pos[i]).collect();
+            let pre_step: Vec<Position> = (0..n_slots)
+                .filter(|&i| filled[i])
+                .map(|i| member_pos[i])
+                .collect();
             let has_fighter = !pre_step.is_empty();
             let target_room = travel.target.room_name();
-            let in_room_count = (0..n_slots).filter(|&i| filled[i] && member_pos[i].room_name() == target_room).count();
+            let in_room_count = (0..n_slots)
+                .filter(|&i| filled[i] && member_pos[i].room_name() == target_room)
+                .count();
             // D4 RE-ASSESS: a member RE-ASSESSED OUT (`excluded`, persistently blocked from the rally) is
             // dropped from the gather denominator — the manager proceeds with the REACHABLE subset rather
             // than waiting forever on the unreachable one. `effective_slots` = the roster minus the excluded
             // (and the gather positions exclude them too), so the contested quorum can fire over who can mass.
             let excluded_count = excluded.iter().filter(|e| **e).count();
             let effective_slots = n_slots.saturating_sub(excluded_count);
-            let reachable: Vec<Position> = (0..n_slots).filter(|&i| filled[i] && !excluded[i]).map(|i| member_pos[i]).collect();
+            let reachable: Vec<Position> = (0..n_slots)
+                .filter(|&i| filled[i] && !excluded[i])
+                .map(|i| member_pos[i])
+                .collect();
             let quorum_now = rally::gather_quorum_met(
                 &ExtendedTravel::pos_options(&reachable),
                 rally,
@@ -1383,7 +1619,11 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 has_fighter,
                 rally::RALLY_GATHER_RADIUS,
             ) || (in_room_count > 0 && has_fighter);
-            let gathered_now = rally::members_gathered_at(&ExtendedTravel::pos_options(&pre_step), rally, rally::RALLY_GATHER_RADIUS);
+            let gathered_now = rally::members_gathered_at(
+                &ExtendedTravel::pos_options(&pre_step),
+                rally,
+                rally::RALLY_GATHER_RADIUS,
+            );
             max_gathered = max_gathered.max(gathered_now);
             // FIX-A LATCH: commit the assault on the FIRST quorum.
             gathered |= quorum_now;
@@ -1425,9 +1665,15 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 }
                 in_target_room = arrived_fit;
                 if in_target_room {
-                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                    return ChurnOutcome::DeployedAndEngaged {
+                        generations: generation,
+                        engage_tick: tick,
+                    };
                 }
-                let cur = (0..n_slots).filter(|&i| filled[i]).map(|i| ExtendedTravel::room_dist(member_pos[i], travel.target)).min();
+                let cur = (0..n_slots)
+                    .filter(|&i| filled[i])
+                    .map(|i| ExtendedTravel::room_dist(member_pos[i], travel.target))
+                    .min();
                 travel_progress = match (cur, prev_min_dist) {
                     (Some(c), Some(p)) => c < p,
                     (Some(_), None) => true,
@@ -1492,7 +1738,13 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 // RC-4/RC-8 — TRAVEL-PROGRESS signal. Per-member distances to the RALLY (excluded members
                 // are out of the signal — the squad no longer waits on them).
                 let dists: Vec<Option<u32>> = (0..n_slots)
-                    .map(|i| if filled[i] && !excluded[i] { Some(ExtendedTravel::room_dist(member_pos[i], rally)) } else { None })
+                    .map(|i| {
+                        if filled[i] && !excluded[i] {
+                            Some(ExtendedTravel::room_dist(member_pos[i], rally))
+                        } else {
+                            None
+                        }
+                    })
                     .collect();
                 if travel.majority_progress {
                     // D5: refresh the lease while a MAJORITY of present members are MAKING PROGRESS — either
@@ -1539,7 +1791,8 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 // member sits, the contested quorum never fires, and the squad lapses at the budget (RED).
                 if travel.escalate_on_block && travel.tight_stall_window {
                     for i in 0..n_slots {
-                        if filled[i] && !excluded[i] && block_streak[i] >= SOLO_TRAVEL_STALL_WINDOW {
+                        if filled[i] && !excluded[i] && block_streak[i] >= SOLO_TRAVEL_STALL_WINDOW
+                        {
                             excluded[i] = true;
                         }
                     }
@@ -1575,7 +1828,9 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
             };
             // One renew per home spawn lane per tick (the bounded, no-monopolization model). Lowest-TTL first
             // (the most urgent member), deterministic (slot order tie-break, no `HashMap`).
-            let free_lanes = (0..s.homes.len()).filter(|&h| tick >= busy_until[h]).count();
+            let free_lanes = (0..s.homes.len())
+                .filter(|&h| tick >= busy_until[h])
+                .count();
             let mut order: Vec<usize> = (0..n_slots).filter(|&i| renewable(i)).collect();
             order.sort_by_key(|&i| (ttl[i], i));
             for &i in order.iter().take(free_lanes) {
@@ -1612,12 +1867,20 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
         };
         match reconcile(snapshot) {
-            ReconcileAction::Retire { reason: RetireReason::GaveUp, .. } => {
+            ReconcileAction::Retire {
+                reason: RetireReason::GaveUp,
+                ..
+            } => {
                 if departed {
                     if oscillations > 0 {
-                        return ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered };
+                        return ChurnOutcome::OscillatedNeverGathered {
+                            generations: generation,
+                            max_gathered,
+                        };
                     }
-                    return ChurnOutcome::LapsedInTravel { generations: generation };
+                    return ChurnOutcome::LapsedInTravel {
+                        generations: generation,
+                    };
                 }
                 generation += 1;
                 filled = vec![false; n_slots];
@@ -1639,18 +1902,34 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 continue;
             }
             ReconcileAction::Retire { .. } => {
-                return ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present };
+                return ChurnOutcome::ChurnedNeverDeployed {
+                    generations: generation,
+                    max_present,
+                };
             }
             ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
             ReconcileAction::Keep => {}
-            ReconcileAction::Reassign { .. } => unreachable!("reassign_available is always false here"),
+            ReconcileAction::Reassign { .. } => {
+                unreachable!("reassign_available is always false here")
+            }
         }
         prev_present = present;
 
         // Spawn step (only while forming).
         if !departed {
-            let combat = fielding::slots_to_spawn(&s.composition, &filled, best_capacity, s.per_member_cap, s.combat_priority, MoveProfile::Plains);
-            let mut in_flight: BTreeSet<u64> = completing.iter().chain(syncing.iter()).map(|&(id, _)| id).collect();
+            let combat = fielding::slots_to_spawn(
+                &s.composition,
+                &filled,
+                best_capacity,
+                s.per_member_cap,
+                s.combat_priority,
+                MoveProfile::Plains,
+            );
+            let mut in_flight: BTreeSet<u64> = completing
+                .iter()
+                .chain(syncing.iter())
+                .map(|&(id, _)| id)
+                .collect();
             for h in 0..s.homes.len() {
                 avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
                 if tick < busy_until[h] {
@@ -1658,14 +1937,23 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
                 }
                 let mut queue: Vec<QueuedSpawn> = Vec::new();
                 if let Some((p, c)) = s.economy.hauler {
-                    queue.push(QueuedSpawn { priority: p, body_cost: c, part_count: (c / 100).max(1), id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64 });
+                    queue.push(QueuedSpawn {
+                        priority: p,
+                        body_cost: c,
+                        part_count: (c / 100).max(1),
+                        id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64,
+                    });
                 }
                 for cs in &combat {
                     if !in_flight.contains(&cs.id) {
                         queue.push(*cs);
                     }
                 }
-                let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+                let mut lane = HomeLanes {
+                    idle_spawns: 1,
+                    available_energy: avail[h],
+                    energy_capacity: s.homes[h].energy_capacity,
+                };
                 for spawned in spawn_step(&mut lane, &queue) {
                     avail[h] = lane.available_energy;
                     busy_until[h] = tick + spawned.completes_in;
@@ -1680,12 +1968,20 @@ pub fn run_lifecycle_churn_extended(s: &ColonyFormingScenario, travel: &Extended
 
     if departed {
         if oscillations > 0 {
-            ChurnOutcome::OscillatedNeverGathered { generations: generation, max_gathered }
+            ChurnOutcome::OscillatedNeverGathered {
+                generations: generation,
+                max_gathered,
+            }
         } else {
-            ChurnOutcome::LapsedInTravel { generations: generation }
+            ChurnOutcome::LapsedInTravel {
+                generations: generation,
+            }
         }
     } else {
-        ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present }
+        ChurnOutcome::ChurnedNeverDeployed {
+            generations: generation,
+            max_present,
+        }
     }
 }
 
@@ -1745,7 +2041,13 @@ impl V1Queue {
         } else {
             let id = self.next_id;
             self.next_id += 1;
-            self.objectives.push(V1Objective { id, room, priority, expires_at, claimed: false });
+            self.objectives.push(V1Objective {
+                id,
+                room,
+                priority,
+                expires_at,
+                claimed: false,
+            });
             id
         }
     }
@@ -1836,12 +2138,19 @@ enum V1Phase {
 /// acceptance result; the pre-reassign control churns (`ChurnedNeverDeployed`/`LapsedInTravel` with climbing
 /// generations) because the stale objective vanishes underneath the squad and it re-fields from scratch.
 pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
-    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+    use screeps_combat_decision::lifecycle::{
+        reconcile, ReconcileAction, ReconcileSnapshot, RetireReason,
+    };
     use screeps_combat_decision::war_decision::{
-        emit_defense, neighbour_threats, observe_neighbours, DefensePolicy, OwnedRoom, RawObservation, Threat,
+        emit_defense, neighbour_threats, observe_neighbours, DefensePolicy, OwnedRoom,
+        RawObservation, Threat,
     };
 
-    let owned: Vec<OwnedRoom<V1Room>> = s.owned.iter().map(|&(r, v)| OwnedRoom { room: r, value: v }).collect();
+    let owned: Vec<OwnedRoom<V1Room>> = s
+        .owned
+        .iter()
+        .map(|&(r, v)| OwnedRoom { room: r, value: v })
+        .collect();
     let policy = DefensePolicy::default();
 
     let mut queue = V1Queue::default();
@@ -1878,19 +2187,33 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             // OWNED-ROOM threats (emit_defense directly): the threat is in an owned room this scan.
             let owned_threats: Vec<Threat<V1Room>> = threat_room
                 .filter(|r| owned_set.contains(r))
-                .map(|r| vec![Threat { room: r, danger: 30.0, tower_danger: 0.0 }])
+                .map(|r| {
+                    vec![Threat {
+                        room: r,
+                        danger: 30.0,
+                        tower_danger: 0.0,
+                    }]
+                })
                 .into_iter()
                 .flatten()
                 .collect();
 
             // NEIGHBOUR observation (the lifted P0 chain): build a synthetic RawObservation for the threat's
             // room (visible, non-owned, an armed Attack body) and run observe_neighbours → neighbour_threats.
-            let bodies: Vec<Vec<screeps::Part>> = vec![vec![screeps::Part::Attack, screeps::Part::Move]];
+            let bodies: Vec<Vec<screeps::Part>> =
+                vec![vec![screeps::Part::Attack, screeps::Part::Move]];
             let neighbour_obs: Vec<RawObservation<V1Room>> = threat_room
                 .filter(|r| !owned_set.contains(r))
                 .map(|r| {
                     let nearest = owned_set.iter().map(|&o| v1_dist(o, r)).min();
-                    vec![RawObservation { room: r, hostile_bodies: &bodies, visible: true, is_owned: false, nearest_owned_dist: nearest, tower_danger: 0.0 }]
+                    vec![RawObservation {
+                        room: r,
+                        hostile_bodies: &bodies,
+                        visible: true,
+                        is_owned: false,
+                        nearest_owned_dist: nearest,
+                        tower_danger: 0.0,
+                    }]
                 })
                 .into_iter()
                 .flatten()
@@ -1899,7 +2222,8 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             let neighbour_threats = neighbour_threats(&owned, &observed, policy, v1_dist);
 
             // Feed the owned-room threats AND the neighbour threats to the one proven emission kernel.
-            let threats: Vec<Threat<V1Room>> = owned_threats.into_iter().chain(neighbour_threats).collect();
+            let threats: Vec<Threat<V1Room>> =
+                owned_threats.into_iter().chain(neighbour_threats).collect();
             // PURE defense emission: Secure at the threat's current room (boost + leash applied in-kernel).
             for emission in emit_defense(&owned, &threats, policy, v1_dist) {
                 queue.request(emission.room, emission.priority, tick, s.objective_ttl);
@@ -1945,7 +2269,11 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             match phase {
                 V1Phase::Forming => {
                     if tick >= form_done_at {
-                        phase = if pos == target { V1Phase::InRoom } else { V1Phase::Traveling };
+                        phase = if pos == target {
+                            V1Phase::InRoom
+                        } else {
+                            V1Phase::Traveling
+                        };
                         travel_start = tick;
                     }
                 }
@@ -1953,7 +2281,10 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
                     traveling = true;
                     // Step one room toward the target.
                     let before = v1_dist(pos, target);
-                    pos = (pos.0 + (target.0 - pos.0).signum(), pos.1 + (target.1 - pos.1).signum());
+                    pos = (
+                        pos.0 + (target.0 - pos.0).signum(),
+                        pos.1 + (target.1 - pos.1).signum(),
+                    );
                     let after = v1_dist(pos, target);
                     travel_progress = after < before;
                     prev_dist = Some(after);
@@ -1976,7 +2307,8 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
         //    objective exists for this squad to take over (best_unclaimed excluding the current id). The
         //    capability gate is trivially satisfied here (all v1 objectives are the same broad Secure/Defend
         //    class). Gated on the scenario toggle so the pre-reassign control reproduces the churn. ──
-        let reassign_available = s.reassign_enabled && queue.best_unclaimed_excluding(cur_id).is_some();
+        let reassign_available =
+            s.reassign_enabled && queue.best_unclaimed_excluding(cur_id).is_some();
 
         // ── RECONCILE (the shared kernel) — the SAME give-up/keep/reassign logic the bot Phase A runs. ──
         let has_members = true; // single fielded member, always present after forming in this driver
@@ -2012,7 +2344,9 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             ReconcileAction::Reassign { withdraw_old } => {
                 // ── IN-PLACE REBIND (no Generation churn): release/withdraw the old claim → claim the new
                 //    → reset engaged_once/state/travel clocks → reopen the lease. Bodies reused. ──
-                let new_id = queue.best_unclaimed_excluding(cur_id).expect("reassign_available implies a sibling");
+                let new_id = queue
+                    .best_unclaimed_excluding(cur_id)
+                    .expect("reassign_available implies a sibling");
                 queue.release(cur_id);
                 if withdraw_old {
                     queue.withdraw(cur_id);
@@ -2029,7 +2363,9 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
                 // NB: `generation` is NOT bumped — that is the whole point (reuse, not re-field).
                 continue;
             }
-            ReconcileAction::Retire { reason, withdraw, .. } => {
+            ReconcileAction::Retire {
+                reason, withdraw, ..
+            } => {
                 if withdraw {
                     queue.withdraw(cur_id);
                 } else {
@@ -2039,7 +2375,11 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
                 // engaged (it reached + cleared at least one objective). Otherwise this is the pre-reassign
                 // churn: re-field a fresh generation (bump the counter) and try to re-claim next tick.
                 if reason == RetireReason::Resolved && reassignments > 0 {
-                    return ChurnOutcome::Reassigned { from_gen: generation, reassignments, engage_tick: tick };
+                    return ChurnOutcome::Reassigned {
+                        from_gen: generation,
+                        reassignments,
+                        engage_tick: tick,
+                    };
                 }
                 generation += 1;
                 claimed_id = None;
@@ -2056,18 +2396,31 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
         // ── ACCEPTANCE: the squad has REASSIGNED at least once AND is now engaging the new objective in its
         //    room (it followed the threat to the neighbour, reusing its bodies — no Generation churn). ──
         if reassignments > 0 && in_target_room && engaged_once && has_focus {
-            return ChurnOutcome::Reassigned { from_gen: generation, reassignments, engage_tick: tick };
+            return ChurnOutcome::Reassigned {
+                from_gen: generation,
+                reassignments,
+                engage_tick: tick,
+            };
         }
     }
 
     // Budget elapsed. If the squad reassigned but the run ended mid-flight, still report the reuse (no
     // churn) — `from_gen == 0` is the proof the bodies were reused. Otherwise classify the churn.
     if reassignments > 0 {
-        ChurnOutcome::Reassigned { from_gen: generation, reassignments, engage_tick: s.budget_ticks }
+        ChurnOutcome::Reassigned {
+            from_gen: generation,
+            reassignments,
+            engage_tick: s.budget_ticks,
+        }
     } else if phase == V1Phase::Forming {
-        ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present: 0 }
+        ChurnOutcome::ChurnedNeverDeployed {
+            generations: generation,
+            max_present: 0,
+        }
     } else {
-        ChurnOutcome::LapsedInTravel { generations: generation }
+        ChurnOutcome::LapsedInTravel {
+            generations: generation,
+        }
     }
 }
 
@@ -2128,7 +2481,11 @@ pub struct OffenseFlowScenario {
 /// doctrine (`honor_verdict`) commits ONLY when `optimize_composition` returns a comp (EV-positive +
 /// winnable); an always-field doctrine commits regardless. Returns `(priority, member_count)` for the
 /// objective when fielded. Deterministic (the decision crate's optimizer is bit-deterministic).
-fn offense_candidate_to_objective(c: &OffenseCandidate, member_energy: u32, onsite_window: u32) -> Option<f32> {
+fn offense_candidate_to_objective(
+    c: &OffenseCandidate,
+    member_energy: u32,
+    onsite_window: u32,
+) -> Option<f32> {
     use screeps_combat_decision::composition::{optimize_composition, CompositionParams};
     use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination};
 
@@ -2153,7 +2510,10 @@ fn offense_candidate_to_objective(c: &OffenseCandidate, member_energy: u32, onsi
         0.0,
         c.honor_verdict,
         false, // not confirmed-undefended (these gate beds have no scouted defender creeps)
-        &CompositionParams { member_energy, ..Default::default() },
+        &CompositionParams {
+            member_energy,
+            ..Default::default()
+        },
     );
     comp.map(|_| priority)
 }
@@ -2187,7 +2547,9 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
         //    and upsert the surviving objectives. A gated, hopeless candidate yields nothing (deferred). ──
         if tick % s.scan_period == 0 {
             for c in &s.candidates {
-                if let Some(priority) = offense_candidate_to_objective(c, s.member_energy, s.onsite_window) {
+                if let Some(priority) =
+                    offense_candidate_to_objective(c, s.member_energy, s.onsite_window)
+                {
                     queue.request(c.room, priority, tick, s.objective_ttl);
                     emitted_any = true;
                 }
@@ -2227,14 +2589,21 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             match phase {
                 V1Phase::Forming => {
                     if tick >= form_done_at {
-                        phase = if pos == target { V1Phase::InRoom } else { V1Phase::Traveling };
+                        phase = if pos == target {
+                            V1Phase::InRoom
+                        } else {
+                            V1Phase::Traveling
+                        };
                         travel_start = tick;
                     }
                 }
                 V1Phase::Traveling => {
                     traveling = true;
                     let before = v1_dist(pos, target);
-                    pos = (pos.0 + (target.0 - pos.0).signum(), pos.1 + (target.1 - pos.1).signum());
+                    pos = (
+                        pos.0 + (target.0 - pos.0).signum(),
+                        pos.1 + (target.1 - pos.1).signum(),
+                    );
                     travel_progress = v1_dist(pos, target) < before;
                     if pos == target {
                         phase = V1Phase::InRoom;
@@ -2242,7 +2611,10 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
                 }
                 V1Phase::InRoom => {
                     // Arrived + engaging the offense target — the production layer drove a squad to the kill.
-                    return ChurnOutcome::DeployedAndEngaged { generations: generation, engage_tick: tick };
+                    return ChurnOutcome::DeployedAndEngaged {
+                        generations: generation,
+                        engage_tick: tick,
+                    };
                 }
             }
         }
@@ -2271,7 +2643,9 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
         };
         match reconcile(snapshot) {
-            ReconcileAction::Retire { reason, withdraw, .. } => {
+            ReconcileAction::Retire {
+                reason, withdraw, ..
+            } => {
                 if withdraw {
                     queue.withdraw(cur_id);
                 } else {
@@ -2286,13 +2660,18 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             }
             ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
             ReconcileAction::Keep => {}
-            ReconcileAction::Reassign { .. } => unreachable!("offense flow never feeds reassign_available=true"),
+            ReconcileAction::Reassign { .. } => {
+                unreachable!("offense flow never feeds reassign_available=true")
+            }
         }
     }
 
     // Budget elapsed. If nothing was ever emitted, EVERY candidate was gated out (the deferred-hopeless case).
     let _ = emitted_any;
-    ChurnOutcome::ChurnedNeverDeployed { generations: generation, max_present: 0 }
+    ChurnOutcome::ChurnedNeverDeployed {
+        generations: generation,
+        max_present: 0,
+    }
 }
 
 // ═══ ADR 0027 v1.1 P2 — the DECLAIM flow (sim-first) ═════════════════════════════════════════════════════
@@ -2335,10 +2714,16 @@ pub enum DeclaimOutcome {
     /// The declaimer formed, traveled, arrived, and STRUCK the controller across `cadence_cycles` cadence
     /// cycles WITHOUT ever giving up, until the controller went neutral and the producer withdrew the
     /// objective — the squad retired cleanly (`generations == 0`: no re-field churn). The P2 success path.
-    Neutralized { cadence_cycles: u32, neutralized_tick: u32 },
+    Neutralized {
+        cadence_cycles: u32,
+        neutralized_tick: u32,
+    },
     /// The declaimer gave up mid-neutralization (the lease lapsed between strikes and was NOT held) → it was
     /// re-fielded. `generations` counts the churn. The pre-`declaiming`-fix failure.
-    GaveUpMidNeutralization { generations: u32, strikes_landed: u32 },
+    GaveUpMidNeutralization {
+        generations: u32,
+        strikes_landed: u32,
+    },
     /// The declaimer never reached the controller within the budget (a travel/form stall — not the P2 concern,
     /// but reported for completeness).
     NeverReached { generations: u32 },
@@ -2351,7 +2736,9 @@ pub enum DeclaimOutcome {
 /// churn) on the success path. The reconcile is the SHARED `lifecycle::reconcile` kernel — the same Phase-A
 /// logic the bot runs — so the persistence-across-cadence behavior cannot drift between sim and live.
 pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
-    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+    use screeps_combat_decision::lifecycle::{
+        reconcile, ReconcileAction, ReconcileSnapshot, RetireReason,
+    };
 
     let mut queue = V1Queue::default();
     let mut generation: u32 = 0;
@@ -2377,8 +2764,18 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
         //    corridor is open (ReachableNow). Once the controller goes neutral, the producer STOPS emitting +
         //    WITHDRAWS — the `objective_gone` terminal that retires the declaimer cleanly. ──
         if !controller_neutral {
-            queue.request(s.controller_room, 25.0 /* LOW */, tick, s.objective_ttl);
-        } else if let Some(id) = queue.objectives.iter().find(|o| o.room == s.controller_room).map(|o| o.id) {
+            queue.request(
+                s.controller_room,
+                25.0, /* LOW */
+                tick,
+                s.objective_ttl,
+            );
+        } else if let Some(id) = queue
+            .objectives
+            .iter()
+            .find(|o| o.room == s.controller_room)
+            .map(|o| o.id)
+        {
             queue.withdraw(id); // controller neutral → withdraw (the de-claim is done)
         }
         queue.expire(tick);
@@ -2399,7 +2796,10 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
         let Some(cur_id) = claimed_id else {
             if controller_neutral {
                 // The controller is neutral AND the squad has retired (no claim) — the success terminal.
-                return DeclaimOutcome::Neutralized { cadence_cycles, neutralized_tick: tick };
+                return DeclaimOutcome::Neutralized {
+                    cadence_cycles,
+                    neutralized_tick: tick,
+                };
             }
             continue;
         };
@@ -2415,14 +2815,21 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             match phase {
                 V1Phase::Forming => {
                     if tick >= form_done_at {
-                        phase = if pos == target { V1Phase::InRoom } else { V1Phase::Traveling };
+                        phase = if pos == target {
+                            V1Phase::InRoom
+                        } else {
+                            V1Phase::Traveling
+                        };
                         travel_start = tick;
                     }
                 }
                 V1Phase::Traveling => {
                     traveling = true;
                     let before = v1_dist(pos, target);
-                    pos = (pos.0 + (target.0 - pos.0).signum(), pos.1 + (target.1 - pos.1).signum());
+                    pos = (
+                        pos.0 + (target.0 - pos.0).signum(),
+                        pos.1 + (target.1 - pos.1).signum(),
+                    );
                     travel_progress = v1_dist(pos, target) < before;
                     if pos == target {
                         phase = V1Phase::InRoom;
@@ -2457,7 +2864,7 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             is_defend: false,
             deadline_lapsed: tick >= deadline,
             wiped: false,
-            has_focus: false,   // a quiet derelict room — a declaimer never has a combat focus
+            has_focus: false, // a quiet derelict room — a declaimer never has a combat focus
             engaged_once: false, // a declaimer never enters combat
             in_target_room,
             has_members: true,
@@ -2474,14 +2881,22 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by the declaim flow
         };
         match reconcile(snapshot) {
-            ReconcileAction::Retire { reason, withdraw, .. } => {
+            ReconcileAction::Retire {
+                reason, withdraw, ..
+            } => {
                 // The ONLY clean terminal for a declaimer is ObjectiveGone (the producer withdrew on neutral).
                 // A GaveUp here is the pre-fix failure: the lease lapsed mid-cadence and was NOT held.
                 if reason == RetireReason::ObjectiveGone && controller_neutral {
-                    return DeclaimOutcome::Neutralized { cadence_cycles, neutralized_tick: tick };
+                    return DeclaimOutcome::Neutralized {
+                        cadence_cycles,
+                        neutralized_tick: tick,
+                    };
                 }
                 if reason == RetireReason::GaveUp {
-                    return DeclaimOutcome::GaveUpMidNeutralization { generations: generation, strikes_landed };
+                    return DeclaimOutcome::GaveUpMidNeutralization {
+                        generations: generation,
+                        strikes_landed,
+                    };
                 }
                 let _ = withdraw;
                 if withdraw {
@@ -2495,12 +2910,16 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             }
             ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
             ReconcileAction::Keep => {}
-            ReconcileAction::Reassign { .. } => unreachable!("declaim flow never feeds reassign_available=true"),
+            ReconcileAction::Reassign { .. } => {
+                unreachable!("declaim flow never feeds reassign_available=true")
+            }
         }
     }
 
     // Budget elapsed without neutralizing → never reached / never finished.
-    DeclaimOutcome::NeverReached { generations: generation }
+    DeclaimOutcome::NeverReached {
+        generations: generation,
+    }
 }
 
 // ═══ ADR 0032 v1.2 — run_auction_flow: the GLOBAL Hungarian matching flow (extends run_v1_flow to N
@@ -2567,7 +2986,11 @@ fn auction_matrix(s: &AuctionFlowScenario) -> screeps_combat_decision::assignmen
         .squads
         .iter()
         .map(|sq| SquadRow {
-            caps: SquadCapabilities { heal_per_tick: sq.heal, structure_dps: sq.structure_dps, tank_effective_hp: 2000 },
+            caps: SquadCapabilities {
+                heal_per_tick: sq.heal,
+                structure_dps: sq.structure_dps,
+                tank_effective_hp: 2000,
+            },
             class: CapClass::Offense,
             current_objective: sq.current_objective,
             recycle_ev: 0,
@@ -2583,11 +3006,18 @@ fn auction_matrix(s: &AuctionFlowScenario) -> screeps_combat_decision::assignmen
             class: CapClass::Offense,
             value_kind: ObjectiveValueKind::Denial,
             // Denial value_e = denial_value × 0.5; pass 2× so value_e == o.value.
-            intel: ObjectiveIntel { denial_value: o.value * 2.0, ..Default::default() },
+            intel: ObjectiveIntel {
+                denial_value: o.value * 2.0,
+                ..Default::default()
+            },
             defense: Default::default(),
             enemy: None,
             travel_rooms_per_row: vec![0; n_rows],
-            feasible_per_row: if o.feasible_per_row.is_empty() { vec![true; n_rows] } else { o.feasible_per_row.clone() },
+            feasible_per_row: if o.feasible_per_row.is_empty() {
+                vec![true; n_rows]
+            } else {
+                o.feasible_per_row.clone()
+            },
         })
         .collect();
     build_ev_matrix(&rows, &cells, &MatrixParams::default())
@@ -2625,7 +3055,10 @@ fn auction_greedy(matrix: &screeps_combat_decision::assignment::EvMatrix) -> Auc
             total += ev;
         }
     }
-    AuctionOutcome { total_ev: total, picks }
+    AuctionOutcome {
+        total_ev: total,
+        picks,
+    }
 }
 
 /// Drive the multi-squad ASSIGNMENT flow (ADR 0032 v1.2): build the shared EV matrix, then select via the
@@ -2648,7 +3081,10 @@ pub fn run_auction_flow(s: &AuctionFlowScenario) -> AuctionOutcome {
             })
         })
         .collect();
-    AuctionOutcome { total_ev: sol.total_ev, picks }
+    AuctionOutcome {
+        total_ev: sol.total_ev,
+        picks,
+    }
 }
 
 // ═══ ADR 0032 v2 / ADR 0027 — run_merge_flow: the MERGE/transfer pending-slot primitive (kernel + model) ══
@@ -2697,10 +3133,16 @@ pub struct MergeSquad {
 
 impl MergeSquad {
     fn open_slot_roles(&self) -> u8 {
-        self.slots.iter().filter(|s| !s.filled).fold(0u8, |acc, s| acc | role_bit(s.role))
+        self.slots
+            .iter()
+            .filter(|s| !s.filled)
+            .fold(0u8, |acc, s| acc | role_bit(s.role))
     }
     fn sheddable_roles(&self) -> u8 {
-        self.slots.iter().filter(|s| s.filled).fold(0u8, |acc, s| acc | role_bit(s.role))
+        self.slots
+            .iter()
+            .filter(|s| s.filled)
+            .fold(0u8, |acc, s| acc | role_bit(s.role))
     }
     fn present_count(&self) -> usize {
         self.slots.iter().filter(|s| s.filled).count()
@@ -2744,15 +3186,27 @@ pub struct MergeOutcome {
 
 fn merge_squad_row(sq: &MergeSquad) -> SquadRow {
     SquadRow {
-        caps: SquadCapabilities { heal_per_tick: sq.heal, structure_dps: sq.structure_dps, tank_effective_hp: 2000 },
+        caps: SquadCapabilities {
+            heal_per_tick: sq.heal,
+            structure_dps: sq.structure_dps,
+            tank_effective_hp: 2000,
+        },
         class: CapClass::Offense,
         current_objective: Some(sq.current_objective),
         recycle_ev: 0,
         merge_eligible: sq.merge_eligible,
-        sheddable: SquadCapabilities { heal_per_tick: sq.sheddable_heal, structure_dps: sq.sheddable_dps, tank_effective_hp: 2000 },
+        sheddable: SquadCapabilities {
+            heal_per_tick: sq.sheddable_heal,
+            structure_dps: sq.sheddable_dps,
+            tank_effective_hp: 2000,
+        },
         sheddable_roles: sq.sheddable_roles(),
         // A receiver offers its open pending slots (a squad with present members AND open slots is forming).
-        open_slot_roles: if sq.present_count() > 0 && sq.open_count() > 0 { sq.open_slot_roles() } else { 0 },
+        open_slot_roles: if sq.present_count() > 0 && sq.open_count() > 0 {
+            sq.open_slot_roles()
+        } else {
+            0
+        },
     }
 }
 
@@ -2763,15 +3217,28 @@ fn merge_objective_cell(s: &MergeFlowScenario, id: u32, n_rows: usize) -> Object
     let tower_range = s.objective_tower_range.get(i).copied().unwrap_or(0);
     let required = s.objective_required_hits.get(i).copied().unwrap_or(0);
     let defense = if tower_range > 0 {
-        DefenseProfile { objective_hits: required, towers: vec![TowerThreat { range_to_assault: tower_range, energy: 1000 }], ..Default::default() }
+        DefenseProfile {
+            objective_hits: required,
+            towers: vec![TowerThreat {
+                range_to_assault: tower_range,
+                energy: 1000,
+            }],
+            ..Default::default()
+        }
     } else {
-        DefenseProfile { objective_hits: required, ..Default::default() }
+        DefenseProfile {
+            objective_hits: required,
+            ..Default::default()
+        }
     };
     ObjectiveCell {
         id,
         class: CapClass::Offense,
         value_kind: ObjectiveValueKind::Denial,
-        intel: ObjectiveIntel { denial_value: value * 2.0, ..Default::default() },
+        intel: ObjectiveIntel {
+            denial_value: value * 2.0,
+            ..Default::default()
+        },
         defense,
         enemy: None,
         travel_rooms_per_row: vec![0; n_rows],
@@ -2793,13 +3260,21 @@ pub fn run_merge_flow(s: &MergeFlowScenario) -> MergeOutcome {
     let mut objective_ids: Vec<u32> = s.squads.iter().map(|sq| sq.current_objective).collect();
     objective_ids.sort_unstable();
     objective_ids.dedup();
-    let cells: Vec<ObjectiveCell> = objective_ids.iter().map(|&id| merge_objective_cell(s, id, n)).collect();
+    let cells: Vec<ObjectiveCell> = objective_ids
+        .iter()
+        .map(|&id| merge_objective_cell(s, id, n))
+        .collect();
 
     // RED control: zero out every receiver's open_slot_roles so NO merge column is built (merge disabled).
     let rows = if s.merge_enabled {
         rows
     } else {
-        rows.into_iter().map(|mut r| { r.open_slot_roles = 0; r }).collect()
+        rows.into_iter()
+            .map(|mut r| {
+                r.open_slot_roles = 0;
+                r
+            })
+            .collect()
     };
 
     let matrix = build_ev_matrix_with_merge(&rows, &cells, &[], &MatrixParams::default());
@@ -2829,7 +3304,9 @@ pub fn run_merge_flow(s: &MergeFlowScenario) -> MergeOutcome {
             let open_idxs: Vec<usize> = slots[receiver_row]
                 .iter()
                 .enumerate()
-                .filter_map(|(i, sl)| (!sl.filled && (role_bit(sl.role) & shed_roles) != 0).then_some(i))
+                .filter_map(|(i, sl)| {
+                    (!sl.filled && (role_bit(sl.role) & shed_roles) != 0).then_some(i)
+                })
                 .collect();
             for oi in open_idxs {
                 let want = slots[receiver_row][oi].role;
@@ -2854,9 +3331,18 @@ pub fn run_merge_flow(s: &MergeFlowScenario) -> MergeOutcome {
 
     let slot_counts: Vec<(usize, usize)> = slots
         .iter()
-        .map(|sl| (sl.iter().filter(|s| s.filled).count(), sl.iter().filter(|s| !s.filled).count()))
+        .map(|sl| {
+            (
+                sl.iter().filter(|s| s.filled).count(),
+                sl.iter().filter(|s| !s.filled).count(),
+            )
+        })
         .collect();
-    MergeOutcome { retired, slots: slot_counts, merge }
+    MergeOutcome {
+        retired,
+        slots: slot_counts,
+        merge,
+    }
 }
 
 /// The end-to-end lifecycle outcome: did the colony FORM the roster, and did that roster KILL the core
@@ -2891,7 +3377,9 @@ pub fn run_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
     // 1. Forming. If the roster never completes, nothing departs — there is nothing to engage.
     let form_ticks = match run_forming(s) {
         FormingOutcome::Completed { ticks } => ticks,
-        FormingOutcome::Stalled { filled, of } => return LifecycleOutcome::NeverFormed { filled, of },
+        FormingOutcome::Stalled { filled, of } => {
+            return LifecycleOutcome::NeverFormed { filled, of }
+        }
     };
 
     // 2. The engaged roster == the formed roster: both build from (composition, build_energy).
@@ -2914,12 +3402,26 @@ pub fn run_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
 
     // 4. Engage via the existing managed-assault driver (clone world → place roster at entry →
     //    ManagedSimSquad → resolve_tick to ObjectivesDestroyed | SideWiped(attacker) | Timeout).
-    match run_managed_assault_with(&engage, &engage.objectives[0], &s.composition, SquadTacticParams::default()) {
+    match run_managed_assault_with(
+        &engage,
+        &engage.objectives[0],
+        &s.composition,
+        SquadTacticParams::default(),
+    ) {
         None => LifecycleOutcome::CouldNotField { form_ticks },
         Some((out, _rec)) => match out.stop {
-            StopReason::ObjectivesComplete => LifecycleOutcome::Killed { form_ticks, engage_ticks: out.ticks },
-            StopReason::SideWiped(_) => LifecycleOutcome::RosterWiped { form_ticks, engage_ticks: out.ticks },
-            _ => LifecycleOutcome::Stalled { form_ticks, engage_ticks: out.ticks },
+            StopReason::ObjectivesComplete => LifecycleOutcome::Killed {
+                form_ticks,
+                engage_ticks: out.ticks,
+            },
+            StopReason::SideWiped(_) => LifecycleOutcome::RosterWiped {
+                form_ticks,
+                engage_ticks: out.ticks,
+            },
+            _ => LifecycleOutcome::Stalled {
+                form_ticks,
+                engage_ticks: out.ticks,
+            },
         },
     }
 }
@@ -2940,7 +3442,13 @@ pub fn run_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
 /// economy / homes / priority / ttl / renew drive the forming contention; its `composition` is overridden.
 pub fn run_defended_lifecycle(s: &ColonyFormingScenario) -> LifecycleOutcome {
     // Canonical fixture (the acceptance bed): a rampart breach-gate, one energized tower, a melee guard force.
-    run_defended_lifecycle_with(s, 30_000, &[((24, 16), 100_000)], crate::harness::generate::Layout::Open, crate::harness::generate::ForceSpec::Guard(2))
+    run_defended_lifecycle_with(
+        s,
+        30_000,
+        &[((24, 16), 100_000)],
+        crate::harness::generate::Layout::Open,
+        crate::harness::generate::ForceSpec::Guard(2),
+    )
 }
 
 /// Parameterized defended lifecycle (ADR 0031 P3 — the graded regime sweep): emit_requirement → assemble_force
@@ -2955,7 +3463,14 @@ pub fn run_defended_lifecycle_with(
     force: crate::harness::generate::ForceSpec,
 ) -> LifecycleOutcome {
     // The Default-knob regime (the seed): the acceptance gate routes through here unchanged.
-    run_defended_lifecycle_with_params(s, rampart_hits, towers, layout, force, &screeps_combat_decision::composition::CompositionParams::default())
+    run_defended_lifecycle_with_params(
+        s,
+        rampart_hits,
+        towers,
+        layout,
+        force,
+        &screeps_combat_decision::composition::CompositionParams::default(),
+    )
 }
 
 /// As [`run_defended_lifecycle_with`] but driven by a [`CompositionParams`] knob set (the param-sweep seam,
@@ -2974,7 +3489,9 @@ pub fn run_defended_lifecycle_with_params(
     use crate::harness::generate::assemble_single_room;
     use crate::harness::validate::{derive_profile, run_managed_assault_with, siege_ceiling};
     use screeps_combat_decision::composition::assemble_force;
-    use screeps_combat_decision::doctrine::{emit_requirement, DoctrineObjective, EnemyCoordination};
+    use screeps_combat_decision::doctrine::{
+        emit_requirement, DoctrineObjective, EnemyCoordination,
+    };
     use screeps_combat_decision::force_sizing::AssaultMode;
     use screeps_combat_decision::kite::SquadTacticParams;
 
@@ -3005,7 +3522,8 @@ pub fn run_defended_lifecycle_with_params(
     //    assemble_force fields the capability vector directly (no template, no sized_for). This is the path
     //    the bot will run at P4; the lifecycle proves it end-to-end now (emit → assemble → form → move → kill).
     let profile = derive_profile(&engage.world, engage.defender_owner, obj);
-    let budget = siege_ceiling(engage.member_energy).force_budget(engage.member_energy, engage.onsite_budget);
+    let budget = siege_ceiling(engage.member_energy)
+        .force_budget(engage.member_energy, engage.onsite_budget);
     let defenders = crate::harness::validate::defender_force(&engage);
     // Coordination from the OBSERVED guards (grouped / self-healing → over-match), matching the doctrine path.
     let coordination = match defenders {
@@ -3029,7 +3547,11 @@ pub fn run_defended_lifecycle_with_params(
     // soak buffer `from_assessment` sized (P2); the engage phase below runs it through the drain stance +
     // `breach_drain` tactics (P3 parity — the SAME `decide_squad` the live bot threads).
     let drain = assessment.winnable && assessment.mode == AssaultMode::Drain;
-    let comp = match (assessment.winnable && assessment.mode == AssaultMode::Breach, drain, assemble_force(&required, sizing_energy)) {
+    let comp = match (
+        assessment.winnable && assessment.mode == AssaultMode::Breach,
+        drain,
+        assemble_force(&required, sizing_energy),
+    ) {
         (true, _, Some(assembled)) => assembled,
         (_, true, Some(assembled)) => assembled,
         // The oracle deferred / the assembler couldn't field the required force at this energy — field the
@@ -3052,7 +3574,9 @@ pub fn run_defended_lifecycle_with_params(
     };
     let form_ticks = match run_forming(&forming_scenario) {
         FormingOutcome::Completed { ticks } => ticks,
-        FormingOutcome::Stalled { filled, of } => return LifecycleOutcome::NeverFormed { filled, of },
+        FormingOutcome::Stalled { filled, of } => {
+            return LifecycleOutcome::NeverFormed { filled, of }
+        }
     };
 
     // 4. Engage the FORMED + MOVING roster against the defended core. A BREACH dismantles through the gate
@@ -3060,16 +3584,30 @@ pub fn run_defended_lifecycle_with_params(
     //    FINITE towers bleed dry, then advances + dismantles — fielded via the drain stance + `breach_drain`
     //    tactics (the SAME `decide_squad` the live bot threads through P3). The engaged comp == the formed comp.
     let engaged = if drain {
-        crate::harness::validate::run_managed_assault_drain(&engage, obj, &comp, SquadTacticParams::breach_drain())
+        crate::harness::validate::run_managed_assault_drain(
+            &engage,
+            obj,
+            &comp,
+            SquadTacticParams::breach_drain(),
+        )
     } else {
         run_managed_assault_with(&engage, obj, &comp, SquadTacticParams::breach())
     };
     match engaged {
         None => LifecycleOutcome::CouldNotField { form_ticks },
         Some((out, _rec)) => match out.stop {
-            StopReason::ObjectivesComplete => LifecycleOutcome::Killed { form_ticks, engage_ticks: out.ticks },
-            StopReason::SideWiped(_) => LifecycleOutcome::RosterWiped { form_ticks, engage_ticks: out.ticks },
-            _ => LifecycleOutcome::Stalled { form_ticks, engage_ticks: out.ticks },
+            StopReason::ObjectivesComplete => LifecycleOutcome::Killed {
+                form_ticks,
+                engage_ticks: out.ticks,
+            },
+            StopReason::SideWiped(_) => LifecycleOutcome::RosterWiped {
+                form_ticks,
+                engage_ticks: out.ticks,
+            },
+            _ => LifecycleOutcome::Stalled {
+                form_ticks,
+                engage_ticks: out.ticks,
+            },
         },
     }
 }
@@ -3083,17 +3621,41 @@ mod tests {
     /// A multi-slot placeholder composition (assembled template-free, ADR 0031 D16) the forming tests
     /// override with the oracle-sized one; several RANGED + several HEAL members at the home cap.
     fn placeholder_comp() -> SquadComposition {
-        assemble_force(&RequiredForce { heal_parts: 40, immune_struct_parts: 30, ..Default::default() }, 12_900)
-            .expect("assembles a multi-slot placeholder")
+        assemble_force(
+            &RequiredForce {
+                heal_parts: 40,
+                immune_struct_parts: 30,
+                ..Default::default()
+            },
+            12_900,
+        )
+        .expect("assembles a multi-slot placeholder")
     }
 
     /// Build a forming scenario: `homes` spawn homes at `income`/tick, combat at `combat_priority` vs a
     /// constant HIGH hauler (75), members live `member_ttl` ticks, `renew` keeps the rallying roster alive.
-    fn forming(homes: usize, income: u32, combat_priority: f32, member_ttl: u32, renew: bool, budget: u32) -> ColonyFormingScenario {
+    fn forming(
+        homes: usize,
+        income: u32,
+        combat_priority: f32,
+        member_ttl: u32,
+        renew: bool,
+        budget: u32,
+    ) -> ColonyFormingScenario {
         ColonyFormingScenario {
             composition: placeholder_comp(),
-            homes: (0..homes).map(|_| Home { energy_capacity: 5300, income, start_energy: 2000 }).collect(),
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            homes: (0..homes)
+                .map(|_| Home {
+                    energy_capacity: 5300,
+                    income,
+                    start_energy: 2000,
+                })
+                .collect(),
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority,
             per_member_cap: 3000,
             budget_ticks: budget,
@@ -3111,8 +3673,13 @@ mod tests {
     fn medium_priority_combat_stalls_below_economy() {
         // Combat below the hauler (50 < 75) → the hauler takes every lane → the roster never completes.
         match run_forming(&scenario(50.0)) {
-            FormingOutcome::Stalled { filled, of } => assert!(filled < of, "MEDIUM combat stalls below economy ({filled}/{of})"),
-            FormingOutcome::Completed { ticks } => panic!("MEDIUM combat should NOT complete (did at tick {ticks})"),
+            FormingOutcome::Stalled { filled, of } => assert!(
+                filled < of,
+                "MEDIUM combat stalls below economy ({filled}/{of})"
+            ),
+            FormingOutcome::Completed { ticks } => {
+                panic!("MEDIUM combat should NOT complete (did at tick {ticks})")
+            }
         }
     }
 
@@ -3121,7 +3688,9 @@ mod tests {
         // Combat above the hauler (87.5 > 75) → wins lanes → the roster completes within budget.
         match run_forming(&scenario(87.5)) {
             FormingOutcome::Completed { .. } => {}
-            FormingOutcome::Stalled { filled, of } => panic!("above-economy combat should complete ({filled}/{of})"),
+            FormingOutcome::Stalled { filled, of } => {
+                panic!("above-economy combat should complete ({filled}/{of})")
+            }
         }
     }
 
@@ -3143,7 +3712,10 @@ mod tests {
         let multi = run_forming(&forming(4, 400, 87.5, 1500, false, 3000));
         match (single, multi) {
             (FormingOutcome::Completed { ticks: s }, FormingOutcome::Completed { ticks: m }) => {
-                assert!(m < s, "multi-room parallel spawning forms faster than single-room serial ({m} < {s})");
+                assert!(
+                    m < s,
+                    "multi-room parallel spawning forms faster than single-room serial ({m} < {s})"
+                );
             }
             other => panic!("both single + multi room should complete, got {other:?}"),
         }
@@ -3155,8 +3727,12 @@ mod tests {
         // deterministic test; the live equivalent is a form stalled >1500t by spawn contention). Early
         // members age out → drop back to unfilled → the roster never has the full set present at once.
         match run_forming(&forming(1, 200, 87.5, 200, false, 4000)) {
-            FormingOutcome::Stalled { filled, of } => assert!(filled < of, "early members die → stuck ({filled}/{of})"),
-            FormingOutcome::Completed { ticks } => panic!("a too-slow form must NOT complete without renew (did at {ticks})"),
+            FormingOutcome::Stalled { filled, of } => {
+                assert!(filled < of, "early members die → stuck ({filled}/{of})")
+            }
+            FormingOutcome::Completed { ticks } => {
+                panic!("a too-slow form must NOT complete without renew (did at {ticks})")
+            }
         }
     }
 
@@ -3166,7 +3742,9 @@ mod tests {
         // early members stay alive until the full squad forms → it completes.
         match run_forming(&forming(1, 200, 87.5, 200, true, 4000)) {
             FormingOutcome::Completed { .. } => {}
-            FormingOutcome::Stalled { filled, of } => panic!("renew should keep the roster alive + complete ({filled}/{of})"),
+            FormingOutcome::Stalled { filled, of } => {
+                panic!("renew should keep the roster alive + complete ({filled}/{of})")
+            }
         }
     }
 
@@ -3190,16 +3768,29 @@ mod tests {
         use screeps_combat_decision::composition::optimize_composition;
         use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination, EnemyForce};
         use screeps_combat_decision::force_sizing::DefenseProfile;
-        let defense = DefenseProfile { towers: vec![], breach_hits: 0, objective_hits: 0, repair_per_tick: 0.0, safe_mode: false, ..Default::default() };
+        let defense = DefenseProfile {
+            towers: vec![],
+            breach_hits: 0,
+            objective_hits: 0,
+            repair_per_tick: 0.0,
+            safe_mode: false,
+            ..Default::default()
+        };
         // ADR 0031 #41: the threat creep dps the optimizer prices comes from this single `EnemyForce` (dps=30),
         // not a co-resident `defense.enemy_dps` (removed).
-        let enemy = EnemyForce { dps: 30.0, heal: 0.0, hits: 600, count: 2, boosted: false };
+        let enemy = EnemyForce {
+            dps: 30.0,
+            heal: 0.0,
+            hits: 600,
+            count: 2,
+            boosted: false,
+        };
         optimize_composition(
             DoctrineObjective::ClearCreeps,
             &defense,
             Some(enemy),
-            1e6,   // defense target_value (always-field)
-            1500,  // generous on-site window
+            1e6,  // defense target_value (always-field)
+            1500, // generous on-site window
             EnemyCoordination::Coordinated,
             0.0,   // importance
             false, // always-field (honor_verdict=false)
@@ -3219,8 +3810,16 @@ mod tests {
             // exceeds the lease window. The roster IS fieldable, just slower than the pre-fix lease tolerates
             // BETWEEN present++ events → the lease lapses between members → drop slot 0 → re-field churn (the
             // live W7N4 healer-pile-up at present=1/2). A constant HIGH hauler holds the lane otherwise.
-            homes: vec![Home { energy_capacity: 5300, income: 4, start_energy: 2400 }],
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            homes: vec![Home {
+                energy_capacity: 5300,
+                income: 4,
+                start_energy: 2400,
+            }],
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 85.0, // SPAWN_PRIORITY_COMBAT_FORMING
             per_member_cap: 3000,
             budget_ticks: 6000,
@@ -3236,7 +3835,12 @@ mod tests {
     /// to completion and DEPLOY. A DEFENDED target (contested) keeps the full-roster rally.
     #[test]
     fn oversized_defense_roster_churns_never_deploys() {
-        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0, ..Default::default() };
+        let target = ChurnTarget {
+            travel_ticks: 30,
+            uncontested: false,
+            empty_dtos_on_arrival_ticks: 0,
+            ..Default::default()
+        };
         let out = run_lifecycle_churn(&contended(oversized_defense_comp()), &target);
         // After the fix this must be DeployedAndEngaged; pre-fix it churns. Assert the FIXED expectation so
         // the test is RED today and GREEN once the lease fix lands.
@@ -3254,13 +3858,31 @@ mod tests {
     /// progress, bounded) carries it to arrival + engage.
     #[test]
     fn single_slot_offense_deploys_within_lease() {
-        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
-            .expect("a single-slot ranged core-killer");
-        assert_eq!(comp.slots.len(), 1, "the undefended-core force is a single slot (W7N7)");
+        let comp = assemble_force(
+            &RequiredForce {
+                immune_struct_parts: 4,
+                ..Default::default()
+            },
+            3000,
+        )
+        .expect("a single-slot ranged core-killer");
+        assert_eq!(
+            comp.slots.len(),
+            1,
+            "the undefended-core force is a single slot (W7N7)"
+        );
         let scenario = ColonyFormingScenario {
             composition: comp,
-            homes: vec![Home { energy_capacity: 5300, income: 300, start_energy: 2000 }],
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            homes: vec![Home {
+                energy_capacity: 5300,
+                income: 300,
+                start_energy: 2000,
+            }],
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 85.0,
             per_member_cap: 3000,
             budget_ticks: 1500,
@@ -3269,7 +3891,12 @@ mod tests {
         };
         // A long multi-room hop (> COMMITMENT_BUDGET) so the travel-phase lapse is exercised; uncontested →
         // the quorum gate releases the single member immediately.
-        let target = ChurnTarget { travel_ticks: 500, uncontested: true, empty_dtos_on_arrival_ticks: 0, ..Default::default() };
+        let target = ChurnTarget {
+            travel_ticks: 500,
+            uncontested: true,
+            empty_dtos_on_arrival_ticks: 0,
+            ..Default::default()
+        };
         let out = run_lifecycle_churn(&scenario, &target);
         assert!(
             matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
@@ -3284,12 +3911,26 @@ mod tests {
     /// lapses.
     #[test]
     fn arrived_squad_with_empty_dtos_does_not_lapse() {
-        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
-            .expect("a single-slot ranged core-killer");
+        let comp = assemble_force(
+            &RequiredForce {
+                immune_struct_parts: 4,
+                ..Default::default()
+            },
+            3000,
+        )
+        .expect("a single-slot ranged core-killer");
         let scenario = ColonyFormingScenario {
             composition: comp,
-            homes: vec![Home { energy_capacity: 5300, income: 300, start_energy: 2000 }],
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            homes: vec![Home {
+                energy_capacity: 5300,
+                income: 300,
+                start_energy: 2000,
+            }],
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 85.0,
             per_member_cap: 3000,
             budget_ticks: 1500,
@@ -3298,7 +3939,12 @@ mod tests {
         };
         // Arrives quickly, but the room DTOs stay empty far past the lease window (> COMMITMENT_BUDGET) —
         // the live mapping/visibility timing hole. Pre-fix: no focus → lease lapses → LapsedOnArrival.
-        let target = ChurnTarget { travel_ticks: 20, uncontested: true, empty_dtos_on_arrival_ticks: 600, ..Default::default() };
+        let target = ChurnTarget {
+            travel_ticks: 20,
+            uncontested: true,
+            empty_dtos_on_arrival_ticks: 600,
+            ..Default::default()
+        };
         let out = run_lifecycle_churn(&scenario, &target);
         assert!(
             matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
@@ -3321,15 +3967,33 @@ mod tests {
     fn vacuous_commit_scenario() -> ColonyFormingScenario {
         // A 2-slot offense roster that forms readily (not the focus of this test — the commit/abandon
         // cascade is). Two healthy homes so the full roster banks well within the lease.
-        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
-            .expect("an offense force");
+        let comp = assemble_force(
+            &RequiredForce {
+                immune_struct_parts: 4,
+                ..Default::default()
+            },
+            3000,
+        )
+        .expect("an offense force");
         ColonyFormingScenario {
             composition: comp,
             homes: vec![
-                Home { energy_capacity: 5300, income: 300, start_energy: 5300 },
-                Home { energy_capacity: 5300, income: 300, start_energy: 5300 },
+                Home {
+                    energy_capacity: 5300,
+                    income: 300,
+                    start_energy: 5300,
+                },
+                Home {
+                    energy_capacity: 5300,
+                    income: 300,
+                    start_energy: 5300,
+                },
             ],
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 85.0,
             per_member_cap: 3000,
             budget_ticks: 4000,
@@ -3353,9 +4017,14 @@ mod tests {
         let out = run_lifecycle_churn(&s, &target);
         match out {
             ChurnOutcome::LapsedOnVacuousCommit { generations } => {
-                assert!(generations > 1, "the vacuous-commit oscillation must climb generations, got {generations}");
+                assert!(
+                    generations > 1,
+                    "the vacuous-commit oscillation must climb generations, got {generations}"
+                );
             }
-            other => panic!("pre-fix must LapsedOnVacuousCommit (the reach<->retreat spiral), got {other:?}"),
+            other => panic!(
+                "pre-fix must LapsedOnVacuousCommit (the reach<->retreat spiral), got {other:?}"
+            ),
         }
     }
 
@@ -3375,9 +4044,14 @@ mod tests {
         match out {
             ChurnOutcome::AbandonedOnContact { generations } => {
                 // Stable: a single de-commit, no re-field within the backoff (the producer suppressed it).
-                assert!(generations <= 1, "abandon-on-contact must NOT oscillate (stable generations), got {generations}");
+                assert!(
+                    generations <= 1,
+                    "abandon-on-contact must NOT oscillate (stable generations), got {generations}"
+                );
             }
-            other => panic!("post-fix must AbandonedOnContact (clean de-commit + backoff), got {other:?}"),
+            other => panic!(
+                "post-fix must AbandonedOnContact (clean de-commit + backoff), got {other:?}"
+            ),
         }
     }
 
@@ -3444,25 +4118,50 @@ mod tests {
             abandon_fixes_enabled: true,
             ..Default::default()
         };
-        assert_eq!(run_lifecycle_churn(&s, &target), run_lifecycle_churn(&s, &target));
+        assert_eq!(
+            run_lifecycle_churn(&s, &target),
+            run_lifecycle_churn(&s, &target)
+        );
     }
 
     #[test]
     fn lifecycle_churn_is_deterministic() {
-        let target = ChurnTarget { travel_ticks: 30, uncontested: false, empty_dtos_on_arrival_ticks: 0, ..Default::default() };
+        let target = ChurnTarget {
+            travel_ticks: 30,
+            uncontested: false,
+            empty_dtos_on_arrival_ticks: 0,
+            ..Default::default()
+        };
         let s = contended(oversized_defense_comp());
-        assert_eq!(run_lifecycle_churn(&s, &target), run_lifecycle_churn(&s, &target));
+        assert_eq!(
+            run_lifecycle_churn(&s, &target),
+            run_lifecycle_churn(&s, &target)
+        );
     }
 
     /// An easily-fielded single-slot scenario for the B1/B2 lifecycle repros (no spawn contention — the bug
     /// under test is the LATCH / GARRISON wiring, not the forming plateau).
     fn easy_single_slot() -> ColonyFormingScenario {
-        let comp = assemble_force(&RequiredForce { immune_struct_parts: 4, ..Default::default() }, 3000)
-            .expect("a single-slot core-killer");
+        let comp = assemble_force(
+            &RequiredForce {
+                immune_struct_parts: 4,
+                ..Default::default()
+            },
+            3000,
+        )
+        .expect("a single-slot core-killer");
         ColonyFormingScenario {
             composition: comp,
-            homes: vec![Home { energy_capacity: 5300, income: 300, start_energy: 3000 }],
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            homes: vec![Home {
+                energy_capacity: 5300,
+                income: 300,
+                start_energy: 3000,
+            }],
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 87.5,
             per_member_cap: 3000,
             budget_ticks: 2000,
@@ -3528,7 +4227,9 @@ mod tests {
             },
         );
         match buggy {
-            ChurnOutcome::Garrisoned { generations } => panic!("pre-fix must CHURN, not garrison ({generations} gens)"),
+            ChurnOutcome::Garrisoned { generations } => {
+                panic!("pre-fix must CHURN, not garrison ({generations} gens)")
+            }
             other => assert!(
                 matches!(other, ChurnOutcome::LapsedOnArrival { generations } if generations >= 1),
                 "pre-fix: the focus-less in-room defender GaveUp + re-fields → churn, got {other:?}"
@@ -3558,16 +4259,39 @@ mod tests {
     /// the MOVEMENT stall from spawn contention.
     fn two_home_offense() -> ColonyFormingScenario {
         // A 2-slot force (one anti-creep fighter + one healer) so there is one member per distinct home.
-        let comp = assemble_force(&RequiredForce { anti_creep_parts: 4, heal_parts: 4, ..Default::default() }, 3000)
-            .expect("a 2-slot fighter+healer force");
-        assert_eq!(comp.slots.len(), 2, "the spatial repro uses a 2-slot roster (one member per home)");
+        let comp = assemble_force(
+            &RequiredForce {
+                anti_creep_parts: 4,
+                heal_parts: 4,
+                ..Default::default()
+            },
+            3000,
+        )
+        .expect("a 2-slot fighter+healer force");
+        assert_eq!(
+            comp.slots.len(),
+            2,
+            "the spatial repro uses a 2-slot roster (one member per home)"
+        );
         ColonyFormingScenario {
             composition: comp,
             homes: vec![
-                Home { energy_capacity: 5300, income: 300, start_energy: 3000 },
-                Home { energy_capacity: 5300, income: 300, start_energy: 3000 },
+                Home {
+                    energy_capacity: 5300,
+                    income: 300,
+                    start_energy: 3000,
+                },
+                Home {
+                    energy_capacity: 5300,
+                    income: 300,
+                    start_energy: 3000,
+                },
             ],
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 87.5,
             per_member_cap: 3000,
             budget_ticks: 2000,
@@ -3582,11 +4306,23 @@ mod tests {
             // Two homes in DIFFERENT rooms (the multi-home scatter): W2N9 ≈ (world 100+25, 400+25) and
             // W3N4. Using world coords: room (rx, ry) maps to W{-rx-1}N{-ry-1}, so W2N9 → rx=-3, ry=-10.
             homes: vec![
-                WPos { wx: -3 * 50 + 25, wy: -10 * 50 + 25 }, // W2N9
-                WPos { wx: -4 * 50 + 25, wy: -5 * 50 + 25 },  // W3N4
+                WPos {
+                    wx: -3 * 50 + 25,
+                    wy: -10 * 50 + 25,
+                }, // W2N9
+                WPos {
+                    wx: -4 * 50 + 25,
+                    wy: -5 * 50 + 25,
+                }, // W3N4
             ],
-            rally: WPos { wx: -4 * 50 + 5, wy: -4 * 50 + 25 }, // W3N3 staging (approach)
-            target: WPos { wx: -5 * 50 + 25, wy: -4 * 50 + 25 }, // W4N3 target
+            rally: WPos {
+                wx: -4 * 50 + 5,
+                wy: -4 * 50 + 25,
+            }, // W3N3 staging (approach)
+            target: WPos {
+                wx: -5 * 50 + 25,
+                wy: -4 * 50 + 25,
+            }, // W4N3 target
             uncontested,
             use_shared_rally,
             enemy_held_rooms: vec![], // no in-transit attrition in the baseline movement-stall repro
@@ -3629,7 +4365,10 @@ mod tests {
     fn spatial_lifecycle_is_deterministic() {
         let s = two_home_offense();
         let t = scatter_travel(false, true);
-        assert_eq!(run_lifecycle_churn_spatial(&s, &t), run_lifecycle_churn_spatial(&s, &t));
+        assert_eq!(
+            run_lifecycle_churn_spatial(&s, &t),
+            run_lifecycle_churn_spatial(&s, &t)
+        );
     }
 
     // ── BUG A: CONTESTED boundary oscillation (the W4N7 multi-home defender) ──
@@ -3642,13 +4381,25 @@ mod tests {
             // Two homes co-located near the rally room (rx=-4, ry=-5) → both members reach the rally without
             // attrition + form the contested quorum (so the assault DOES commit at least once).
             homes: vec![
-                WPos { wx: -4 * 50 + 20, wy: -5 * 50 + 25 }, // W3N4 (near the rally)
-                WPos { wx: -4 * 50 + 30, wy: -5 * 50 + 25 }, // W3N4 (near the rally)
+                WPos {
+                    wx: -4 * 50 + 20,
+                    wy: -5 * 50 + 25,
+                }, // W3N4 (near the rally)
+                WPos {
+                    wx: -4 * 50 + 30,
+                    wy: -5 * 50 + 25,
+                }, // W3N4 (near the rally)
             ],
-            rally: WPos { wx: -4 * 50 + 25, wy: -5 * 50 + 25 }, // W3N4 staging
-            target: WPos { wx: -6 * 50 + 25, wy: -5 * 50 + 25 }, // W5N4 target (two rooms away)
-            uncontested: false,                                  // CONTESTED → near-full quorum required
-            use_shared_rally: true,                              // the shared-rally travel is in place (ADR 0028)
+            rally: WPos {
+                wx: -4 * 50 + 25,
+                wy: -5 * 50 + 25,
+            }, // W3N4 staging
+            target: WPos {
+                wx: -6 * 50 + 25,
+                wy: -5 * 50 + 25,
+            }, // W5N4 target (two rooms away)
+            uncontested: false,     // CONTESTED → near-full quorum required
+            use_shared_rally: true, // the shared-rally travel is in place (ADR 0028)
             // The enemy HOLDS the intermediate room (rx=-5, ry=-5 = W4N4) the ASSAULT must cross from the
             // rally (rx=-4) to the target (rx=-6). A member stepping into it during the assault DIES → present
             // drops 2→1 → the NON-LATCHED per-tick gather re-eval loses quorum → reverts assault→travel → the
@@ -3694,17 +4445,36 @@ mod tests {
         // Three DISTINCT roles → three slots (a ranged fighter for the gather quorum's fighter requirement,
         // a dismantler, and a healer) so we have a clean lead + two-member bulk for the D5 majority test.
         let comp = assemble_force(
-            &RequiredForce { anti_creep_parts: 4, dismantle_parts: 4, heal_parts: 4, ..Default::default() },
+            &RequiredForce {
+                anti_creep_parts: 4,
+                dismantle_parts: 4,
+                heal_parts: 4,
+                ..Default::default()
+            },
             3000,
         )
         .expect("a 3-slot ranged+dismantler+healer force");
-        assert!(comp.slots.len() >= 3, "the far-home repro wants a >=3-slot roster, got {}", comp.slots.len());
+        assert!(
+            comp.slots.len() >= 3,
+            "the far-home repro wants a >=3-slot roster, got {}",
+            comp.slots.len()
+        );
         let n = comp.slots.len();
         ColonyFormingScenario {
             composition: comp,
             // One easily-fieldable home per slot — isolate the MOVEMENT stall from spawn contention.
-            homes: (0..n).map(|_| Home { energy_capacity: 5300, income: 400, start_energy: 3000 }).collect(),
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            homes: (0..n)
+                .map(|_| Home {
+                    energy_capacity: 5300,
+                    income: 400,
+                    start_energy: 3000,
+                })
+                .collect(),
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 87.5,
             per_member_cap: 3000,
             budget_ticks: budget,
@@ -3847,7 +4617,13 @@ mod tests {
     fn far_home_s3_gate_without_renew_still_fails() {
         let s = s3_short_life_offense();
         let n = s.composition.slots.len();
-        let out = run_lifecycle_churn_extended(&s, &ExtendedTravel { lifetime_gate: true, ..far_home_s3(n) });
+        let out = run_lifecycle_churn_extended(
+            &s,
+            &ExtendedTravel {
+                lifetime_gate: true,
+                ..far_home_s3(n)
+            },
+        );
         assert!(
             !matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
             "D6a gate alone (no renew to top up the held members) can't deploy a too-short roster, got {out:?}"
@@ -3863,7 +4639,12 @@ mod tests {
         let n = s.composition.slots.len();
         let green = run_lifecycle_churn_extended(
             &s,
-            &ExtendedTravel { lifetime_gate: true, renew_in_transit: true, rally_spawn: true, ..far_home_s3(n) },
+            &ExtendedTravel {
+                lifetime_gate: true,
+                renew_in_transit: true,
+                rally_spawn: true,
+                ..far_home_s3(n)
+            },
         );
         assert!(
             matches!(green, ChurnOutcome::DeployedAndEngaged { .. }),
@@ -3885,7 +4666,10 @@ mod tests {
             "RC-4/RC-8: the pre-fix min-distance progress signal must lapse the far-home squad in travel, got {red:?}"
         );
         // GREEN: D5 majority progress carries the lease until the bulk gathers + the quorum fires.
-        let green_travel = ExtendedTravel { majority_progress: true, ..far_home_s1(n) };
+        let green_travel = ExtendedTravel {
+            majority_progress: true,
+            ..far_home_s1(n)
+        };
         let green = run_lifecycle_churn_extended(&s, &green_travel);
         assert!(
             matches!(green, ChurnOutcome::DeployedAndEngaged { .. }),
@@ -3929,9 +4713,18 @@ mod tests {
     fn far_home_s1_blocked_d5_alone_still_lapses() {
         let s = three_slot_offense(2000);
         let n = s.composition.slots.len();
-        let out = run_lifecycle_churn_extended(&s, &ExtendedTravel { majority_progress: true, ..far_home_s1_blocked(n) });
+        let out = run_lifecycle_churn_extended(
+            &s,
+            &ExtendedTravel {
+                majority_progress: true,
+                ..far_home_s1_blocked(n)
+            },
+        );
         assert!(
-            matches!(out, ChurnOutcome::LapsedInTravel { .. } | ChurnOutcome::OscillatedNeverGathered { .. }),
+            matches!(
+                out,
+                ChurnOutcome::LapsedInTravel { .. } | ChurnOutcome::OscillatedNeverGathered { .. }
+            ),
             "D5 alone can't unblock a NO_PATH member — D4/D8 escalation is required, got {out:?}"
         );
     }
@@ -3941,13 +4734,24 @@ mod tests {
         let s = three_slot_offense(2000);
         let n = s.composition.slots.len();
         let t = far_home_s1_blocked(n);
-        assert_eq!(run_lifecycle_churn_extended(&s, &t), run_lifecycle_churn_extended(&s, &t));
+        assert_eq!(
+            run_lifecycle_churn_extended(&s, &t),
+            run_lifecycle_churn_extended(&s, &t)
+        );
         // Phase 2: the TTL/renew/lifetime-gate path is equally deterministic (integer math, no float branch,
         // no HashMap) — same (scenario, travel) → same outcome.
         let s3 = s3_short_life_offense();
         let n3 = s3.composition.slots.len();
-        let t3 = ExtendedTravel { lifetime_gate: true, renew_in_transit: true, rally_spawn: true, ..far_home_s3(n3) };
-        assert_eq!(run_lifecycle_churn_extended(&s3, &t3), run_lifecycle_churn_extended(&s3, &t3));
+        let t3 = ExtendedTravel {
+            lifetime_gate: true,
+            renew_in_transit: true,
+            rally_spawn: true,
+            ..far_home_s3(n3)
+        };
+        assert_eq!(
+            run_lifecycle_churn_extended(&s3, &t3),
+            run_lifecycle_churn_extended(&s3, &t3)
+        );
     }
 
     // ── End-to-end: form → engine engage → kill (ADR 0028 engage handoff) ──
@@ -3957,7 +4761,9 @@ mod tests {
         // The full chain: form above economy (completes) → travel → raze the 50k-hit core.
         match run_lifecycle(&scenario(87.5)) {
             LifecycleOutcome::Killed { .. } => {}
-            other => panic!("expected the formed roster to kill the undefended core, got {other:?}"),
+            other => {
+                panic!("expected the formed roster to kill the undefended core, got {other:?}")
+            }
         }
     }
 
@@ -3972,7 +4778,10 @@ mod tests {
 
     #[test]
     fn lifecycle_is_deterministic() {
-        assert_eq!(run_lifecycle(&scenario(87.5)), run_lifecycle(&scenario(87.5)));
+        assert_eq!(
+            run_lifecycle(&scenario(87.5)),
+            run_lifecycle(&scenario(87.5))
+        );
     }
 
     // ── Defended end-to-end: oracle-sized force, FORMED + MOVING, kills a defended core (ADR 0029 §10 #1) ──
@@ -3983,8 +4792,18 @@ mod tests {
     fn defended_forming() -> ColonyFormingScenario {
         ColonyFormingScenario {
             composition: placeholder_comp(), // placeholder — replaced by the oracle-sized comp
-            homes: (0..4).map(|_| Home { energy_capacity: 12_900, income: 1000, start_energy: 12_900 }).collect(),
-            economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+            homes: (0..4)
+                .map(|_| Home {
+                    energy_capacity: 12_900,
+                    income: 1000,
+                    start_energy: 12_900,
+                })
+                .collect(),
+            economy: EconomyPressure {
+                hauler: Some((75.0, 1000)),
+                miner: None,
+                miner_period: 0,
+            },
             combat_priority: 87.5, // above the hauler (75) → combat wins the lane
             per_member_cap: 12_900,
             budget_ticks: 4000,
@@ -4017,7 +4836,10 @@ mod tests {
     fn defended_lifecycle_is_deterministic() {
         // Fixed seed + safe_mode=false + a fixed ForceSpec → the defended chain is reproducible (it stalls
         // identically each run today; this still holds once the redesign flips the outcome to Killed).
-        assert_eq!(run_defended_lifecycle(&defended_forming()), run_defended_lifecycle(&defended_forming()));
+        assert_eq!(
+            run_defended_lifecycle(&defended_forming()),
+            run_defended_lifecycle(&defended_forming())
+        );
     }
 
     /// ADR 0031 P3 — the GRADED REGIME SWEEP: an emit→assemble force, FORMED + MOVING, must KILL a defended
@@ -4030,16 +4852,45 @@ mod tests {
     fn assembler_kills_across_defended_regimes() {
         use crate::harness::generate::{ForceSpec, Layout};
         let regimes: &[(&str, u32, &[((u8, u8), u32)], Layout, ForceSpec)] = &[
-            ("rampart-only + light guard", 50_000, &[], Layout::Open, ForceSpec::Guard(1)),
-            ("tower-only + guard", 0, &[((24, 16), 100_000)], Layout::Open, ForceSpec::Guard(2)),
-            ("tower + rampart + guard", 30_000, &[((24, 16), 100_000)], Layout::Open, ForceSpec::Guard(2)),
-            ("corridor choke + guard", 20_000, &[((24, 16), 100_000)], Layout::Corridor, ForceSpec::Guard(2)),
+            (
+                "rampart-only + light guard",
+                50_000,
+                &[],
+                Layout::Open,
+                ForceSpec::Guard(1),
+            ),
+            (
+                "tower-only + guard",
+                0,
+                &[((24, 16), 100_000)],
+                Layout::Open,
+                ForceSpec::Guard(2),
+            ),
+            (
+                "tower + rampart + guard",
+                30_000,
+                &[((24, 16), 100_000)],
+                Layout::Open,
+                ForceSpec::Guard(2),
+            ),
+            (
+                "corridor choke + guard",
+                20_000,
+                &[((24, 16), 100_000)],
+                Layout::Corridor,
+                ForceSpec::Guard(2),
+            ),
         ];
         for (name, rampart, towers, layout, force) in regimes {
-            let out = run_defended_lifecycle_with(&defended_forming(), *rampart, towers, *layout, *force);
-            let out2 = run_defended_lifecycle_with(&defended_forming(), *rampart, towers, *layout, *force);
+            let out =
+                run_defended_lifecycle_with(&defended_forming(), *rampart, towers, *layout, *force);
+            let out2 =
+                run_defended_lifecycle_with(&defended_forming(), *rampart, towers, *layout, *force);
             assert_eq!(out, out2, "{name}: the regime is deterministic");
-            assert!(matches!(out, LifecycleOutcome::Killed { .. }), "{name}: the assembled force should KILL the defended core, got {out:?}");
+            assert!(
+                matches!(out, LifecycleOutcome::Killed { .. }),
+                "{name}: the assembled force should KILL the defended core, got {out:?}"
+            );
         }
     }
 
@@ -4054,12 +4905,21 @@ mod tests {
     /// the RED (pre-reassign retire→re-field churn) vs GREEN (in-place rebind) arms.
     fn v1_threat_walks_to_neighbour(reassign: bool) -> V1FlowScenario {
         V1FlowScenario {
-            owned: vec![((0, 0), 1.0)],                 // one owned room at the origin
-            home: (0, 0),                               // the squad forms in the owned room
+            owned: vec![((0, 0), 1.0)], // one owned room at the origin
+            home: (0, 0),               // the squad forms in the owned room
             // The threat sits in the owned room a couple of scans (the squad forms + engages there), then
             // steps to the neighbour (1,0) and stays — so the owned Secure resolves + a neighbour Secure
             // appears, and the squad must FOLLOW it (reassign).
-            threat_path: vec![(0, 0), (0, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0)],
+            threat_path: vec![
+                (0, 0),
+                (0, 0),
+                (1, 0),
+                (1, 0),
+                (1, 0),
+                (1, 0),
+                (1, 0),
+                (1, 0),
+            ],
             scan_period: 2,
             objective_ttl: 6, // a few scans — the stale owned Secure lapses once the squad reassigns off it
             reassign_enabled: reassign,
@@ -4077,14 +4937,30 @@ mod tests {
     fn defender_reassigns_to_follow_a_moving_threat_end_to_end() {
         let out = run_v1_flow(&v1_threat_walks_to_neighbour(true));
         match out {
-            ChurnOutcome::Reassigned { from_gen, reassignments, .. } => {
-                assert_eq!(from_gen, 0, "the SAME squad followed the threat — NO Generation churn (bodies reused)");
-                assert!(reassignments >= 1, "the squad rebound in place to the neighbour Secure at least once");
+            ChurnOutcome::Reassigned {
+                from_gen,
+                reassignments,
+                ..
+            } => {
+                assert_eq!(
+                    from_gen, 0,
+                    "the SAME squad followed the threat — NO Generation churn (bodies reused)"
+                );
+                assert!(
+                    reassignments >= 1,
+                    "the squad rebound in place to the neighbour Secure at least once"
+                );
             }
-            other => panic!("the defender must reassign + follow the moving threat end-to-end, got {other:?}"),
+            other => panic!(
+                "the defender must reassign + follow the moving threat end-to-end, got {other:?}"
+            ),
         }
         // Deterministic: a single run reproduces.
-        assert_eq!(run_v1_flow(&v1_threat_walks_to_neighbour(true)), out, "the v1 flow is deterministic");
+        assert_eq!(
+            run_v1_flow(&v1_threat_walks_to_neighbour(true)),
+            out,
+            "the v1 flow is deterministic"
+        );
     }
 
     /// REASSIGN-ON-RESOLVE = REUSE (same generation), vs the pre-reassign control that CHURNS (climbing
@@ -4099,8 +4975,11 @@ mod tests {
         );
         let churned = run_v1_flow(&v1_threat_walks_to_neighbour(false));
         match churned {
-            ChurnOutcome::Reassigned { .. } => panic!("the control (reassign disabled) must NOT reassign — it churns"),
-            ChurnOutcome::ChurnedNeverDeployed { generations, .. } | ChurnOutcome::LapsedInTravel { generations } => {
+            ChurnOutcome::Reassigned { .. } => {
+                panic!("the control (reassign disabled) must NOT reassign — it churns")
+            }
+            ChurnOutcome::ChurnedNeverDeployed { generations, .. }
+            | ChurnOutcome::LapsedInTravel { generations } => {
                 assert!(generations >= 1, "the pre-reassign control re-fields a fresh generation (churn), got {generations}");
             }
             other => panic!("the control must churn (climbing generations), got {other:?}"),
@@ -4143,14 +5022,30 @@ mod tests {
     fn auction_greedy_suboptimal(global: bool) -> AuctionFlowScenario {
         AuctionFlowScenario {
             squads: vec![
-                AuctionSquad { structure_dps: 1000, heal: 50, current_objective: None }, // A (row 0)
-                AuctionSquad { structure_dps: 120, heal: 50, current_objective: None },  // B (row 1)
+                AuctionSquad {
+                    structure_dps: 1000,
+                    heal: 50,
+                    current_objective: None,
+                }, // A (row 0)
+                AuctionSquad {
+                    structure_dps: 120,
+                    heal: 50,
+                    current_objective: None,
+                }, // B (row 1)
             ],
             objectives: vec![
                 // H (id 0): high value, feasible for BOTH. Value edges L so greedy-A grabs it.
-                AuctionObjective { id: 0, value: 50_001.0, feasible_per_row: vec![true, true] },
+                AuctionObjective {
+                    id: 0,
+                    value: 50_001.0,
+                    feasible_per_row: vec![true, true],
+                },
                 // L (id 1): slightly lower value, feasible ONLY for A (B cannot reach/take it).
-                AuctionObjective { id: 1, value: 50_000.0, feasible_per_row: vec![true, false] },
+                AuctionObjective {
+                    id: 1,
+                    value: 50_000.0,
+                    feasible_per_row: vec![true, false],
+                },
             ],
             global_solve: global,
         }
@@ -4172,8 +5067,16 @@ mod tests {
             global.picks
         );
         // Greedy: A→H, B→(stranded, L infeasible) → only H claimed. Global: A→L, B→H → BOTH claimed.
-        assert_eq!(greedy.picks, vec![Some(0), None], "greedy strands B (A grabbed H; L infeasible for B)");
-        assert_eq!(global.picks, vec![Some(1), Some(0)], "global routes A→L and B→H — the swap greedy misses");
+        assert_eq!(
+            greedy.picks,
+            vec![Some(0), None],
+            "greedy strands B (A grabbed H; L infeasible for B)"
+        );
+        assert_eq!(
+            global.picks,
+            vec![Some(1), Some(0)],
+            "global routes A→L and B→H — the swap greedy misses"
+        );
     }
 
     /// The auction flow is DETERMINISTIC (ADR 0032 §Determinism): the same scenario yields a byte-identical
@@ -4194,15 +5097,31 @@ mod tests {
         let s = AuctionFlowScenario {
             // One squad currently on the high-value objective (id 0); a tiny new objective (id 1) is the only
             // unclaimed one. The optimum is StayPut on 0, never the sub-threshold 1.
-            squads: vec![AuctionSquad { structure_dps: 1000, heal: 50, current_objective: Some(0) }],
+            squads: vec![AuctionSquad {
+                structure_dps: 1000,
+                heal: 50,
+                current_objective: Some(0),
+            }],
             objectives: vec![
-                AuctionObjective { id: 0, value: 100_000.0, feasible_per_row: vec![true] }, // current (StayPut re-scores it)
-                AuctionObjective { id: 1, value: 5.0, feasible_per_row: vec![true] },        // tiny new objective
+                AuctionObjective {
+                    id: 0,
+                    value: 100_000.0,
+                    feasible_per_row: vec![true],
+                }, // current (StayPut re-scores it)
+                AuctionObjective {
+                    id: 1,
+                    value: 5.0,
+                    feasible_per_row: vec![true],
+                }, // tiny new objective
             ],
             global_solve: true,
         };
         let out = run_auction_flow(&s);
-        assert_ne!(out.picks[0], Some(1), "must NOT take the sub-threshold objective — StayPut/high-value wins");
+        assert_ne!(
+            out.picks[0],
+            Some(1),
+            "must NOT take the sub-threshold objective — StayPut/high-value wins"
+        );
     }
 
     // ── ADR 0032 v2 / ADR 0027: the MERGE FLOW (transfer pending-slot primitive END-TO-END) ──
@@ -4224,8 +5143,14 @@ mod tests {
                     sheddable_heal: 0,
                     current_objective: 0,
                     slots: vec![
-                        MergeSlot { role: SquadRole::RangedDPS, filled: true },
-                        MergeSlot { role: SquadRole::Dismantler, filled: false }, // OPEN pending slot
+                        MergeSlot {
+                            role: SquadRole::RangedDPS,
+                            filled: true,
+                        },
+                        MergeSlot {
+                            role: SquadRole::Dismantler,
+                            filled: false,
+                        }, // OPEN pending slot
                     ],
                     merge_eligible: false,
                 },
@@ -4236,7 +5161,10 @@ mod tests {
                     sheddable_dps: 800,
                     sheddable_heal: 0,
                     current_objective: 1,
-                    slots: vec![MergeSlot { role: SquadRole::Dismantler, filled: true }],
+                    slots: vec![MergeSlot {
+                        role: SquadRole::Dismantler,
+                        filled: true,
+                    }],
                     merge_eligible: true,
                 },
             ],
@@ -4257,19 +5185,41 @@ mod tests {
     fn merge_flow_transfers_fills_the_pending_slot_and_retires_the_empty_donor() {
         let green = run_merge_flow(&merge_reinforce_scenario(true));
         // The merge fired: donor 1 → receiver 0, 1 member.
-        assert_eq!(green.merge, Some((1, 0, 1)), "the donor merges into the receiver's open slot (1 transfer)");
+        assert_eq!(
+            green.merge,
+            Some((1, 0, 1)),
+            "the donor merges into the receiver's open slot (1 transfer)"
+        );
         // The receiver's pending slot is now filled in the model (2 filled, 0 open — BY TRANSFER, not spawn).
-        assert_eq!(green.slots[0], (2, 0), "the receiver's open pending slot is filled by transfer (model)");
+        assert_eq!(
+            green.slots[0],
+            (2, 0),
+            "the receiver's open pending slot is filled by transfer (model)"
+        );
         // The donor EMPTIED → clean retire (the creep was TRANSFERRED, not orphaned/deleted).
         assert!(green.retired[1], "the emptied donor retires cleanly");
         assert!(!green.retired[0], "the receiver is not retired");
-        assert_eq!(green.slots[1], (0, 0), "the donor has no members left (all transferred)");
+        assert_eq!(
+            green.slots[1],
+            (0, 0),
+            "the donor has no members left (all transferred)"
+        );
 
         // RED control: merge disabled ⇒ no transfer, no slot drop, no retire.
         let red = run_merge_flow(&merge_reinforce_scenario(false));
-        assert_eq!(red.merge, None, "with merge disabled the donor cannot transfer (no merge column)");
-        assert_eq!(red.slots[0], (1, 1), "the receiver's pending slot stays OPEN (must be spawned)");
-        assert!(!red.retired[1], "the donor does not empty/retire without the transfer");
+        assert_eq!(
+            red.merge, None,
+            "with merge disabled the donor cannot transfer (no merge column)"
+        );
+        assert_eq!(
+            red.slots[0],
+            (1, 1),
+            "the receiver's pending slot stays OPEN (must be spawned)"
+        );
+        assert!(
+            !red.retired[1],
+            "the donor does not empty/retire without the transfer"
+        );
     }
 
     /// FORMING-CONSOLIDATION end-to-end (ADR 0027 lines 270-271 — "two squads stuck at 1/4 each → one at
@@ -4286,8 +5236,14 @@ mod tests {
                     sheddable_heal: 0,
                     current_objective: 0,
                     slots: vec![
-                        MergeSlot { role: SquadRole::RangedDPS, filled: true },
-                        MergeSlot { role: SquadRole::RangedDPS, filled: false },
+                        MergeSlot {
+                            role: SquadRole::RangedDPS,
+                            filled: true,
+                        },
+                        MergeSlot {
+                            role: SquadRole::RangedDPS,
+                            filled: false,
+                        },
                     ],
                     merge_eligible: false,
                 },
@@ -4299,8 +5255,14 @@ mod tests {
                     sheddable_heal: 30,
                     current_objective: 1,
                     slots: vec![
-                        MergeSlot { role: SquadRole::RangedDPS, filled: true },
-                        MergeSlot { role: SquadRole::RangedDPS, filled: false },
+                        MergeSlot {
+                            role: SquadRole::RangedDPS,
+                            filled: true,
+                        },
+                        MergeSlot {
+                            role: SquadRole::RangedDPS,
+                            filled: false,
+                        },
                     ],
                     merge_eligible: true,
                 },
@@ -4311,9 +5273,20 @@ mod tests {
             merge_enabled: true,
         };
         let out = run_merge_flow(&s);
-        assert_eq!(out.merge, Some((1, 0, 1)), "the donor consolidates its present member into the receiver");
-        assert_eq!(out.slots[0], (2, 0), "the receiver is now at 2/2 (consolidated) — the pending slot dropped");
-        assert!(out.retired[1], "the donor emptied and retired (two 1/2 squads became one 2/2)");
+        assert_eq!(
+            out.merge,
+            Some((1, 0, 1)),
+            "the donor consolidates its present member into the receiver"
+        );
+        assert_eq!(
+            out.slots[0],
+            (2, 0),
+            "the receiver is now at 2/2 (consolidated) — the pending slot dropped"
+        );
+        assert!(
+            out.retired[1],
+            "the donor emptied and retired (two 1/2 squads became one 2/2)"
+        );
     }
 
     /// The merge flow is DETERMINISTIC (ADR 0032 §Determinism): the same scenario yields a byte-identical
@@ -4338,11 +5311,23 @@ mod tests {
         // through observe_neighbours (armed Attack body, visible, non-owned, within leash).
         let out = run_v1_flow(&v1_threat_walks_to_neighbour(true));
         match out {
-            ChurnOutcome::Reassigned { from_gen, reassignments, .. } => {
-                assert_eq!(from_gen, 0, "same squad followed the threat via the lifted observe chain (no churn)");
-                assert!(reassignments >= 1, "the squad rebound to the neighbour Secure produced by observe_neighbours");
+            ChurnOutcome::Reassigned {
+                from_gen,
+                reassignments,
+                ..
+            } => {
+                assert_eq!(
+                    from_gen, 0,
+                    "same squad followed the threat via the lifted observe chain (no churn)"
+                );
+                assert!(
+                    reassignments >= 1,
+                    "the squad rebound to the neighbour Secure produced by observe_neighbours"
+                );
             }
-            other => panic!("the full defense production chain must drive Secure end-to-end, got {other:?}"),
+            other => panic!(
+                "the full defense production chain must drive Secure end-to-end, got {other:?}"
+            ),
         }
     }
 
@@ -4362,7 +5347,10 @@ mod tests {
                 room: (2, 0),
                 objective: DoctrineObjective::KillImmuneStructure,
                 honor_verdict: true, // a gated doctrine — must pass the winnability gate to field
-                defense: DefenseProfile { objective_hits: 50_000, ..Default::default() },
+                defense: DefenseProfile {
+                    objective_hits: 50_000,
+                    ..Default::default()
+                },
                 target_value: 1_000_000.0,
             }],
             member_energy: 5600,
@@ -4377,7 +5365,11 @@ mod tests {
             matches!(out, ChurnOutcome::DeployedAndEngaged { generations: 0, .. }),
             "a winnable undefended core must field + engage end-to-end, got {out:?}"
         );
-        assert_eq!(run_offense_flow(&s), out, "the offense flow is deterministic");
+        assert_eq!(
+            run_offense_flow(&s),
+            out,
+            "the offense flow is deterministic"
+        );
     }
 
     /// A SAFE-MODED room is UNWINNABLE (zero damage possible): the gated doctrine's winnability gate DEFERS
@@ -4392,7 +5384,11 @@ mod tests {
                 objective: DoctrineObjective::KillImmuneStructure,
                 honor_verdict: true,
                 // Safe mode → zero damage possible → unwinnable → the gate defers (no comp).
-                defense: DefenseProfile { objective_hits: 50_000, safe_mode: true, ..Default::default() },
+                defense: DefenseProfile {
+                    objective_hits: 50_000,
+                    safe_mode: true,
+                    ..Default::default()
+                },
                 target_value: 1_000_000.0,
             }],
             member_energy: 5600,
@@ -4404,10 +5400,17 @@ mod tests {
         };
         let out = run_offense_flow(&s);
         assert!(
-            matches!(out, ChurnOutcome::ChurnedNeverDeployed { generations: 0, .. }),
+            matches!(
+                out,
+                ChurnOutcome::ChurnedNeverDeployed { generations: 0, .. }
+            ),
             "an unwinnable safe-moded room must be gated out (no squad fielded), got {out:?}"
         );
-        assert_eq!(run_offense_flow(&s), out, "the offense flow is deterministic");
+        assert_eq!(
+            run_offense_flow(&s),
+            out,
+            "the offense flow is deterministic"
+        );
     }
 
     /// ADR 0027 v1.1 P1 — the SALVAGE BREACH migration, proved offline end-to-end. A derelict room's
@@ -4428,7 +5431,10 @@ mod tests {
                 objective: DoctrineObjective::DismantleStructure,
                 honor_verdict: true, // gated offense — must pass the winnability gate to field
                 // A feasible dismantlable seal: the corridor's total hits (a single over-horizon wall here).
-                defense: DefenseProfile { objective_hits: 30_000, ..Default::default() },
+                defense: DefenseProfile {
+                    objective_hits: 30_000,
+                    ..Default::default()
+                },
                 target_value: 1_000_000.0,
             }],
             member_energy: 5600,
@@ -4443,7 +5449,11 @@ mod tests {
             matches!(out, ChurnOutcome::DeployedAndEngaged { generations: 0, .. }),
             "a feasible breach blocker must field a SiegeBreach squad + engage (dismantle) it end-to-end, got {out:?}"
         );
-        assert_eq!(run_offense_flow(&s), out, "the salvage breach flow is deterministic");
+        assert_eq!(
+            run_offense_flow(&s),
+            out,
+            "the salvage breach flow is deterministic"
+        );
     }
 
     /// The breach winnability gate: a breach corridor sealed past any feasible WORK budget (an enormous hit
@@ -4459,7 +5469,10 @@ mod tests {
                 objective: DoctrineObjective::DismantleStructure,
                 honor_verdict: true,
                 // A wall hit-pool far beyond what a WORK squad can chew in the window → unwinnable → deferred.
-                defense: DefenseProfile { objective_hits: u32::MAX, ..Default::default() },
+                defense: DefenseProfile {
+                    objective_hits: u32::MAX,
+                    ..Default::default()
+                },
                 target_value: 1_000_000.0,
             }],
             member_energy: 5600,
@@ -4471,10 +5484,17 @@ mod tests {
         };
         let out = run_offense_flow(&s);
         assert!(
-            matches!(out, ChurnOutcome::ChurnedNeverDeployed { generations: 0, .. }),
+            matches!(
+                out,
+                ChurnOutcome::ChurnedNeverDeployed { generations: 0, .. }
+            ),
             "an infeasible breach seal must be gated out (no squad fielded), got {out:?}"
         );
-        assert_eq!(run_offense_flow(&s), out, "the salvage breach flow is deterministic");
+        assert_eq!(
+            run_offense_flow(&s),
+            out,
+            "the salvage breach flow is deterministic"
+        );
     }
 
     // ── ADR 0027 v1.1 P2 — the DECLAIM flow ──────────────────────────────────────────────────────────────
@@ -4487,11 +5507,11 @@ mod tests {
         DeclaimFlowScenario {
             home: (0, 0),
             controller_room: (1, 0),
-            cadence: 1000,             // the engine upgrade-block (>> COMMITMENT_BUDGET=400)
-            strikes_to_neutralize: 3,  // multiple cadence cycles
+            cadence: 1000, // the engine upgrade-block (>> COMMITMENT_BUDGET=400)
+            strikes_to_neutralize: 3, // multiple cadence cycles
             form_ticks: 4,
-            objective_ttl: 100,        // << cadence — proves the objective survives via the lease, not the TTL
-            budget_ticks: 4000,        // room for 3 cadence cycles + form + travel
+            objective_ttl: 100, // << cadence — proves the objective survives via the lease, not the TTL
+            budget_ticks: 4000, // room for 3 cadence cycles + form + travel
         }
     }
 
@@ -4505,11 +5525,18 @@ mod tests {
         let out = run_declaim_flow(&declaim_scenario());
         match out {
             DeclaimOutcome::Neutralized { cadence_cycles, .. } => {
-                assert_eq!(cadence_cycles, 3, "all three cadence-cycle strikes landed (the squad persisted)");
+                assert_eq!(
+                    cadence_cycles, 3,
+                    "all three cadence-cycle strikes landed (the squad persisted)"
+                );
             }
             other => panic!("declaim must persist across the cadence + neutralize, got {other:?}"),
         }
-        assert_eq!(run_declaim_flow(&declaim_scenario()), out, "the declaim flow is deterministic");
+        assert_eq!(
+            run_declaim_flow(&declaim_scenario()),
+            out,
+            "the declaim flow is deterministic"
+        );
     }
 
     /// The declaimer must persist EVEN THOUGH the lease lapses mid-cadence — i.e. the success above is NOT an
@@ -4519,7 +5546,10 @@ mod tests {
     #[test]
     fn declaim_flow_lease_actually_lapses_between_strikes() {
         let s = declaim_scenario();
-        assert!(s.cadence > COMMITMENT_BUDGET, "the test must exercise the mid-cadence lapse the hold bridges");
+        assert!(
+            s.cadence > COMMITMENT_BUDGET,
+            "the test must exercise the mid-cadence lapse the hold bridges"
+        );
         let out = run_declaim_flow(&s);
         assert!(
             matches!(out, DeclaimOutcome::Neutralized { .. }),

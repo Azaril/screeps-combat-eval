@@ -32,7 +32,9 @@ pub struct SuiteReport {
 /// Cross every scenario a generator offers with a validator (stage 1 → stage 3). Generation ⊥
 /// validation: any generator pairs with any validator.
 pub fn run_suite(generator: &dyn Generator, validator: &mut dyn Validator) -> SuiteReport {
-    let verdicts: Vec<Verdict> = (0..generator.count()).map(|i| validator.validate(&generator.generate(i))).collect();
+    let verdicts: Vec<Verdict> = (0..generator.count())
+        .map(|i| validator.validate(&generator.generate(i)))
+        .collect();
     let passed = verdicts.iter().filter(|v| v.pass).count() as u32;
     SuiteReport {
         generator: generator.label().into(),
@@ -64,7 +66,9 @@ mod tests {
     use super::*;
     use generate::{CreepClearBed, Designed, ForemanGenerator, ImportedRoom, Permutations};
     use scenario::ObjectiveKind;
-    use validate::{clear_outcome_at, CreepClearWins, ManagedSquadIntegration, SelfPlay, SizingWins};
+    use validate::{
+        clear_outcome_at, CreepClearWins, ManagedSquadIntegration, SelfPlay, SizingWins,
+    };
 
     /// The WIN gate (ADR 0022 P-FORCE / ADR 0023a stages 1–3): over 200 seeded defended-base scenarios,
     /// the force-sizing oracle is calibrated against the engine — winnable verdicts breach (fp ≤ 1%) and
@@ -73,8 +77,16 @@ mod tests {
     fn oracle_is_calibrated_against_the_engine() {
         let c = calibrate(200);
         println!("{}", c.report());
-        assert!(c.fielded >= 20, "too few fielded scenarios to calibrate FP ({})", c.fielded);
-        assert!(c.deferred >= 20, "too few deferred scenarios to calibrate FN ({})", c.deferred);
+        assert!(
+            c.fielded >= 20,
+            "too few fielded scenarios to calibrate FP ({})",
+            c.fielded
+        );
+        assert!(
+            c.deferred >= 20,
+            "too few deferred scenarios to calibrate FN ({})",
+            c.deferred
+        );
         assert!(
             c.fp_rate() <= 0.01,
             "FALSE POSITIVES {}/{} (fp_rate {:.3} > 0.010)\n{}",
@@ -96,7 +108,10 @@ mod tests {
     /// Determinism: the same seed count yields the same tally (SplitMix64 over the index).
     #[test]
     fn calibration_is_deterministic() {
-        assert_eq!(format!("{:?}", calibrate(64)), format!("{:?}", calibrate(64)));
+        assert_eq!(
+            format!("{:?}", calibrate(64)),
+            format!("{:?}", calibrate(64))
+        );
     }
 
     /// Stage wiring smoke test: `run_suite` produces one verdict per generated scenario.
@@ -125,9 +140,22 @@ mod tests {
             let verdict = v.validate(&s);
             println!("{:48} -> {}", s.label, verdict.detail);
         }
-        println!("creep-clear win rate: {:.0}% ({}/{} fielded)", v.win_rate() * 100.0, v.won, v.attempted);
-        assert!(v.attempted >= 2, "at least some beds fielded a sized squad ({})", v.attempted);
-        assert!(v.win_rate() >= 0.75, "clear_force-sized squads should clear most winnable beds (got {:.0}%)", v.win_rate() * 100.0);
+        println!(
+            "creep-clear win rate: {:.0}% ({}/{} fielded)",
+            v.win_rate() * 100.0,
+            v.won,
+            v.attempted
+        );
+        assert!(
+            v.attempted >= 2,
+            "at least some beds fielded a sized squad ({})",
+            v.attempted
+        );
+        assert!(
+            v.win_rate() >= 0.75,
+            "clear_force-sized squads should clear most winnable beds (got {:.0}%)",
+            v.win_rate() * 100.0
+        );
     }
 
     /// ADR 0026 §9.10 L6b — the `COORDINATED_DPS_MARGIN` sweep on the creep-clear bed. For a range of
@@ -161,7 +189,10 @@ mod tests {
             }
         }
         let (bm, _) = best.expect("swept at least one margin");
-        println!("BEST margin: {bm:.2} (shipped COORDINATED_DPS_MARGIN seed = {:.2})", screeps_combat_decision::force_sizing::COORDINATED_DPS_MARGIN);
+        println!(
+            "BEST margin: {bm:.2} (shipped COORDINATED_DPS_MARGIN seed = {:.2})",
+            screeps_combat_decision::force_sizing::COORDINATED_DPS_MARGIN
+        );
         assert!(bm >= 1.0);
     }
 
@@ -172,7 +203,10 @@ mod tests {
         let html = calibration_replay(7);
         assert!(html.starts_with("<!doctype html>") && html.trim_end().ends_with("</html>"));
         assert!(html.contains("window.REPLAY=") && html.contains("IbexReplay.start"));
-        assert!(html.contains("\"frames\":[{"), "embeds a non-empty frame array");
+        assert!(
+            html.contains("\"frames\":[{"),
+            "embeds a non-empty frame array"
+        );
         assert!(html.contains("\"verdict\":"));
     }
 
@@ -185,13 +219,20 @@ mod tests {
             assert!(g.count() > 0, "{label} offers scenarios");
             let mut v = OracleCalibration::new();
             let report = run_suite(g, &mut v);
-            assert_eq!(report.verdicts.len(), g.count() as usize, "{label}: a verdict per scenario");
+            assert_eq!(
+                report.verdicts.len(),
+                g.count() as usize,
+                "{label}: a verdict per scenario"
+            );
             // Every scenario has at least one objective with the staging tiles populated.
             for i in 0..g.count() {
                 let s = g.generate(i);
                 assert!(!s.objectives.is_empty(), "{label}#{i} has an objective");
                 let o = &s.objectives[0];
-                assert!(!o.front_tiles.is_empty() && !o.support_tiles.is_empty(), "{label}#{i} staged");
+                assert!(
+                    !o.front_tiles.is_empty() && !o.support_tiles.is_empty(),
+                    "{label}#{i} staged"
+                );
             }
         }
     }
@@ -206,7 +247,11 @@ mod tests {
         let scenario = Permutations.generate(0);
         let mut v = ManagedSquadIntegration;
         let verdict = v.validate(&scenario);
-        assert!(verdict.pass, "the managed assault did not reach/engage the undefended objective: {}", verdict.detail);
+        assert!(
+            verdict.pass,
+            "the managed assault did not reach/engage the undefended objective: {}",
+            verdict.detail
+        );
     }
 
     /// Validator-swap (ADR 0023a): the SAME generator feeds a different validator (`SizingWins`) — the
@@ -216,8 +261,15 @@ mod tests {
         let mut v = SizingWins::default();
         let report = run_suite(&RandomDefendedBase { n: 64 }, &mut v);
         assert_eq!(report.verdicts.len(), 64);
-        assert!(v.attempted > 0, "some scenarios are winnable+fielded sizing attempts");
-        assert!(v.win_rate() >= 0.99, "the fielded sized force wins its attempts (win_rate {:.3})", v.win_rate());
+        assert!(
+            v.attempted > 0,
+            "some scenarios are winnable+fielded sizing attempts"
+        );
+        assert!(
+            v.win_rate() >= 0.99,
+            "the fielded sized force wins its attempts (win_rate {:.3})",
+            v.win_rate()
+        );
     }
 
     /// Self-play realism + the kiting-stalemate fix (operator-requested): in the open no-tower skirmish
@@ -229,8 +281,16 @@ mod tests {
         let scenario = Designed.generate(5);
         let mut v = SelfPlay;
         let verdict = v.validate(&scenario);
-        assert!(verdict.pass, "self-play did not resolve (frozen standoff?): {}", verdict.detail);
-        assert!(!verdict.detail.contains("Timeout"), "self-play froze at range instead of closing to a result: {}", verdict.detail);
+        assert!(
+            verdict.pass,
+            "self-play did not resolve (frozen standoff?): {}",
+            verdict.detail
+        );
+        assert!(
+            !verdict.detail.contains("Timeout"),
+            "self-play froze at range instead of closing to a result: {}",
+            verdict.detail
+        );
     }
 
     /// Empty-recording regression (operator-flagged): self-play over a scenario with NO defender creeps
@@ -239,8 +299,14 @@ mod tests {
     #[test]
     fn self_play_records_frames_even_without_defenders() {
         let html = validate::render_self_play_replay(&Permutations.generate(0));
-        assert!(!html.contains("\"frames\":[]"), "self-play recorded zero frames (the empty-recording bug)");
-        assert!(html.contains("\"frames\":[{"), "non-empty frame array embedded");
+        assert!(
+            !html.contains("\"frames\":[]"),
+            "self-play recorded zero frames (the empty-recording bug)"
+        );
+        assert!(
+            html.contains("\"frames\":[{"),
+            "non-empty frame array embedded"
+        );
     }
 
     /// Multi-room cross-room movement (operator-flagged): the twin-room assault (Designed#4) must
@@ -251,7 +317,11 @@ mod tests {
         let scenario = Designed.generate(4);
         let mut v = ManagedSquadIntegration;
         let verdict = v.validate(&scenario);
-        assert!(verdict.pass, "the assault did not cross into the objective room + engage: {}", verdict.detail);
+        assert!(
+            verdict.pass,
+            "the assault did not cross into the objective room + engage: {}",
+            verdict.detail
+        );
     }
 
     // ── ADR 0025 §12 Stage 2: imported-terrain scenarios (single + multi-room × objectives × comps) ──
@@ -261,23 +331,41 @@ mod tests {
     /// `terrain_generators_produce_assessable_scenarios` for the real-terrain generator).
     #[test]
     fn imported_room_every_kind_is_assessable() {
-        let g = ImportedRoom { multi_room: false, n_comps: 2 };
+        let g = ImportedRoom {
+            multi_room: false,
+            n_comps: 2,
+        };
         assert!(g.count() > 0, "imported-room offers scenarios");
         let mut v = OracleCalibration::new();
         let report = run_suite(&g, &mut v);
-        assert_eq!(report.verdicts.len(), g.count() as usize, "a verdict per scenario");
+        assert_eq!(
+            report.verdicts.len(),
+            g.count() as usize,
+            "a verdict per scenario"
+        );
         let mut kinds_seen = std::collections::HashSet::new();
         for i in 0..g.count() {
             let s = g.generate(i);
             assert!(!s.objectives.is_empty(), "imported#{i} has an objective");
             let o = &s.objectives[0];
-            assert!(!o.front_tiles.is_empty() && !o.support_tiles.is_empty(), "imported#{i} ({:?}) is staged", o.kind);
+            assert!(
+                !o.front_tiles.is_empty() && !o.support_tiles.is_empty(),
+                "imported#{i} ({:?}) is staged",
+                o.kind
+            );
             // The objective + staging sit on the navigable interior (not in a wall).
             let t = s.world.terrain_for(o.room);
-            assert!(!t.is_wall(o.pos.x().u8(), o.pos.y().u8()), "imported#{i} objective is on a clear tile");
+            assert!(
+                !t.is_wall(o.pos.x().u8(), o.pos.y().u8()),
+                "imported#{i} objective is on a clear tile"
+            );
             kinds_seen.insert(o.kind);
         }
-        assert_eq!(kinds_seen.len(), 5, "all five objective kinds are exercised, got {kinds_seen:?}");
+        assert_eq!(
+            kinds_seen.len(),
+            5,
+            "all five objective kinds are exercised, got {kinds_seen:?}"
+        );
     }
 
     /// A `Declaim` scenario carries a defender-owned controller at the objective (the world plumbing the
@@ -285,11 +373,21 @@ mod tests {
     /// ADR 0025 §11 #11 / §12 fallback #4).
     #[test]
     fn imported_declaim_has_a_controller() {
-        let g = ImportedRoom { multi_room: false, n_comps: 1 };
-        let declaim = (0..g.count()).map(|i| g.generate(i)).find(|s| s.objectives[0].kind == ObjectiveKind::Declaim).expect("a declaim scenario exists");
+        let g = ImportedRoom {
+            multi_room: false,
+            n_comps: 1,
+        };
+        let declaim = (0..g.count())
+            .map(|i| g.generate(i))
+            .find(|s| s.objectives[0].kind == ObjectiveKind::Declaim)
+            .expect("a declaim scenario exists");
         let ctrl = &declaim.world.controllers;
         assert!(!ctrl.is_empty(), "declaim scenario has a controller");
-        assert!(ctrl.iter().any(|c| c.owner == Some(generate::DEFENDER) && c.pos == declaim.objectives[0].pos), "the controller is defender-owned at the objective tile");
+        assert!(
+            ctrl.iter()
+                .any(|c| c.owner == Some(generate::DEFENDER) && c.pos == declaim.objectives[0].pos),
+            "the controller is defender-owned at the objective tile"
+        );
     }
 
     /// The traversal lens over REAL terrain: a moving managed squad navigates an imported single-room
@@ -297,9 +395,15 @@ mod tests {
     /// fixtures — the operator's "terrain renders + a squad navigates it" Stage 1/2 smoke test.
     #[test]
     fn imported_room_navigable() {
-        let g = ImportedRoom { multi_room: false, n_comps: 1 };
+        let g = ImportedRoom {
+            multi_room: false,
+            n_comps: 1,
+        };
         // The Raze fixtures are indices 0..fixtures (kind index 0). Field the moving squad on each.
-        let raze: Vec<_> = (0..g.count()).map(|i| g.generate(i)).filter(|s| s.objectives[0].kind == ObjectiveKind::Raze).collect();
+        let raze: Vec<_> = (0..g.count())
+            .map(|i| g.generate(i))
+            .filter(|s| s.objectives[0].kind == ObjectiveKind::Raze)
+            .collect();
         assert!(!raze.is_empty(), "there are single-room Raze fixtures");
         let mut passed = 0;
         for s in &raze {
@@ -308,7 +412,11 @@ mod tests {
                 passed += 1;
             }
         }
-        assert!(passed * 5 >= raze.len() * 3, "the managed squad navigates most real-terrain bases ({passed}/{} reached/engaged)", raze.len());
+        assert!(
+            passed * 5 >= raze.len() * 3,
+            "the managed squad navigates most real-terrain bases ({passed}/{} reached/engaged)",
+            raze.len()
+        );
     }
 
     /// The multi-room imported variant is well-formed: it stages the assault in a DIFFERENT room than the
@@ -316,15 +424,26 @@ mod tests {
     /// caveat, so this gates on well-formedness + oracle-assessability, not strict crossing).
     #[test]
     fn multi_room_imported_is_assessable() {
-        let g = ImportedRoom { multi_room: true, n_comps: 1 };
+        let g = ImportedRoom {
+            multi_room: true,
+            n_comps: 1,
+        };
         assert!(g.count() > 0, "multi-room imported offers scenarios");
         let mut v = OracleCalibration::new();
         let report = run_suite(&g, &mut v);
-        assert_eq!(report.verdicts.len(), g.count() as usize, "a verdict per scenario");
+        assert_eq!(
+            report.verdicts.len(),
+            g.count() as usize,
+            "a verdict per scenario"
+        );
         for i in 0..g.count() {
             let s = g.generate(i);
             let o = &s.objectives[0];
-            assert_ne!(o.entry.room_name(), o.room, "multi-room#{i} stages in a different room than the objective");
+            assert_ne!(
+                o.entry.room_name(),
+                o.room,
+                "multi-room#{i} stages in a different room than the objective"
+            );
         }
     }
 
@@ -339,11 +458,28 @@ mod tests {
         assert!(g.count() > 0, "the committed foreman cache is non-empty");
         let s = g.generate(0); // base 0, kind Raze
         let o = &s.objectives[0];
-        let spawns = s.world.structures.iter().filter(|st| st.kind == StructureKind::Spawn).count();
-        let ramparts = s.world.structures.iter().filter(|st| st.kind == StructureKind::Rampart).count();
+        let spawns = s
+            .world
+            .structures
+            .iter()
+            .filter(|st| st.kind == StructureKind::Spawn)
+            .count();
+        let ramparts = s
+            .world
+            .structures
+            .iter()
+            .filter(|st| st.kind == StructureKind::Rampart)
+            .count();
         assert!(spawns >= 1, "realized base has a spawn ({spawns})");
-        assert!(!s.world.towers.is_empty(), "realized base has energized towers ({})", s.world.towers.len());
-        assert!(ramparts >= 1, "realized base has a rampart ring ({ramparts})");
+        assert!(
+            !s.world.towers.is_empty(),
+            "realized base has energized towers ({})",
+            s.world.towers.len()
+        );
+        assert!(
+            ramparts >= 1,
+            "realized base has a rampart ring ({ramparts})"
+        );
         let walls = s.world.terrain_for(o.room).walls.len();
         assert!(walls > 50, "real terrain decoded ({walls} walls)");
     }
@@ -355,19 +491,34 @@ mod tests {
         let g = ForemanGenerator { n_comps: 1 };
         let mut v = OracleCalibration::new();
         let report = run_suite(&g, &mut v);
-        assert_eq!(report.verdicts.len(), g.count() as usize, "a verdict per scenario");
+        assert_eq!(
+            report.verdicts.len(),
+            g.count() as usize,
+            "a verdict per scenario"
+        );
         let mut kinds = std::collections::HashSet::new();
         for i in 0..g.count() {
             let s = g.generate(i);
             let o = &s.objectives[0];
-            assert!(!o.front_tiles.is_empty() && !o.support_tiles.is_empty(), "foreman#{i} ({:?}) staged", o.kind);
+            assert!(
+                !o.front_tiles.is_empty() && !o.support_tiles.is_empty(),
+                "foreman#{i} ({:?}) staged",
+                o.kind
+            );
             let t = s.world.terrain_for(o.room);
             for fp in &o.front_tiles {
-                assert!(!t.is_wall(fp.x().u8(), fp.y().u8()), "foreman#{i} front tile is on a clear tile");
+                assert!(
+                    !t.is_wall(fp.x().u8(), fp.y().u8()),
+                    "foreman#{i} front tile is on a clear tile"
+                );
             }
             kinds.insert(o.kind);
         }
-        assert_eq!(kinds.len(), 5, "all five kinds over foreman bases, got {kinds:?}");
+        assert_eq!(
+            kinds.len(),
+            5,
+            "all five kinds over foreman bases, got {kinds:?}"
+        );
     }
 
     /// The breach objective targets a RAMPART (the real ring's breach point), proving the adaptive
@@ -376,10 +527,22 @@ mod tests {
     fn foreman_breach_targets_a_rampart() {
         use screeps_combat_engine::StructureKind;
         let g = ForemanGenerator { n_comps: 1 };
-        let breach = (0..g.count()).map(|i| g.generate(i)).find(|s| s.objectives[0].kind == ObjectiveKind::Breach).expect("a breach scenario exists");
+        let breach = (0..g.count())
+            .map(|i| g.generate(i))
+            .find(|s| s.objectives[0].kind == ObjectiveKind::Breach)
+            .expect("a breach scenario exists");
         let o = &breach.objectives[0];
-        let target = breach.world.structures.iter().find(|st| st.id == o.id).expect("breach objective id is a real structure");
-        assert_eq!(target.kind, StructureKind::Rampart, "breach targets a rampart gate from the real ring");
+        let target = breach
+            .world
+            .structures
+            .iter()
+            .find(|st| st.id == o.id)
+            .expect("breach objective id is a real structure");
+        assert_eq!(
+            target.kind,
+            StructureKind::Rampart,
+            "breach targets a rampart gate from the real ring"
+        );
     }
 
     /// Eyeball hook (operator visual validation): render managed assaults on the real foreman bases.
@@ -391,7 +554,11 @@ mod tests {
         for i in 0..g.count().min(5) {
             let s = g.generate(i);
             let html = render_managed_replay(&s);
-            std::fs::write(format!("foreman-replay-{}.html", s.label.replace(['#', ':'], "_")), html).unwrap();
+            std::fs::write(
+                format!("foreman-replay-{}.html", s.label.replace(['#', ':'], "_")),
+                html,
+            )
+            .unwrap();
         }
     }
 
@@ -410,19 +577,41 @@ mod tests {
             let s = Designed.generate(i);
             let cross_room = s.objectives.iter().any(|o| o.entry.room_name() != o.room);
             if let Some(r) = managed_oscillation_rate(&s) {
-                println!("designed#{i} oscillation {:.1}%{}", r * 100.0, if cross_room { " (cross-room, excluded)" } else { "" });
+                println!(
+                    "designed#{i} oscillation {:.1}%{}",
+                    r * 100.0,
+                    if cross_room {
+                        " (cross-room, excluded)"
+                    } else {
+                        ""
+                    }
+                );
                 if cross_room {
-                    assert!(r <= 0.97, "cross-room oscillation must not fully regress ({:.1}%)", r * 100.0);
+                    assert!(
+                        r <= 0.97,
+                        "cross-room oscillation must not fully regress ({:.1}%)",
+                        r * 100.0
+                    );
                 } else {
                     single_room.push(r);
                 }
             }
         }
-        assert!(!single_room.is_empty(), "at least one single-room Designed assault fielded a squad");
+        assert!(
+            !single_room.is_empty(),
+            "at least one single-room Designed assault fielded a squad"
+        );
         let mean = single_room.iter().sum::<f64>() / single_room.len() as f64;
         println!("mean single-room period-2 oscillation {:.2}%", mean * 100.0);
-        assert!(single_room.iter().all(|&r| r <= 0.10), "every single-room scenario stays ≤10% period-2 oscillation");
-        assert!(mean <= 0.05, "mean single-room period-2 oscillation stays low ({:.2}%)", mean * 100.0);
+        assert!(
+            single_room.iter().all(|&r| r <= 0.10),
+            "every single-room scenario stays ≤10% period-2 oscillation"
+        );
+        assert!(
+            mean <= 0.05,
+            "mean single-room period-2 oscillation stays low ({:.2}%)",
+            mean * 100.0
+        );
     }
 
     /// The dashboard writes per-scenario replays + a contact-sheet index (smoke).
@@ -447,7 +636,11 @@ mod tests {
         for i in 0..Designed.count() {
             let s = Designed.generate(i);
             let name = s.label.replace([' ', '#'], "_");
-            std::fs::write(format!("target/replays/managed-{name}.html"), render_managed_replay(&s)).unwrap();
+            std::fs::write(
+                format!("target/replays/managed-{name}.html"),
+                render_managed_replay(&s),
+            )
+            .unwrap();
         }
         // A calibration breach + defer (the sizing-pure lens).
         let gen = RandomDefendedBase { n: 200 };
@@ -465,6 +658,9 @@ mod tests {
                 break;
             }
         }
-        println!("wrote managed (x{}) + calibration replays to target/replays/", Designed.count());
+        println!(
+            "wrote managed (x{}) + calibration replays to target/replays/",
+            Designed.count()
+        );
     }
 }

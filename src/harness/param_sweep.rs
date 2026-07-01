@@ -19,7 +19,10 @@
 //! per-case stability); [`tests::sweep_point_is_deterministic`] pins a sample point run-twice-equal.
 
 use crate::harness::generate::{ForceSpec, Generator, Layout, RandomDefendedBase};
-use crate::harness::lifecycle::{run_defended_lifecycle_with_params, ColonyFormingScenario, EconomyPressure, Home, LifecycleOutcome};
+use crate::harness::lifecycle::{
+    run_defended_lifecycle_with_params, ColonyFormingScenario, EconomyPressure, Home,
+    LifecycleOutcome,
+};
 use crate::harness::validate::{CreepClearWins, OracleCalibration, SizingWins, Validator};
 use screeps_combat_decision::composition::{assemble_force, CompositionParams};
 use screeps_combat_decision::force_sizing::RequiredForce;
@@ -60,7 +63,11 @@ impl ParamScore {
     /// Encoded as `(gates_held, win_rate, -cost)` — larger is better on every field, so a plain DESC sort on
     /// the tuple yields the winning-but-efficient order.
     pub fn winning_efficient_key(&self) -> (u8, f64, f64) {
-        (self.gates_held as u8, self.win_rate, -self.mean_spawn_cost_per_win)
+        (
+            self.gates_held as u8,
+            self.win_rate,
+            -self.mean_spawn_cost_per_win,
+        )
     }
 }
 
@@ -100,10 +107,27 @@ impl Regime {
 /// `defended_forming`): 4 RCL8 homes so the breach force can be sized + formed under economy contention.
 fn defended_forming() -> ColonyFormingScenario {
     ColonyFormingScenario {
-        composition: assemble_force(&RequiredForce { heal_parts: 40, immune_struct_parts: 30, ..Default::default() }, 12_900)
-            .expect("placeholder comp assembles at RCL8"),
-        homes: (0..4).map(|_| Home { energy_capacity: 12_900, income: 1000, start_energy: 12_900 }).collect(),
-        economy: EconomyPressure { hauler: Some((75.0, 1000)), miner: None, miner_period: 0 },
+        composition: assemble_force(
+            &RequiredForce {
+                heal_parts: 40,
+                immune_struct_parts: 30,
+                ..Default::default()
+            },
+            12_900,
+        )
+        .expect("placeholder comp assembles at RCL8"),
+        homes: (0..4)
+            .map(|_| Home {
+                energy_capacity: 12_900,
+                income: 1000,
+                start_energy: 12_900,
+            })
+            .collect(),
+        economy: EconomyPressure {
+            hauler: Some((75.0, 1000)),
+            miner: None,
+            miner_period: 0,
+        },
         combat_priority: 87.5,
         per_member_cap: 12_900,
         budget_ticks: 4000,
@@ -119,10 +143,34 @@ type AcceptanceRegime = (&'static str, u32, Vec<((u8, u8), u32)>, Layout, ForceS
 /// graded sweep regimes — rampart thickness / tower presence / approach / guard strength).
 fn acceptance_regimes() -> Vec<AcceptanceRegime> {
     vec![
-        ("canonical: rampart + tower + guard", 30_000, vec![((24, 16), 100_000)], Layout::Open, ForceSpec::Guard(2)),
-        ("rampart-only + light guard", 50_000, vec![], Layout::Open, ForceSpec::Guard(1)),
-        ("tower-only + guard", 0, vec![((24, 16), 100_000)], Layout::Open, ForceSpec::Guard(2)),
-        ("corridor choke + guard", 20_000, vec![((24, 16), 100_000)], Layout::Corridor, ForceSpec::Guard(2)),
+        (
+            "canonical: rampart + tower + guard",
+            30_000,
+            vec![((24, 16), 100_000)],
+            Layout::Open,
+            ForceSpec::Guard(2),
+        ),
+        (
+            "rampart-only + light guard",
+            50_000,
+            vec![],
+            Layout::Open,
+            ForceSpec::Guard(1),
+        ),
+        (
+            "tower-only + guard",
+            0,
+            vec![((24, 16), 100_000)],
+            Layout::Open,
+            ForceSpec::Guard(2),
+        ),
+        (
+            "corridor choke + guard",
+            20_000,
+            vec![((24, 16), 100_000)],
+            Layout::Corridor,
+            ForceSpec::Guard(2),
+        ),
     ]
 }
 
@@ -142,7 +190,9 @@ pub fn evaluate_params(params: &CompositionParams, regime: Regime) -> ParamScore
     // The FP/FN gates are the universal honesty gate: a knob set that over-commits (FP) or over-defers (FN)
     // is rejected regardless of the regime filter, so the calibration bed runs unconditionally.
     let calib = {
-        let gen = RandomDefendedBase { n: SWEEP_CALIBRATION_SCENARIOS };
+        let gen = RandomDefendedBase {
+            n: SWEEP_CALIBRATION_SCENARIOS,
+        };
         let mut v = OracleCalibration::with_params(*params);
         for i in 0..gen.count() {
             v.validate(&gen.generate(i));
@@ -156,7 +206,9 @@ pub fn evaluate_params(params: &CompositionParams, regime: Regime) -> ParamScore
     let mut winning_cost = 0u64;
     let mut fielded = 0u32;
     if regime.runs_structure() {
-        let gen = RandomDefendedBase { n: SWEEP_CALIBRATION_SCENARIOS };
+        let gen = RandomDefendedBase {
+            n: SWEEP_CALIBRATION_SCENARIOS,
+        };
         let mut v = SizingWins::with_params(*params);
         for i in 0..gen.count() {
             v.validate(&gen.generate(i));
@@ -185,13 +237,22 @@ pub fn evaluate_params(params: &CompositionParams, regime: Regime) -> ParamScore
     if regime.runs_defended() {
         let bed = defended_forming();
         for (_name, rampart, towers, layout, force) in acceptance_regimes() {
-            let out = run_defended_lifecycle_with_params(&bed, rampart, &towers, layout, force, params);
+            let out =
+                run_defended_lifecycle_with_params(&bed, rampart, &towers, layout, force, params);
             acceptance_killed &= matches!(out, LifecycleOutcome::Killed { .. });
         }
     }
 
-    let win_rate = if attempted == 0 { 0.0 } else { won as f64 / attempted as f64 };
-    let mean_spawn_cost_per_win = if won == 0 { 0.0 } else { winning_cost as f64 / won as f64 };
+    let win_rate = if attempted == 0 {
+        0.0
+    } else {
+        won as f64 / attempted as f64
+    };
+    let mean_spawn_cost_per_win = if won == 0 {
+        0.0
+    } else {
+        winning_cost as f64 / won as f64
+    };
     let gates_held = calib.fp_rate() <= FP_GATE && calib.fn_rate() <= FN_GATE && acceptance_killed;
 
     ParamScore {
@@ -207,7 +268,9 @@ pub fn evaluate_params(params: &CompositionParams, regime: Regime) -> ParamScore
 /// Rank `(params, score)` points winning-but-efficiently (BEST first): gates-held points, then win-rate DESC,
 /// then mean-spawn-cost-per-win ASC; gates-failing points last. The single source of truth for the sweep
 /// ordering + the "did anything beat Default" comparison.
-pub fn rank(mut points: Vec<(CompositionParams, ParamScore)>) -> Vec<(CompositionParams, ParamScore)> {
+pub fn rank(
+    mut points: Vec<(CompositionParams, ParamScore)>,
+) -> Vec<(CompositionParams, ParamScore)> {
     points.sort_by(|a, b| {
         b.1.winning_efficient_key()
             .partial_cmp(&a.1.winning_efficient_key())
@@ -245,14 +308,20 @@ mod tests {
     /// Parse a comma-separated `f32` list from an env var (e.g. `"1.15,1.3,1.45"`); `default` when unset/empty.
     fn env_f32_list(key: &str, default: &[f32]) -> Vec<f32> {
         match std::env::var(key) {
-            Ok(s) if !s.trim().is_empty() => s.split(',').filter_map(|t| t.trim().parse::<f32>().ok()).collect(),
+            Ok(s) if !s.trim().is_empty() => s
+                .split(',')
+                .filter_map(|t| t.trim().parse::<f32>().ok())
+                .collect(),
             _ => default.to_vec(),
         }
     }
     /// Parse a comma-separated `u32` list from an env var; `default` when unset/empty.
     fn env_u32_list(key: &str, default: &[u32]) -> Vec<u32> {
         match std::env::var(key) {
-            Ok(s) if !s.trim().is_empty() => s.split(',').filter_map(|t| t.trim().parse::<u32>().ok()).collect(),
+            Ok(s) if !s.trim().is_empty() => s
+                .split(',')
+                .filter_map(|t| t.trim().parse::<u32>().ok())
+                .collect(),
             _ => default.to_vec(),
         }
     }
@@ -290,10 +359,15 @@ mod tests {
         let commits = env_f32_list("SWEEP_COMMIT", &[0.0]);
         let dynamics = env_f32_list("SWEEP_DYNAMIC", &[1.0]);
         let w_energies = env_f32_list("SWEEP_W_ENERGY", &[0.001]);
-        let regime = std::env::var("SWEEP_REGIME").ok().and_then(|s| Regime::parse(&s)).unwrap_or(Regime::All);
+        let regime = std::env::var("SWEEP_REGIME")
+            .ok()
+            .and_then(|s| Regime::parse(&s))
+            .unwrap_or(Regime::All);
         let out_path = std::env::var("SWEEP_OUT").unwrap_or_else(|_| {
             let dir = std::env::temp_dir();
-            dir.join("sweep_composition_params.txt").to_string_lossy().into_owned()
+            dir.join("sweep_composition_params.txt")
+                .to_string_lossy()
+                .into_owned()
         });
 
         // Cross-product → the candidate param set (Vec-ordered, deterministic).
@@ -333,25 +407,48 @@ mod tests {
         if !all.iter().any(|c| *c == default) {
             all.push(default);
         }
-        let scored: Vec<(CompositionParams, ParamScore)> = all.par_iter().map(|p| (*p, evaluate_params(p, regime))).collect();
-        let default_score = scored.iter().find(|(p, _)| *p == default).map(|(_, s)| *s).unwrap();
+        let scored: Vec<(CompositionParams, ParamScore)> = all
+            .par_iter()
+            .map(|p| (*p, evaluate_params(p, regime)))
+            .collect();
+        let default_score = scored
+            .iter()
+            .find(|(p, _)| *p == default)
+            .map(|(_, s)| *s)
+            .unwrap();
 
         let ranked = rank(scored);
 
         // Did any SWEPT point strictly beat Default? (gates held + a better winning-but-efficient key.)
         let default_key = default_score.winning_efficient_key();
-        let beat_default = ranked.iter().any(|(p, s)| {
-            *p != default && s.gates_held && s.winning_efficient_key() > default_key
-        });
+        let beat_default = ranked
+            .iter()
+            .any(|(p, s)| *p != default && s.gates_held && s.winning_efficient_key() > default_key);
 
         // Build the report.
         use std::fmt::Write;
         let mut report = String::new();
-        let _ = writeln!(report, "# CompositionParams sweep — {n} points, regime={regime:?}");
-        let _ = writeln!(report, "# ranked winning-but-efficient: gates-held, then win_rate DESC, then cost/win ASC");
-        let _ = writeln!(report, "# gates: FP<={FP_GATE} AND FN<={FN_GATE} AND acceptance defended bed Killed");
-        let _ = writeln!(report, "# Default baseline: {}", format_row(0, &default, &default_score));
-        let _ = writeln!(report, "# any swept point strictly beats Default: {beat_default}");
+        let _ = writeln!(
+            report,
+            "# CompositionParams sweep — {n} points, regime={regime:?}"
+        );
+        let _ = writeln!(
+            report,
+            "# ranked winning-but-efficient: gates-held, then win_rate DESC, then cost/win ASC"
+        );
+        let _ = writeln!(
+            report,
+            "# gates: FP<={FP_GATE} AND FN<={FN_GATE} AND acceptance defended bed Killed"
+        );
+        let _ = writeln!(
+            report,
+            "# Default baseline: {}",
+            format_row(0, &default, &default_score)
+        );
+        let _ = writeln!(
+            report,
+            "# any swept point strictly beats Default: {beat_default}"
+        );
         let _ = writeln!(report, "#");
         for (i, (p, s)) in ranked.iter().enumerate() {
             let marker = if *p == default { "  <== Default" } else { "" };
@@ -369,7 +466,10 @@ mod tests {
 
         // The harness ASSERTS the top point holds the gates (a sweep that can't produce ANY gated-held point
         // is a misconfigured range / a regression, not a tuning result).
-        assert!(top_s.gates_held, "the sweep's top point must hold the gates (FP/FN + acceptance); got {top_s:?}");
+        assert!(
+            top_s.gates_held,
+            "the sweep's top point must hold the gates (FP/FN + acceptance); got {top_s:?}"
+        );
     }
 
     /// DETERMINISM: a sample point scores bit-identically run-twice (the sweep is over the bit-deterministic
@@ -377,13 +477,28 @@ mod tests {
     /// fence `sim_is_deterministic_over_rounds`). Cheap (one point, Structure regime) so it can run in CI.
     #[test]
     fn sweep_point_is_deterministic() {
-        let p = CompositionParams { member_energy: 3000, ..Default::default() };
+        let p = CompositionParams {
+            member_energy: 3000,
+            ..Default::default()
+        };
         let a = evaluate_params(&p, Regime::Structure);
         let b = evaluate_params(&p, Regime::Structure);
         assert_eq!(a.fielded, b.fielded, "fielded is deterministic");
-        assert_eq!(a.fp_rate.to_bits(), b.fp_rate.to_bits(), "fp_rate is bit-deterministic");
-        assert_eq!(a.fn_rate.to_bits(), b.fn_rate.to_bits(), "fn_rate is bit-deterministic");
-        assert_eq!(a.win_rate.to_bits(), b.win_rate.to_bits(), "win_rate is bit-deterministic");
+        assert_eq!(
+            a.fp_rate.to_bits(),
+            b.fp_rate.to_bits(),
+            "fp_rate is bit-deterministic"
+        );
+        assert_eq!(
+            a.fn_rate.to_bits(),
+            b.fn_rate.to_bits(),
+            "fn_rate is bit-deterministic"
+        );
+        assert_eq!(
+            a.win_rate.to_bits(),
+            b.win_rate.to_bits(),
+            "win_rate is bit-deterministic"
+        );
         assert_eq!(
             a.mean_spawn_cost_per_win.to_bits(),
             b.mean_spawn_cost_per_win.to_bits(),
@@ -397,9 +512,20 @@ mod tests {
     #[test]
     fn default_params_hold_the_structure_gates() {
         let s = evaluate_params(&CompositionParams::default(), Regime::Structure);
-        println!("[default] {}", format_row(0, &CompositionParams::default(), &s));
-        assert!(s.fp_rate <= FP_GATE, "Default FP rate {} exceeds the gate {FP_GATE}", s.fp_rate);
-        assert!(s.fn_rate <= FN_GATE, "Default FN rate {} exceeds the gate {FN_GATE}", s.fn_rate);
+        println!(
+            "[default] {}",
+            format_row(0, &CompositionParams::default(), &s)
+        );
+        assert!(
+            s.fp_rate <= FP_GATE,
+            "Default FP rate {} exceeds the gate {FP_GATE}",
+            s.fp_rate
+        );
+        assert!(
+            s.fn_rate <= FN_GATE,
+            "Default FN rate {} exceeds the gate {FN_GATE}",
+            s.fn_rate
+        );
         assert!(s.gates_held, "Default holds the structure gates");
     }
 
@@ -417,14 +543,20 @@ mod tests {
         };
         let p = CompositionParams::default();
         let pts = vec![
-            (p, mk(true, 0.9, 5000.0)),  // gated, high win, expensive
-            (p, mk(true, 0.9, 3000.0)),  // gated, high win, CHEAPER → should outrank the above
-            (p, mk(true, 0.8, 1000.0)),  // gated, lower win → ranks below both 0.9s despite cheapest
-            (p, mk(false, 1.0, 100.0)),  // gates FAIL → ranks LAST despite perfect win + cheapest
+            (p, mk(true, 0.9, 5000.0)), // gated, high win, expensive
+            (p, mk(true, 0.9, 3000.0)), // gated, high win, CHEAPER → should outrank the above
+            (p, mk(true, 0.8, 1000.0)), // gated, lower win → ranks below both 0.9s despite cheapest
+            (p, mk(false, 1.0, 100.0)), // gates FAIL → ranks LAST despite perfect win + cheapest
         ];
         let ranked = rank(pts);
-        assert_eq!(ranked[0].1.mean_spawn_cost_per_win, 3000.0, "cheapest of the top win-rate ranks first");
-        assert_eq!(ranked[1].1.mean_spawn_cost_per_win, 5000.0, "pricier same-win ranks second");
+        assert_eq!(
+            ranked[0].1.mean_spawn_cost_per_win, 3000.0,
+            "cheapest of the top win-rate ranks first"
+        );
+        assert_eq!(
+            ranked[1].1.mean_spawn_cost_per_win, 5000.0,
+            "pricier same-win ranks second"
+        );
         assert_eq!(ranked[2].1.win_rate, 0.8, "lower win-rate ranks third");
         assert!(!ranked[3].1.gates_held, "gates-failing ranks last");
     }
@@ -452,12 +584,19 @@ mod tests {
     fn multi_member_drain_soak_kills_with_tank_forward_coordination() {
         use crate::harness::generate::{ForceSpec, Layout};
         use screeps_combat_decision::composition::CompositionParams;
-        use screeps_combat_decision::force_sizing::{assess, AssaultMode, DefenseProfile, ForceBudget, TowerThreat};
+        use screeps_combat_decision::force_sizing::{
+            assess, AssaultMode, DefenseProfile, ForceBudget, TowerThreat,
+        };
 
         // The finite-energy multi-tower drain bed: 4 towers @ 1500 energy each, point-blank to the breach
         // standoff, behind a thin rampart, with a small guard.
         let bed = defended_forming();
-        let drain_towers: Vec<((u8, u8), u32)> = vec![((24, 24), 1500), ((26, 24), 1500), ((24, 26), 1500), ((26, 26), 1500)];
+        let drain_towers: Vec<((u8, u8), u32)> = vec![
+            ((24, 24), 1500),
+            ((26, 24), 1500),
+            ((24, 26), 1500),
+            ((26, 26), 1500),
+        ];
         let rampart = 8_000u32;
         let params = CompositionParams::default();
 
@@ -474,7 +613,13 @@ mod tests {
             breach_hits: rampart,
             repair_per_tick: 0.0,
             // Four energized finite towers, evaluated at the falloff standoff (range 20 → 150/tower).
-            towers: drain_towers.iter().map(|&(_, e)| TowerThreat { range_to_assault: 20, energy: e }).collect(),
+            towers: drain_towers
+                .iter()
+                .map(|&(_, e)| TowerThreat {
+                    range_to_assault: 20,
+                    energy: e,
+                })
+                .collect(),
             safe_mode: false,
             ..Default::default()
         };
@@ -487,15 +632,31 @@ mod tests {
             onsite_budget_ticks: 1500,
         };
         let a = assess(&profile, 0.0, &budget); // drain bed has no defender creeps (structure-only)
-        assert!(a.winnable, "the bed IS winnable for a single squad — via drain ({})", a.reason);
-        assert_eq!(a.mode, AssaultMode::Drain, "and the winning mode is DRAIN, not breach ({})", a.reason);
+        assert!(
+            a.winnable,
+            "the bed IS winnable for a single squad — via drain ({})",
+            a.reason
+        );
+        assert_eq!(
+            a.mode,
+            AssaultMode::Drain,
+            "and the winning mode is DRAIN, not breach ({})",
+            a.reason
+        );
 
         // (2) The lifecycle PICKS Drain (the oracle, P2), FIELDS a drain comp through the drain stance +
         //     `breach_drain` tactics (P3), and the ASSEMBLED MULTI-member soak now KILLS via the §2(g)
         //     tank-forward coordination: the TANK soaks the towers' focus at the standoff while the HEALERS
         //     heal it from one tile behind, the FINITE towers bleed dry, and the squad breaches the dead
         //     core. A GENUINE kill (the drain math/decision was already correct — this is the runtime fix).
-        let out = run_defended_lifecycle_with_params(&bed, rampart, &drain_towers, Layout::Open, ForceSpec::Guard(1), &params);
+        let out = run_defended_lifecycle_with_params(
+            &bed,
+            rampart,
+            &drain_towers,
+            Layout::Open,
+            ForceSpec::Guard(1),
+            &params,
+        );
         assert!(
             matches!(out, LifecycleOutcome::Killed { .. }),
             "the ASSEMBLED multi-member drain soak KILLS via tank-forward heal-the-tank coordination (got {out:?})"
@@ -504,7 +665,17 @@ mod tests {
         // (3) DETERMINISM: the whole lifecycle (forming + the drain-coordinated engage) is bit-deterministic —
         //     the tank designation + the per-member goals + the heal-the-tank assignment carry no HashMap and
         //     a stable (lowest-index) tie-break, so a re-run produces the IDENTICAL outcome.
-        let out2 = run_defended_lifecycle_with_params(&bed, rampart, &drain_towers, Layout::Open, ForceSpec::Guard(1), &params);
-        assert_eq!(out, out2, "the tank-forward drain coordination is deterministic (re-run matches)");
+        let out2 = run_defended_lifecycle_with_params(
+            &bed,
+            rampart,
+            &drain_towers,
+            Layout::Open,
+            ForceSpec::Guard(1),
+            &params,
+        );
+        assert_eq!(
+            out, out2,
+            "the tank-forward drain coordination is deterministic (re-run matches)"
+        );
     }
 }

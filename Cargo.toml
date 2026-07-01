@@ -16,6 +16,9 @@ screeps-game-api = "0.23"
 screeps-combat-engine = { git = "https://github.com/Azaril/screeps-combat-engine" }
 screeps-combat-decision = { git = "https://github.com/Azaril/screeps-combat-decision" }
 screeps-combat-agent = { git = "https://github.com/Azaril/screeps-combat-agent" }
+# The shared movement kernel — used directly for its seeded RNG (`rng::Rng`, ADR 0033); the scenario
+# generators previously carried a private copy.
+screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core" }
 # The bot's backend-agnostic structure-shape primitives, reused for the replay player's typed
 # buildings (host-only; the root [patch] redirects to the local working tree).
 screeps-visual = { git = "https://github.com/Azaril/screeps-visual" }

@@ -24,12 +24,12 @@ use screeps::{Part, Position, RoomCoordinate, RoomName};
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::kernel::KernelParams;
 use screeps_combat_decision::kite::{KiteScoreParams, SquadTacticParams};
-use screeps_combat_engine::{CombatWorld, PlayerId, SimBody, SimCreep, SimTower};
+use screeps_combat_engine::{CombatWorld, MovementState, PlayerId, SimBody, SimCreep, SimTower};
 
 use rayon::prelude::*;
 
-use crate::harness::generate::Rng;
 use crate::harness::roster::random_squad;
+use screeps_sim_core::rng::Rng;
 use crate::harness::terrain_import::{decode_terrain, fixtures};
 use crate::harness::validate::assault_score;
 use crate::{ranged_file, run_managed};
@@ -38,7 +38,11 @@ fn room() -> RoomName {
     "W1N1".parse().unwrap()
 }
 fn pos(x: u8, y: u8) -> Position {
-    Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+    Position::new(
+        RoomCoordinate::new(x).unwrap(),
+        RoomCoordinate::new(y).unwrap(),
+        room(),
+    )
 }
 
 /// A named tactical strategy = the position-scoring weights the managed squad fights with.
@@ -112,9 +116,9 @@ fn apply_bed_terrain(world: &mut CombatWorld, bed: Bed) {
                     let (wall, swamp) = (real.is_wall(x, y), real.swamps.contains(&(x, y)));
                     for tx in [x, 49 - x] {
                         if wall {
-                            world.terrain.walls.insert((tx, y));
+                            world.movement.terrain.walls.insert((tx, y));
                         } else if swamp {
-                            world.terrain.swamps.insert((tx, y));
+                            world.movement.terrain.swamps.insert((tx, y));
                         }
                     }
                 }
@@ -123,8 +127,8 @@ fn apply_bed_terrain(world: &mut CombatWorld, bed: Bed) {
             for x in 0..12u8 {
                 for y in 18..32u8 {
                     for tx in [x, 49 - x] {
-                        world.terrain.walls.remove(&(tx, y));
-                        world.terrain.swamps.remove(&(tx, y));
+                        world.movement.terrain.walls.remove(&(tx, y));
+                        world.movement.terrain.swamps.remove(&(tx, y));
                     }
                 }
             }
@@ -132,13 +136,27 @@ fn apply_bed_terrain(world: &mut CombatWorld, bed: Bed) {
         Bed::Corridor => {
             for y in 0..=49u8 {
                 if !(24..=26).contains(&y) {
-                    world.terrain.walls.insert((25, y));
+                    world.movement.terrain.walls.insert((25, y));
                 }
             }
         }
         Bed::TowerCrossfire => {
-            world.towers.push(SimTower { id: 100, owner: 0, pos: pos(14, 25), energy: 1000, hits: 3000, hits_max: 3000 });
-            world.towers.push(SimTower { id: 101, owner: 1, pos: pos(35, 25), energy: 1000, hits: 3000, hits_max: 3000 });
+            world.towers.push(SimTower {
+                id: 100,
+                owner: 0,
+                pos: pos(14, 25),
+                energy: 1000,
+                hits: 3000,
+                hits_max: 3000,
+            });
+            world.towers.push(SimTower {
+                id: 101,
+                owner: 1,
+                pos: pos(35, 25),
+                energy: 1000,
+                hits: 3000,
+                hits_max: 3000,
+            });
         }
     }
 }
@@ -147,7 +165,13 @@ fn apply_bed_terrain(world: &mut CombatWorld, bed: Bed) {
 fn build_bed(bed: Bed) -> CombatWorld {
     let mut creeps = ranged_file(0, 1, 8, 24, 3);
     creeps.extend(ranged_file(1, 11, 41, 24, 3));
-    let mut world = CombatWorld { creeps, ..Default::default() };
+    let mut world = CombatWorld {
+        movement: MovementState {
+            creeps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     apply_bed_terrain(&mut world, bed);
     world
 }
@@ -160,12 +184,25 @@ fn build_bed_comp(bed: Bed, bodies: &[Vec<Part>]) -> CombatWorld {
         bodies
             .iter()
             .enumerate()
-            .map(|(i, b)| SimCreep { id: first + i as u32, owner, pos: pos(x, 22 + i as u8), body: SimBody::unboosted(b), fatigue: 0 })
+            .map(|(i, b)| SimCreep {
+                id: first + i as u32,
+                owner,
+                pos: pos(x, 22 + i as u8),
+                body: SimBody::unboosted(b),
+                fatigue: 0,
+                carry_used: 0,
+            })
             .collect()
     };
     let mut creeps = file(0, 1, 8);
     creeps.extend(file(1, 1000, 41));
-    let mut world = CombatWorld { creeps, ..Default::default() };
+    let mut world = CombatWorld {
+        movement: MovementState {
+            creeps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     apply_bed_terrain(&mut world, bed);
     world
 }
@@ -174,28 +211,74 @@ fn build_bed_comp(bed: Bed, bodies: &[Vec<Part>]) -> CombatWorld {
 /// advantage (HP it retained − HP side-1 retained); a wipe shows as the full margin (decisive).
 fn play_bed(bed: Bed, side0: SquadTacticParams, side1: SquadTacticParams, ticks: usize) -> i64 {
     let mut world = build_bed(bed);
-    let a_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 0).map(|c| c.id).collect();
-    let b_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 1).map(|c| c.id).collect();
+    let a_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 0)
+        .map(|c| c.id)
+        .collect();
+    let b_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 1)
+        .map(|c| c.id)
+        .collect();
     let mut squads = [
         ManagedSimSquad::new(0, a_ids, pos(41, 25)).with_tactics(side0),
         ManagedSimSquad::new(1, b_ids, pos(8, 25)).with_tactics(side1),
     ];
     run_managed(&mut world, &mut squads, ticks);
-    let kept = |owner| -> i64 { world.creeps.iter().filter(|c| c.owner == owner && c.is_alive()).map(|c| c.body.hits as i64).sum() };
+    let kept = |owner| -> i64 {
+        world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner && c.is_alive())
+            .map(|c| c.body.hits as i64)
+            .sum()
+    };
     kept(0) - kept(1)
 }
 
 /// Like [`play_bed`] but both sides field the given (random) composition — the comp-varied match.
-fn play_bed_comp(bed: Bed, bodies: &[Vec<Part>], side0: SquadTacticParams, side1: SquadTacticParams, ticks: usize) -> i64 {
+fn play_bed_comp(
+    bed: Bed,
+    bodies: &[Vec<Part>],
+    side0: SquadTacticParams,
+    side1: SquadTacticParams,
+    ticks: usize,
+) -> i64 {
     let mut world = build_bed_comp(bed, bodies);
-    let a_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 0).map(|c| c.id).collect();
-    let b_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 1).map(|c| c.id).collect();
+    let a_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 0)
+        .map(|c| c.id)
+        .collect();
+    let b_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 1)
+        .map(|c| c.id)
+        .collect();
     let mut squads = [
         ManagedSimSquad::new(0, a_ids, pos(41, 25)).with_tactics(side0),
         ManagedSimSquad::new(1, b_ids, pos(8, 25)).with_tactics(side1),
     ];
     run_managed(&mut world, &mut squads, ticks);
-    let kept = |owner| -> i64 { world.creeps.iter().filter(|c| c.owner == owner && c.is_alive()).map(|c| c.body.hits as i64).sum() };
+    let kept = |owner| -> i64 {
+        world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner && c.is_alive())
+            .map(|c| c.body.hits as i64)
+            .sum()
+    };
     kept(0) - kept(1)
 }
 
@@ -239,50 +322,94 @@ pub fn realistic_base_scenarios() -> Vec<crate::harness::scenario::Scenario> {
     use crate::harness::scenario::ObjectiveKind;
     // Raze (destroy the core) + Breach (crack the rampart ring) — the two breach-relevant objectives that
     // put positioning under fire; Farm/Secure/Declaim exercise plumbing, not assault positioning.
-    let attack = |s: &crate::harness::scenario::Scenario| matches!(s.objectives[0].kind, ObjectiveKind::Raze | ObjectiveKind::Breach);
+    let attack = |s: &crate::harness::scenario::Scenario| {
+        matches!(
+            s.objectives[0].kind,
+            ObjectiveKind::Raze | ObjectiveKind::Breach
+        )
+    };
     let fg = ForemanGenerator { n_comps: 1 };
-    let ir = ImportedRoom { multi_room: false, n_comps: 1 };
-    let mut out: Vec<_> = (0..fg.count()).map(|i| fg.generate(i)).filter(attack).collect();
+    let ir = ImportedRoom {
+        multi_room: false,
+        n_comps: 1,
+    };
+    let mut out: Vec<_> = (0..fg.count())
+        .map(|i| fg.generate(i))
+        .filter(attack)
+        .collect();
     out.extend((0..ir.count()).map(|i| ir.generate(i)).filter(attack));
     out
 }
 
 /// Antisymmetric payoff of `a` vs `b` over a **comp-varied basket** (both side assignments, cancelling
 /// start-side bias). The diverse-opponent analogue of [`payoff`].
-pub fn payoff_over_comps(basket: &[(Bed, Vec<Vec<Part>>)], a: SquadTacticParams, b: SquadTacticParams, ticks: usize) -> i64 {
+pub fn payoff_over_comps(
+    basket: &[(Bed, Vec<Vec<Part>>)],
+    a: SquadTacticParams,
+    b: SquadTacticParams,
+    ticks: usize,
+) -> i64 {
     if basket.is_empty() {
         return 0;
     }
-    let sum: i64 = basket.iter().map(|(bed, bodies)| (play_bed_comp(*bed, bodies, a, b, ticks) - play_bed_comp(*bed, bodies, b, a, ticks)) / 2).sum();
+    let sum: i64 = basket
+        .iter()
+        .map(|(bed, bodies)| {
+            (play_bed_comp(*bed, bodies, a, b, ticks) - play_bed_comp(*bed, bodies, b, a, ticks))
+                / 2
+        })
+        .sum();
     sum / basket.len() as i64
 }
 
 /// Round-robin `strategies` over a comp-varied basket (the kernel-tuning analogue of [`run_tournament`]).
-pub fn run_tournament_over_comps(strategies: &[Strategy], basket: &[(Bed, Vec<Vec<Part>>)], ticks: usize) -> TournamentResult {
+pub fn run_tournament_over_comps(
+    strategies: &[Strategy],
+    basket: &[(Bed, Vec<Vec<Part>>)],
+    ticks: usize,
+) -> TournamentResult {
     let n = strategies.len();
     let mut matrix = vec![vec![0i64; n]; n];
     // Each upper-triangle cell is an independent round-robin sum — run them in PARALLEL (rayon). Matches
     // are pure (fresh world per call), so this is deterministic regardless of completion order.
-    let pairs: Vec<(usize, usize)> = (0..n).flat_map(|i| ((i + 1)..n).map(move |j| (i, j))).collect();
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| ((i + 1)..n).map(move |j| (i, j)))
+        .collect();
     let cells: Vec<(usize, usize, i64)> = pairs
         .par_iter()
-        .map(|&(i, j)| (i, j, payoff_over_comps(basket, strategies[i].tactics, strategies[j].tactics, ticks)))
+        .map(|&(i, j)| {
+            (
+                i,
+                j,
+                payoff_over_comps(basket, strategies[i].tactics, strategies[j].tactics, ticks),
+            )
+        })
         .collect();
     for (i, j, p) in cells {
         matrix[i][j] = p;
         matrix[j][i] = -p;
     }
-    let mut ranking: Vec<(usize, f64)> = (0..n).map(|i| (i, matrix[i].iter().sum::<i64>() as f64 / n.max(1) as f64)).collect();
+    let mut ranking: Vec<(usize, f64)> = (0..n)
+        .map(|i| (i, matrix[i].iter().sum::<i64>() as f64 / n.max(1) as f64))
+        .collect();
     ranking.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let nash = meta_nash(&matrix, 2000);
-    TournamentResult { names: strategies.iter().map(|s| s.name).collect(), matrix, ranking, nash }
+    TournamentResult {
+        names: strategies.iter().map(|s| s.name).collect(),
+        matrix,
+        ranking,
+        nash,
+    }
 }
 
 /// Antisymmetric payoff of `a` vs `b`, **averaged over the bed basket** and over both side
 /// assignments (to cancel the start-side bias the deterministic tie-break introduces).
 /// `payoff(a,b) == -payoff(b,a)`.
 pub fn payoff(a: SquadTacticParams, b: SquadTacticParams, ticks: usize) -> i64 {
-    let per_bed: i64 = BASKET.iter().map(|&bed| (play_bed(bed, a, b, ticks) - play_bed(bed, b, a, ticks)) / 2).sum();
+    let per_bed: i64 = BASKET
+        .iter()
+        .map(|&bed| (play_bed(bed, a, b, ticks) - play_bed(bed, b, a, ticks)) / 2)
+        .sum();
     per_bed / BASKET.len() as i64
 }
 
@@ -293,19 +420,55 @@ pub fn strategy_population() -> Vec<Strategy> {
     let with_engage = |f: fn(&mut KiteScoreParams)| {
         let mut e = base.engage;
         f(&mut e);
-        SquadTacticParams { kite: base.kite, engage: e, healer: base.healer, kernel: base.kernel }
+        SquadTacticParams {
+            kite: base.kite,
+            engage: e,
+            healer: base.healer,
+            kernel: base.kernel,
+        }
     };
     let with_kite = |f: fn(&mut KiteScoreParams)| {
         let mut k = base.kite;
         f(&mut k);
-        SquadTacticParams { kite: k, engage: base.engage, healer: base.healer, kernel: base.kernel }
+        SquadTacticParams {
+            kite: k,
+            engage: base.engage,
+            healer: base.healer,
+            kernel: base.kernel,
+        }
     };
     vec![
-        Strategy { name: "default", tactics: base },
-        Strategy { name: "aggressive", tactics: with_engage(|e| { e.w_dmg = 3.0; e.w_taken = 0.3; }) },
-        Strategy { name: "cautious", tactics: with_engage(|e| { e.w_taken = 1.5; e.w_dmg = 1.0; }) },
-        Strategy { name: "kite-heavy", tactics: with_kite(|k| { k.w_future = 2.0; k.w_prox = 1.0; }) },
-        Strategy { name: "advance-heavy", tactics: with_engage(|e| { e.w_prox = 3.0; }) },
+        Strategy {
+            name: "default",
+            tactics: base,
+        },
+        Strategy {
+            name: "aggressive",
+            tactics: with_engage(|e| {
+                e.w_dmg = 3.0;
+                e.w_taken = 0.3;
+            }),
+        },
+        Strategy {
+            name: "cautious",
+            tactics: with_engage(|e| {
+                e.w_taken = 1.5;
+                e.w_dmg = 1.0;
+            }),
+        },
+        Strategy {
+            name: "kite-heavy",
+            tactics: with_kite(|k| {
+                k.w_future = 2.0;
+                k.w_prox = 1.0;
+            }),
+        },
+        Strategy {
+            name: "advance-heavy",
+            tactics: with_engage(|e| {
+                e.w_prox = 3.0;
+            }),
+        },
     ]
 }
 
@@ -318,15 +481,27 @@ pub fn kernel_population() -> Vec<Strategy> {
     let with_kernel = |name: &'static str, f: fn(&mut KernelParams)| {
         let mut k = base.kernel;
         f(&mut k);
-        Strategy { name, tactics: SquadTacticParams { kernel: k, ..base } }
+        Strategy {
+            name,
+            tactics: SquadTacticParams { kernel: k, ..base },
+        }
     };
     vec![
-        Strategy { name: "k-default", tactics: base }, // approach 2 / incumbency 3 / discoh 10 / K 3 / spacing 1
+        Strategy {
+            name: "k-default",
+            tactics: base,
+        }, // approach 2 / incumbency 3 / discoh 10 / K 3 / spacing 1
         with_kernel("k-approach-hot", |k| k.approach_coef = 4), // close harder
-        with_kernel("k-sticky", |k| k.incumbency_coef = 6),     // stronger hold (less jitter, less responsive)
-        with_kernel("k-loose-coh", |k| { k.cohesion_k = 5; k.discohesion_coef = 4; }), // spread more (cover more tiles)
-        with_kernel("k-tight-coh", |k| { k.cohesion_k = 2; k.discohesion_coef = 20; }), // ball up tight
-        with_kernel("k-spread", |k| k.spacing_coef = 4),        // anti-stack harder
+        with_kernel("k-sticky", |k| k.incumbency_coef = 6), // stronger hold (less jitter, less responsive)
+        with_kernel("k-loose-coh", |k| {
+            k.cohesion_k = 5;
+            k.discohesion_coef = 4;
+        }), // spread more (cover more tiles)
+        with_kernel("k-tight-coh", |k| {
+            k.cohesion_k = 2;
+            k.discohesion_coef = 20;
+        }), // ball up tight
+        with_kernel("k-spread", |k| k.spacing_coef = 4),    // anti-stack harder
     ]
 }
 
@@ -345,8 +520,12 @@ pub fn kernel_population_grid() -> Vec<Strategy> {
                 k.incumbency_coef = incumbency;
                 k.cohesion_k = ck;
                 k.discohesion_coef = dc;
-                let name: &'static str = Box::leak(format!("a{approach}-i{incumbency}-{tag}").into_boxed_str());
-                out.push(Strategy { name, tactics: SquadTacticParams { kernel: k, ..base } });
+                let name: &'static str =
+                    Box::leak(format!("a{approach}-i{incumbency}-{tag}").into_boxed_str());
+                out.push(Strategy {
+                    name,
+                    tactics: SquadTacticParams { kernel: k, ..base },
+                });
             }
         }
     }
@@ -378,7 +557,11 @@ pub fn meta_nash(matrix: &[Vec<i64>], iters: usize) -> Vec<f64> {
         let total: f64 = counts.iter().sum();
         let (mut best, mut best_v) = (0usize, f64::NEG_INFINITY);
         for (i, row) in matrix.iter().enumerate() {
-            let v: f64 = row.iter().zip(&counts).map(|(&p, &c)| p as f64 * c / total).sum();
+            let v: f64 = row
+                .iter()
+                .zip(&counts)
+                .map(|(&p, &c)| p as f64 * c / total)
+                .sum();
             if v > best_v {
                 best_v = v;
                 best = i;
@@ -402,17 +585,32 @@ pub fn run_tournament(strategies: &[Strategy], budget: TournamentBudget) -> Tour
             matrix[j][i] = -p;
         }
     }
-    let mut ranking: Vec<(usize, f64)> = (0..n).map(|i| (i, matrix[i].iter().sum::<i64>() as f64 / n.max(1) as f64)).collect();
+    let mut ranking: Vec<(usize, f64)> = (0..n)
+        .map(|i| (i, matrix[i].iter().sum::<i64>() as f64 / n.max(1) as f64))
+        .collect();
     ranking.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     let nash = meta_nash(&matrix, 2000);
-    TournamentResult { names: strategies.iter().map(|s| s.name).collect(), matrix, ranking, nash }
+    TournamentResult {
+        names: strategies.iter().map(|s| s.name).collect(),
+        matrix,
+        ranking,
+        nash,
+    }
 }
 
 /// **Exploitability** of `candidate` against `population`: the largest margin (net HP) any population
 /// strategy beats it by. ≤ 0 ⇒ unexploitable by the field (a robust strategy). The ship-gate.
-pub fn exploitability(candidate: SquadTacticParams, population: &[Strategy], budget: TournamentBudget) -> i64 {
+pub fn exploitability(
+    candidate: SquadTacticParams,
+    population: &[Strategy],
+    budget: TournamentBudget,
+) -> i64 {
     let ticks = budget.ticks();
-    population.par_iter().map(|opp| payoff(opp.tactics, candidate, ticks)).max().unwrap_or(0)
+    population
+        .par_iter()
+        .map(|opp| payoff(opp.tactics, candidate, ticks))
+        .max()
+        .unwrap_or(0)
 }
 
 /// **Base attack/defend tuning** (ADR 0025 — the asymmetric lens, vs the symmetric open-combat
@@ -420,11 +618,17 @@ pub fn exploitability(candidate: SquadTacticParams, population: &[Strategy], bud
 /// rank by total objective-progress [`assault_score`] (raze the base + survive). No payoff matrix — the
 /// "opponent" is the base, so it's an absolute-score ranking, not self-play. Returns `(index, total
 /// score)`, best first.
-pub fn base_attack_ranking(strategies: &[Strategy], scenarios: &[crate::harness::scenario::Scenario]) -> Vec<(usize, i64)> {
+pub fn base_attack_ranking(
+    strategies: &[Strategy],
+    scenarios: &[crate::harness::scenario::Scenario],
+) -> Vec<(usize, i64)> {
     // Score every (strategy × base) assault in PARALLEL (rayon) — each is an independent managed sim — then
     // reduce per strategy. This is the heaviest Stage-4 computation (winnable siege forces over real bases).
-    let pairs: Vec<(usize, &crate::harness::scenario::Scenario)> =
-        strategies.iter().enumerate().flat_map(|(i, _)| scenarios.iter().map(move |sc| (i, sc))).collect();
+    let pairs: Vec<(usize, &crate::harness::scenario::Scenario)> = strategies
+        .iter()
+        .enumerate()
+        .flat_map(|(i, _)| scenarios.iter().map(move |sc| (i, sc)))
+        .collect();
     let scored: Vec<(usize, i64)> = pairs
         .par_iter()
         .filter_map(|&(i, sc)| assault_score(sc, strategies[i].tactics).map(|a| (i, a.score)))
@@ -442,7 +646,10 @@ pub fn base_attack_ranking(strategies: &[Strategy], scenarios: &[crate::harness:
 pub fn base_attack_report(strategies: &[Strategy], ranking: &[(usize, i64)]) -> String {
     use std::fmt::Write;
     let mut s = String::new();
-    let _ = writeln!(s, "Base attack/defend ranking — total objective-progress over the base set:");
+    let _ = writeln!(
+        s,
+        "Base attack/defend ranking — total objective-progress over the base set:"
+    );
     for &(i, score) in ranking {
         let _ = writeln!(s, "  {:>14}  {:+}", strategies[i].name, score);
     }
@@ -453,9 +660,18 @@ pub fn base_attack_report(strategies: &[Strategy], ranking: &[(usize, i64)]) -> 
 pub fn report(result: &TournamentResult) -> String {
     use std::fmt::Write;
     let mut s = String::new();
-    let _ = writeln!(s, "Self-play tournament — {} strategies over {} beds (mean payoff | Nash weight):", result.names.len(), BASKET.len());
+    let _ = writeln!(
+        s,
+        "Self-play tournament — {} strategies over {} beds (mean payoff | Nash weight):",
+        result.names.len(),
+        BASKET.len()
+    );
     for &(i, score) in &result.ranking {
-        let _ = writeln!(s, "  {:>14}  {:+6.0} | {:.2}", result.names[i], score, result.nash[i]);
+        let _ = writeln!(
+            s,
+            "  {:>14}  {:+6.0} | {:.2}",
+            result.names[i], score, result.nash[i]
+        );
     }
     s
 }
@@ -467,7 +683,16 @@ pub fn catalog_strategies() -> Vec<Strategy> {
     let base = SquadTacticParams::default();
     let k = |name: &'static str, a: i64, i: i64, d: i64, ck: u32, s: i64| Strategy {
         name,
-        tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+        tactics: SquadTacticParams {
+            kernel: KernelParams {
+                approach_coef: a,
+                incumbency_coef: i,
+                discohesion_coef: d,
+                cohesion_k: ck,
+                spacing_coef: s,
+            },
+            ..base
+        },
     };
     vec![
         k("ranged_duel_kite", 0, 3, 14, 3, 2),
@@ -485,12 +710,29 @@ pub fn catalog_strategies() -> Vec<Strategy> {
 /// table: a ranged mirror, an RMA-heavy stack-punisher, or a melee brawl. The generic basket sits at the
 /// `a1-i6-tight` equilibrium, so these isolate the matchups where a situational mode can earn its place.
 pub fn situational_comp(kind: &str) -> Vec<Vec<Part>> {
-    let body = |parts: &[(Part, usize)]| -> Vec<Part> { parts.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect() };
+    let body = |parts: &[(Part, usize)]| -> Vec<Part> {
+        parts
+            .iter()
+            .flat_map(|&(p, n)| std::iter::repeat_n(p, n))
+            .collect()
+    };
     use Part::{Attack, Heal, Move, RangedAttack};
     match kind {
-        "ranged" => vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)])],
-        "rma" => vec![body(&[(RangedAttack, 6), (Move, 4)]), body(&[(RangedAttack, 6), (Move, 4)]), body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)])],
-        "melee" => vec![body(&[(Attack, 5), (Move, 5), (Heal, 1)]), body(&[(Attack, 5), (Move, 5), (Heal, 1)]), body(&[(Attack, 4), (Move, 4), (Heal, 2)])],
+        "ranged" => vec![
+            body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]),
+            body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]),
+            body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)]),
+        ],
+        "rma" => vec![
+            body(&[(RangedAttack, 6), (Move, 4)]),
+            body(&[(RangedAttack, 6), (Move, 4)]),
+            body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)]),
+        ],
+        "melee" => vec![
+            body(&[(Attack, 5), (Move, 5), (Heal, 1)]),
+            body(&[(Attack, 5), (Move, 5), (Heal, 1)]),
+            body(&[(Attack, 4), (Move, 4), (Heal, 2)]),
+        ],
         _ => vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)])],
     }
 }
@@ -514,7 +756,16 @@ mod tests {
         let base = SquadTacticParams::default();
         let mk = |name: &'static str, a: i64, i: i64, d: i64, ck: u32, s: i64| Strategy {
             name,
-            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+            tactics: SquadTacticParams {
+                kernel: KernelParams {
+                    approach_coef: a,
+                    incumbency_coef: i,
+                    discohesion_coef: d,
+                    cohesion_k: ck,
+                    spacing_coef: s,
+                },
+                ..base
+            },
         };
         let mut field = kernel_population_grid();
         field.extend(catalog_strategies());
@@ -530,18 +781,36 @@ mod tests {
         let catalog_names: Vec<&str> = catalog_strategies().iter().map(|s| s.name).collect();
         for sit in ["ranged", "rma", "melee"] {
             let comp = situational_comp(sit);
-            let basket: Vec<(Bed, Vec<Vec<Part>>)> = BASKET.iter().map(|&b| (b, comp.clone())).collect();
-            let mut scored: Vec<(usize, i64)> =
-                (0..field.len()).into_par_iter().map(|i| (i, payoff_over_comps(&basket, field[i].tactics, baseline, ticks))).collect();
+            let basket: Vec<(Bed, Vec<Vec<Part>>)> =
+                BASKET.iter().map(|&b| (b, comp.clone())).collect();
+            let mut scored: Vec<(usize, i64)> = (0..field.len())
+                .into_par_iter()
+                .map(|i| {
+                    (
+                        i,
+                        payoff_over_comps(&basket, field[i].tactics, baseline, ticks),
+                    )
+                })
+                .collect();
             scored.sort_by_key(|&(_, p)| std::cmp::Reverse(p));
             println!("\n=== situation {sit}: top 8 configs by payoff vs open_combat (a1-i6-tight); baseline=0 ===");
             for &(i, p) in scored.iter().take(8) {
-                let tag = if catalog_names.contains(&field[i].name) { " [catalog]" } else { "" };
+                let tag = if catalog_names.contains(&field[i].name) {
+                    " [catalog]"
+                } else {
+                    ""
+                };
                 println!("  {:>16} {:+6}{tag}", field[i].name, p);
             }
             for cm in &catalog_names {
                 if let Some(r) = scored.iter().position(|&(i, _)| &field[i].name == cm) {
-                    println!("    catalog {:>16}: rank {:>2}/{}  payoff {:+}", cm, r + 1, field.len(), scored[r].1);
+                    println!(
+                        "    catalog {:>16}: rank {:>2}/{}  payoff {:+}",
+                        cm,
+                        r + 1,
+                        field.len(),
+                        scored[r].1
+                    );
                 }
             }
         }
@@ -562,7 +831,16 @@ mod tests {
         let base = SquadTacticParams::default();
         let mk = |name: &'static str, a: i64, i: i64, d: i64, ck: u32, s: i64| Strategy {
             name,
-            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+            tactics: SquadTacticParams {
+                kernel: KernelParams {
+                    approach_coef: a,
+                    incumbency_coef: i,
+                    discohesion_coef: d,
+                    cohesion_k: ck,
+                    spacing_coef: s,
+                },
+                ..base
+            },
         };
         let candidates = vec![
             mk("a1-i6-tight(open)", 1, 6, 20, 2, 1),
@@ -577,7 +855,10 @@ mod tests {
         ];
         let mut pop = kernel_population_grid();
         pop.extend(candidates.iter().copied());
-        println!("\n{:>18} | gen-vs-open | exploit  (gen>0 = better generically; exploit<=0 = robust)", "config");
+        println!(
+            "\n{:>18} | gen-vs-open | exploit  (gen>0 = better generically; exploit<=0 = robust)",
+            "config"
+        );
         for c in &candidates {
             let gen = payoff_over_comps(&generic, c.tactics, baseline, ticks);
             let exp = exploitability(c.tactics, &pop, TournamentBudget::Thorough);
@@ -597,18 +878,51 @@ mod tests {
         let baseline = SquadTacticParams::open_combat();
         let base = SquadTacticParams::default();
         let mk_app = |a: i64, s: i64| SquadTacticParams {
-            kernel: KernelParams { approach_coef: a, incumbency_coef: 6, discohesion_coef: 20, cohesion_k: 2, spacing_coef: s },
+            kernel: KernelParams {
+                approach_coef: a,
+                incumbency_coef: 6,
+                discohesion_coef: 20,
+                cohesion_k: 2,
+                spacing_coef: s,
+            },
             ..base
         };
-        let body = |parts: &[(Part, usize)]| -> Vec<Part> { parts.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect() };
+        let body = |parts: &[(Part, usize)]| -> Vec<Part> {
+            parts
+                .iter()
+                .flat_map(|&(p, n)| std::iter::repeat_n(p, n))
+                .collect()
+        };
         use Part::{Attack, Heal, Move, RangedAttack};
         let comps: Vec<(&str, Vec<Vec<Part>>)> = vec![
-            ("pure_ranged", vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]), body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)])]),
-            ("mixed", vec![body(&[(RangedAttack, 4), (Move, 4), (Heal, 1)]), body(&[(Attack, 4), (Move, 4), (Heal, 1)]), body(&[(RangedAttack, 3), (Attack, 2), (Move, 4), (Heal, 1)])]),
-            ("melee_heavy", vec![body(&[(Attack, 5), (Move, 5)]), body(&[(Attack, 5), (Move, 4), (Heal, 1)]), body(&[(Attack, 4), (Move, 4), (Heal, 2)])]),
+            (
+                "pure_ranged",
+                vec![
+                    body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]),
+                    body(&[(RangedAttack, 4), (Move, 4), (Heal, 2)]),
+                    body(&[(RangedAttack, 5), (Move, 4), (Heal, 1)]),
+                ],
+            ),
+            (
+                "mixed",
+                vec![
+                    body(&[(RangedAttack, 4), (Move, 4), (Heal, 1)]),
+                    body(&[(Attack, 4), (Move, 4), (Heal, 1)]),
+                    body(&[(RangedAttack, 3), (Attack, 2), (Move, 4), (Heal, 1)]),
+                ],
+            ),
+            (
+                "melee_heavy",
+                vec![
+                    body(&[(Attack, 5), (Move, 5)]),
+                    body(&[(Attack, 5), (Move, 4), (Heal, 1)]),
+                    body(&[(Attack, 4), (Move, 4), (Heal, 2)]),
+                ],
+            ),
         ];
         for (name, comp) in &comps {
-            let basket: Vec<(Bed, Vec<Vec<Part>>)> = BASKET.iter().map(|&b| (b, comp.clone())).collect();
+            let basket: Vec<(Bed, Vec<Vec<Part>>)> =
+                BASKET.iter().map(|&b| (b, comp.clone())).collect();
             let mut best = (0i64, i64::MIN);
             print!("  {name:>12} (approach vs open, spacing 1): ");
             for a in 0..=6i64 {
@@ -634,7 +948,16 @@ mod tests {
         let base = SquadTacticParams::default();
         let mk = |name: &'static str, a: i64, i: i64, ck: u32, d: i64, s: i64| Strategy {
             name,
-            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+            tactics: SquadTacticParams {
+                kernel: KernelParams {
+                    approach_coef: a,
+                    incumbency_coef: i,
+                    discohesion_coef: d,
+                    cohesion_k: ck,
+                    spacing_coef: s,
+                },
+                ..base
+            },
         };
         let grid = vec![
             mk("a1-i6-tight-s1(open)", 1, 6, 2, 20, 1),
@@ -651,13 +974,21 @@ mod tests {
         let basket = realistic_comp_basket(6, 5600);
         let t = run_tournament_over_comps(&grid, &basket, TournamentBudget::Thorough.ticks());
         let n = grid.len();
-        let exploit: Vec<i64> = (0..n).map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0)).collect();
+        let exploit: Vec<i64> = (0..n)
+            .map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0))
+            .collect();
         println!("\n{:>22} | mean | exploit | nash", "config");
         for &(i, score) in &t.ranking {
-            println!("{:>22} | {:>+5.0} | {:>7} | {:.2}", grid[i].name, score, exploit[i], t.nash[i]);
+            println!(
+                "{:>22} | {:>+5.0} | {:>7} | {:.2}",
+                grid[i].name, score, exploit[i], t.nash[i]
+            );
         }
         let best = t.ranking[0].0;
-        println!("\n[spacing re-tune] best = {} (mean {:+.0}, exploit {})", grid[best].name, t.ranking[0].1, exploit[best]);
+        println!(
+            "\n[spacing re-tune] best = {} (mean {:+.0}, exploit {})",
+            grid[best].name, t.ranking[0].1, exploit[best]
+        );
     }
 
     /// FINAL open-combat ship-gate: round-robin the spacing candidates + `breach` + the deliberate
@@ -672,7 +1003,16 @@ mod tests {
         let base = SquadTacticParams::default();
         let mk = |name: &'static str, a: i64, i: i64, ck: u32, d: i64, s: i64| Strategy {
             name,
-            tactics: SquadTacticParams { kernel: KernelParams { approach_coef: a, incumbency_coef: i, discohesion_coef: d, cohesion_k: ck, spacing_coef: s }, ..base },
+            tactics: SquadTacticParams {
+                kernel: KernelParams {
+                    approach_coef: a,
+                    incumbency_coef: i,
+                    discohesion_coef: d,
+                    cohesion_k: ck,
+                    spacing_coef: s,
+                },
+                ..base
+            },
         };
         let mut field = vec![
             mk("open-s1", 1, 6, 2, 20, 1),
@@ -685,10 +1025,15 @@ mod tests {
         let basket = realistic_comp_basket(8, 5600);
         let t = run_tournament_over_comps(&field, &basket, TournamentBudget::Thorough.ticks());
         let n = field.len();
-        let exploit: Vec<i64> = (0..n).map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0)).collect();
+        let exploit: Vec<i64> = (0..n)
+            .map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0))
+            .collect();
         println!("\n{:>16} | mean | exploit | nash", "config");
         for &(i, score) in &t.ranking {
-            println!("{:>16} | {:>+5.0} | {:>7} | {:.2}", field[i].name, score, exploit[i], t.nash[i]);
+            println!(
+                "{:>16} | {:>+5.0} | {:>7} | {:.2}",
+                field[i].name, score, exploit[i], t.nash[i]
+            );
         }
     }
 
@@ -702,10 +1047,19 @@ mod tests {
                 assert_eq!(r.matrix[i][j], -r.matrix[j][i], "payoff is antisymmetric");
             }
         }
-        assert!(r.ranking.iter().map(|&(_, s)| s).sum::<f64>().abs() < 1.0, "zero-sum: ranking sums to ~0");
+        assert!(
+            r.ranking.iter().map(|&(_, s)| s).sum::<f64>().abs() < 1.0,
+            "zero-sum: ranking sums to ~0"
+        );
         // Nash is a valid distribution.
-        assert!((r.nash.iter().sum::<f64>() - 1.0).abs() < 1e-6, "Nash mix sums to 1");
-        assert!(r.nash.iter().all(|&w| w >= 0.0), "Nash weights are non-negative");
+        assert!(
+            (r.nash.iter().sum::<f64>() - 1.0).abs() < 1e-6,
+            "Nash mix sums to 1"
+        );
+        assert!(
+            r.nash.iter().all(|&w| w >= 0.0),
+            "Nash weights are non-negative"
+        );
     }
 
     #[test]
@@ -716,7 +1070,10 @@ mod tests {
         // with the adaptivity layer; this is the standing regression guard.)
         let pop = strategy_population();
         let exploit = exploitability(SquadTacticParams::default(), &pop, TournamentBudget::Quick);
-        println!("[ADR0020 tournament] default exploitability = {exploit} net HP\n{}", report(&run_tournament(&pop, TournamentBudget::Quick)));
+        println!(
+            "[ADR0020 tournament] default exploitability = {exploit} net HP\n{}",
+            report(&run_tournament(&pop, TournamentBudget::Quick))
+        );
         const GROSS: i64 = 1500; // ~1.5 creeps' HP; a real hard-counter exceeds this
         assert!(exploit <= GROSS, "the shipped default has a hard counter in the population ({exploit} net HP) — needs adaptivity or a retune");
     }
@@ -750,9 +1107,17 @@ mod tests {
         let ranking = base_attack_ranking(&pop, &bases);
         println!("{}", base_attack_report(&pop, &ranking));
         let (best, score) = ranking[0];
-        println!("[ADR0025 base-attack] {} bases; best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
+        println!(
+            "[ADR0025 base-attack] {} bases; best assaulter = {} ({:+})",
+            bases.len(),
+            pop[best].name,
+            score
+        );
         // Sanity: the assault makes SOME objective progress across the set (not a total wall).
-        assert!(score > 0, "no kernel config made any base progress — investigate breach/siege");
+        assert!(
+            score > 0,
+            "no kernel config made any base progress — investigate breach/siege"
+        );
     }
 
     /// ADR 0025 §12 Stage 4 — the **realistic** open-combat re-tune: round-robin the kernel population over
@@ -767,8 +1132,14 @@ mod tests {
         let r = run_tournament_over_comps(&pop, &basket, TournamentBudget::Thorough.ticks());
         println!("{}", report(&r));
         let best = r.ranking[0];
-        let nash_best = (0..r.nash.len()).max_by(|&a, &b| r.nash[a].partial_cmp(&r.nash[b]).unwrap()).unwrap();
-        let exploit = exploitability(SquadTacticParams::default(), &pop, TournamentBudget::Thorough);
+        let nash_best = (0..r.nash.len())
+            .max_by(|&a, &b| r.nash[a].partial_cmp(&r.nash[b]).unwrap())
+            .unwrap();
+        let exploit = exploitability(
+            SquadTacticParams::default(),
+            &pop,
+            TournamentBudget::Thorough,
+        );
         println!(
             "[ADR0025 §12 realistic kernel tournament] {} beds (synthetic + imported real terrain)\n  field winner = {} ({:+.0} mean payoff)\n  Nash-heaviest (robust) = {} ({:.2})\n  shipped-default exploitability = {} net HP",
             basket.len(), r.names[best.0], best.1, r.names[nash_best], r.nash[nash_best], exploit
@@ -806,11 +1177,24 @@ mod tests {
         let breach = SquadTacticParams::breach();
         let bases = realistic_base_scenarios();
         let rounds: Vec<i64> = (0..5)
-            .map(|_| bases.iter().filter_map(|s| assault_score(s, breach)).map(|a| a.score).sum())
+            .map(|_| {
+                bases
+                    .iter()
+                    .filter_map(|s| assault_score(s, breach))
+                    .map(|a| a.score)
+                    .sum()
+            })
             .collect();
         let (min, max) = (*rounds.iter().min().unwrap(), *rounds.iter().max().unwrap());
-        println!("[sim determinism] base-attack sum over 5 rounds: {rounds:?} (spread {})", max - min);
-        assert_eq!(max - min, 0, "sim nondeterminism regressed: base-attack sum varies over 5 rounds {rounds:?}");
+        println!(
+            "[sim determinism] base-attack sum over 5 rounds: {rounds:?} (spread {})",
+            max - min
+        );
+        assert_eq!(
+            max - min,
+            0,
+            "sim nondeterminism regressed: base-attack sum varies over 5 rounds {rounds:?}"
+        );
     }
 
     /// ADR 0026 — the **per-objective regression fence** (criterion revised in the 2026-06-26 spacing
@@ -826,13 +1210,23 @@ mod tests {
     #[ignore]
     fn per_objective_profiles_are_each_best_in_class() {
         use screeps_combat_decision::kite::SquadTacticParams;
-        let (open, breach, default) = (SquadTacticParams::open_combat(), SquadTacticParams::breach(), SquadTacticParams::default());
+        let (open, breach, default) = (
+            SquadTacticParams::open_combat(),
+            SquadTacticParams::breach(),
+            SquadTacticParams::default(),
+        );
         let ticks = TournamentBudget::Thorough.ticks();
         let basket = realistic_comp_basket(2, 5600);
         let open_vs_default = payoff_over_comps(&basket, open, default, ticks);
         let open_vs_breach = payoff_over_comps(&basket, open, breach, ticks);
         let bases = realistic_base_scenarios();
-        let score = |t| bases.par_iter().filter_map(|s| assault_score(s, t)).map(|a| a.score).sum::<i64>();
+        let score = |t| {
+            bases
+                .par_iter()
+                .filter_map(|s| assault_score(s, t))
+                .map(|a| a.score)
+                .sum::<i64>()
+        };
         let (breach_base, open_base) = (score(breach), score(open));
         println!("[ADR0026 per-objective gate] open vs default(open): {open_vs_default:+} | open vs breach(open): {open_vs_breach:+} | base {breach_base} vs {open_base}");
         // open_combat must be a CLEARLY-TUNED open profile — it decisively beats the untuned `default` in
@@ -840,11 +1234,17 @@ mod tests {
         // head-to-head it TIES open_combat after the spacing-2 re-tune, yet vs the real-opponent field
         // open_combat is the clear best — see `final_open_validation` (open-s2 +169 vs the field). The right
         // criterion is "beats a naive baseline", not "beats our own breach profile".)
-        assert!(open_vs_default > 0, "open_combat() must beat the untuned default in open combat ({open_vs_default:+})");
+        assert!(
+            open_vs_default > 0,
+            "open_combat() must beat the untuned default in open combat ({open_vs_default:+})"
+        );
         // open_combat + breach are CO-BEST in open (breach is a near-open config); open must not clearly LOSE.
         assert!(open_vs_breach > -60, "open_combat() must be co-best (not clearly lose) vs breach in open ({open_vs_breach:+})");
         // Base-attack is deterministic but non-discriminating (all configs tie); a no-catastrophic-regression floor.
-        assert!(breach_base as f64 >= open_base as f64 * 0.97, "breach() catastrophically regresses base ({breach_base} vs {open_base})");
+        assert!(
+            breach_base as f64 >= open_base as f64 * 0.97,
+            "breach() catastrophically regresses base ({breach_base} vs {open_base})"
+        );
     }
 
     /// ADR 0025 §12 Stage 4 — the **THOROUGH** re-tune (operator-requested many-minutes run): sweep the
@@ -866,8 +1266,12 @@ mod tests {
         let base = base_attack_ranking(&grid, &bases);
 
         // Per-config metrics. exploitability_i = the largest margin any opponent beats i by = -min(row i).
-        let mean: Vec<f64> = (0..n).map(|i| t.matrix[i].iter().sum::<i64>() as f64 / n as f64).collect();
-        let exploit: Vec<i64> = (0..n).map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0)).collect();
+        let mean: Vec<f64> = (0..n)
+            .map(|i| t.matrix[i].iter().sum::<i64>() as f64 / n as f64)
+            .collect();
+        let exploit: Vec<i64> = (0..n)
+            .map(|i| -t.matrix[i].iter().copied().min().unwrap_or(0))
+            .collect();
         let mut base_score = vec![0i64; n];
         for &(i, s) in &base {
             base_score[i] = s;
@@ -888,9 +1292,15 @@ mod tests {
         let mut balanced: Vec<usize> = (0..n).collect();
         balanced.sort_by_key(|&i| open_rank[i] + base_rank[i]);
 
-        println!("\n{:>14} | {:>9} | {:>7} | {:>9} | open#  base#", "config", "open-mean", "exploit", "base");
+        println!(
+            "\n{:>14} | {:>9} | {:>7} | {:>9} | open#  base#",
+            "config", "open-mean", "exploit", "base"
+        );
         for &i in &balanced {
-            println!("{:>14} | {:>+9.0} | {:>7} | {:>+9} |  {:>3}   {:>3}", grid[i].name, mean[i], exploit[i], base_score[i], open_rank[i], base_rank[i]);
+            println!(
+                "{:>14} | {:>+9.0} | {:>7} | {:>+9} |  {:>3}   {:>3}",
+                grid[i].name, mean[i], exploit[i], base_score[i], open_rank[i], base_rank[i]
+            );
         }
         let (bo, bb, bal) = (open_order[0], base_order[0], balanced[0]);
         println!(
@@ -908,10 +1318,22 @@ mod tests {
         // tight Screeps-ms threshold.
         let mut world = build_bed(Bed::OpenField);
         // Scale up to 10 creeps a side.
-        world.creeps = ranged_file(0, 1, 8, 20, 10);
-        world.creeps.extend(ranged_file(1, 21, 41, 20, 10));
-        let a_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 0).map(|c| c.id).collect();
-        let b_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 1).map(|c| c.id).collect();
+        world.movement.creeps = ranged_file(0, 1, 8, 20, 10);
+        world.movement.creeps.extend(ranged_file(1, 21, 41, 20, 10));
+        let a_ids: Vec<_> = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == 0)
+            .map(|c| c.id)
+            .collect();
+        let b_ids: Vec<_> = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == 1)
+            .map(|c| c.id)
+            .collect();
         let mut squads = [
             ManagedSimSquad::new(0, a_ids, pos(41, 25)),
             ManagedSimSquad::new(1, b_ids, pos(8, 25)),
@@ -921,6 +1343,9 @@ mod tests {
         run_managed(&mut world, &mut squads, ticks);
         let per_squad_tick_us = start.elapsed().as_secs_f64() * 1e6 / (ticks * 2) as f64;
         println!("[ADR0020 tournament] 10v10 EV/CPU = {per_squad_tick_us:.1} us/squad-tick");
-        assert!(per_squad_tick_us < 20_000.0, "large-N managed combat blew the CPU budget: {per_squad_tick_us:.0} us/squad-tick");
+        assert!(
+            per_squad_tick_us < 20_000.0,
+            "large-N managed combat blew the CPU budget: {per_squad_tick_us:.0} us/squad-tick"
+        );
     }
 }

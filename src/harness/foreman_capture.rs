@@ -77,16 +77,32 @@ fn combat_kind(t: screeps::StructureType) -> Option<&'static str> {
 pub fn capture(fixture: &TerrainFixture) -> Result<CapturedBase, String> {
     let data_source = FixtureDataSource {
         terrain: decode_fast(&fixture.terrain),
-        controllers: vec![PlanLocation::new(fixture.controller.0 as i8, fixture.controller.1 as i8)],
-        sources: fixture.sources.iter().map(|&(x, y)| PlanLocation::new(x as i8, y as i8)).collect(),
-        minerals: fixture.mineral.into_iter().map(|(x, y)| PlanLocation::new(x as i8, y as i8)).collect(),
+        controllers: vec![PlanLocation::new(
+            fixture.controller.0 as i8,
+            fixture.controller.1 as i8,
+        )],
+        sources: fixture
+            .sources
+            .iter()
+            .map(|&(x, y)| PlanLocation::new(x as i8, y as i8))
+            .collect(),
+        minerals: fixture
+            .mineral
+            .into_iter()
+            .map(|(x, y)| PlanLocation::new(x as i8, y as i8))
+            .collect(),
     };
-    let plan = screeps_foreman::planner::plan_room(&data_source).map_err(|e| format!("planning {} failed: {e}", fixture.room))?;
+    let plan = screeps_foreman::planner::plan_room(&data_source)
+        .map_err(|e| format!("planning {} failed: {e}", fixture.room))?;
     let mut structures = Vec::new();
     for (location, items) in &plan.structures {
         for item in items {
             if let Some(kind) = combat_kind(item.structure_type()) {
-                structures.push(CapturedStructure { kind: kind.to_string(), x: location.x(), y: location.y() });
+                structures.push(CapturedStructure {
+                    kind: kind.to_string(),
+                    x: location.x(),
+                    y: location.y(),
+                });
             }
         }
     }

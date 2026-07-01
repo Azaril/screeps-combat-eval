@@ -21,15 +21,20 @@ pub mod tournament;
 
 use crate::metrics::SideMetrics;
 use screeps::{Part, Position, RoomCoordinate, RoomName};
-use screeps_combat_agent::opponents::{run_engagement, tower_intents, world_from_units, DrainAgent, RushAgent, TurtleAgent, Unit};
+use screeps_combat_agent::opponents::{
+    run_engagement, tower_intents, world_from_units, DrainAgent, RushAgent, TurtleAgent, Unit,
+};
 use screeps_combat_agent::scenario::ScenarioBuilder;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_agent::{HoldAgent, IbexAgent};
 use screeps_combat_decision::cohesion;
-use screeps_combat_decision::kite::SquadTacticParams;
 #[cfg(test)]
 use screeps_combat_decision::kite::KiteScoreParams;
-use screeps_combat_engine::{resolve_tick, CombatWorld, Intents, PlayerId, SimBody, SimCreep, SimTower, StructureKind};
+use screeps_combat_decision::kite::SquadTacticParams;
+use screeps_combat_engine::{
+    resolve_tick, CombatWorld, Intents, MovementState, PlayerId, SimBody, SimCreep, SimTower,
+    StructureKind,
+};
 
 // ─── Framework ───────────────────────────────────────────────────────────────
 
@@ -53,14 +58,29 @@ pub struct ExperimentResult {
 }
 
 fn measured(name: &str, value: f64, gate: &'static str, pass: bool) -> Metric {
-    Metric { name: name.into(), value: Some(value), gate, pass }
+    Metric {
+        name: name.into(),
+        value: Some(value),
+        gate,
+        pass,
+    }
 }
 fn boolean(name: &str, gate: &'static str, pass: bool) -> Metric {
-    Metric { name: name.into(), value: None, gate, pass }
+    Metric {
+        name: name.into(),
+        value: None,
+        gate,
+        pass,
+    }
 }
 fn result(id: &'static str, hypothesis: &'static str, metrics: Vec<Metric>) -> ExperimentResult {
     let pass = metrics.iter().all(|m| m.pass);
-    ExperimentResult { id, hypothesis, metrics, pass }
+    ExperimentResult {
+        id,
+        hypothesis,
+        metrics,
+        pass,
+    }
 }
 
 /// Run the whole register (one entry per EXP-*).
@@ -75,7 +95,7 @@ pub fn register() -> Vec<ExperimentResult> {
         exp_breach_1(),
         exp_nest_1(),
         // ADR 0019 managed-squad positioning utility (the decide_squad_with_pathing path):
-        exp_cohesion_1(),   // cohesion through a corridor + terrain
+        exp_cohesion_1(),     // cohesion through a corridor + terrain
         exp_pos_selfplay_1(), // two managed squads head-to-head (advance + engage)
         exp_pos_kite_1(),     // ranged kites melee (kite preset under pursuit)
     ]
@@ -86,14 +106,31 @@ pub fn report(results: &[ExperimentResult]) -> String {
     use std::fmt::Write;
     let passed = results.iter().filter(|r| r.pass).count();
     let mut s = String::new();
-    let _ = writeln!(s, "EXP-* register — {}/{} experiments passed", passed, results.len());
+    let _ = writeln!(
+        s,
+        "EXP-* register — {}/{} experiments passed",
+        passed,
+        results.len()
+    );
     for r in results {
-        let _ = writeln!(s, "[{}] {} — {}", if r.pass { "ok" } else { "!!" }, r.id, r.hypothesis);
+        let _ = writeln!(
+            s,
+            "[{}] {} — {}",
+            if r.pass { "ok" } else { "!!" },
+            r.id,
+            r.hypothesis
+        );
         for m in &r.metrics {
             let mark = if m.pass { "ok" } else { "!!" };
             match m.value {
                 Some(v) => {
-                    let _ = writeln!(s, "    [{mark}] {} = {} (gate {})", m.name, fmt_num(v), m.gate);
+                    let _ = writeln!(
+                        s,
+                        "    [{mark}] {} = {} (gate {})",
+                        m.name,
+                        fmt_num(v),
+                        m.gate
+                    );
                 }
                 None => {
                     let _ = writeln!(s, "    [{mark}] {} (gate {})", m.name, m.gate);
@@ -120,7 +157,11 @@ fn room() -> RoomName {
     "W1N1".parse().unwrap()
 }
 fn pos(x: u8, y: u8) -> Position {
-    Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+    Position::new(
+        RoomCoordinate::new(x).unwrap(),
+        RoomCoordinate::new(y).unwrap(),
+        room(),
+    )
 }
 
 // ─── Experiments (ADR 0008a register) ────────────────────────────────────────
@@ -131,11 +172,29 @@ fn exp_found_1() -> ExperimentResult {
     let target_dies = |attacker_ra: usize, target_heal: usize| {
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, attacker_ra)], vec![pos(25, 22)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, attacker_ra)],
+                vec![pos(25, 22)],
+            )],
             1,
-            &[Unit::new(vec![(Part::Heal, target_heal)], vec![pos(25, 25)])],
+            &[Unit::new(
+                vec![(Part::Heal, target_heal)],
+                vec![pos(25, 25)],
+            )],
         );
-        run_engagement(world, room(), 0, pos(25, 22), &mut IbexAgent, 1, pos(25, 25), &mut TurtleAgent, 40).side_b_alive == 0
+        run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 22),
+            &mut IbexAgent,
+            1,
+            pos(25, 25),
+            &mut TurtleAgent,
+            40,
+        )
+        .side_b_alive
+            == 0
     };
     let kill = target_dies(7, 3); // 70 dps vs 36 heal → dies
     let survive = !target_dies(3, 5); // 30 dps vs 60 heal → lives
@@ -154,19 +213,48 @@ fn exp_found_1() -> ExperimentResult {
 fn exp_kite_1() -> ExperimentResult {
     let world = world_from_units(
         0,
-        &[Unit::new(vec![(Part::RangedAttack, 7), (Part::Move, 7)], vec![pos(30, 25)])],
+        &[Unit::new(
+            vec![(Part::RangedAttack, 7), (Part::Move, 7)],
+            vec![pos(30, 25)],
+        )],
         1,
-        &[Unit::new(vec![(Part::Attack, 10), (Part::Move, 10)], vec![pos(27, 25)])],
+        &[Unit::new(
+            vec![(Part::Attack, 10), (Part::Move, 10)],
+            vec![pos(27, 25)],
+        )],
     );
-    let out = run_engagement(world, room(), 0, pos(30, 25), &mut IbexAgent, 1, pos(27, 25), &mut RushAgent, 30);
+    let out = run_engagement(
+        world,
+        room(),
+        0,
+        pos(30, 25),
+        &mut IbexAgent,
+        1,
+        pos(27, 25),
+        &mut RushAgent,
+        30,
+    );
     let m = metrics::SideMetrics::from_recording(&out.recording, 0); // U5 metrics power the gate
     result(
         "EXP-KITE-1",
         "a range-3 kiter at MOVE parity takes 0 melee damage and chips the chaser",
         vec![
-            measured("melee damage taken by the kiter", m.damage_taken as f64, "== 0", m.damage_taken == 0),
-            boolean("the kiter's DPS is uncontaminated by towers", "creep==total", m.creep_damage_dealt == m.damage_to_enemy_creeps),
-            boolean("the chaser dies to ranged fire", "dead", out.side_b_alive == 0),
+            measured(
+                "melee damage taken by the kiter",
+                m.damage_taken as f64,
+                "== 0",
+                m.damage_taken == 0,
+            ),
+            boolean(
+                "the kiter's DPS is uncontaminated by towers",
+                "creep==total",
+                m.creep_damage_dealt == m.damage_to_enemy_creeps,
+            ),
+            boolean(
+                "the chaser dies to ranged fire",
+                "dead",
+                out.side_b_alive == 0,
+            ),
         ],
     )
 }
@@ -176,19 +264,42 @@ fn exp_kite_1() -> ExperimentResult {
 fn exp_focus_1() -> ExperimentResult {
     let world = world_from_units(
         0,
-        &[Unit::new(vec![(Part::RangedAttack, 7)], vec![pos(25, 22), pos(24, 22), pos(26, 22)])],
+        &[Unit::new(
+            vec![(Part::RangedAttack, 7)],
+            vec![pos(25, 22), pos(24, 22), pos(26, 22)],
+        )],
         1,
         &[Unit::new(vec![(Part::Heal, 5)], vec![pos(25, 25)])],
     );
-    let out = run_engagement(world, room(), 0, pos(25, 22), &mut IbexAgent, 1, pos(25, 25), &mut TurtleAgent, 30);
+    let out = run_engagement(
+        world,
+        room(),
+        0,
+        pos(25, 22),
+        &mut IbexAgent,
+        1,
+        pos(25, 25),
+        &mut TurtleAgent,
+        30,
+    );
     let cleared = out.side_b_alive == 0;
     result(
         "EXP-FOCUS-1",
         "focus-fire out-DPSes the aggregate heal (low ticks-to-clear, no overkill stragglers)",
         vec![
             boolean("3×ranged clear a 5-HEAL turtle", "cleared", cleared),
-            measured("ticks-to-clear", out.ticks as f64, "<= 10", cleared && out.ticks <= 10),
-            measured("attacker survivors", out.side_a_alive as f64, "== 3", out.side_a_alive == 3),
+            measured(
+                "ticks-to-clear",
+                out.ticks as f64,
+                "<= 10",
+                cleared && out.ticks <= 10,
+            ),
+            measured(
+                "attacker survivors",
+                out.side_a_alive as f64,
+                "== 3",
+                out.side_a_alive == 3,
+            ),
         ],
     )
 }
@@ -196,17 +307,53 @@ fn exp_focus_1() -> ExperimentResult {
 /// EXP-TOWER-1 — an edge drain sustains via self-heal and bleeds the tower's energy to zero.
 fn exp_tower_1() -> ExperimentResult {
     let world = CombatWorld {
-        creeps: vec![SimCreep { id: 1, owner: 0, pos: pos(25, 1), body: SimBody::unboosted(&[Part::Heal; 13]), fatigue: 0 }],
-        towers: vec![SimTower { id: 200, owner: 1, pos: pos(25, 22), energy: 100, hits: 3000, hits_max: 3000 }],
+        movement: MovementState {
+            creeps: vec![SimCreep {
+                id: 1,
+                owner: 0,
+                pos: pos(25, 1),
+                body: SimBody::unboosted(&[Part::Heal; 13]),
+                fatigue: 0,
+                carry_used: 0,
+            }],
+            ..Default::default()
+        },
+        towers: vec![SimTower {
+            id: 200,
+            owner: 1,
+            pos: pos(25, 22),
+            energy: 100,
+            hits: 3000,
+            hits_max: 3000,
+        }],
         ..Default::default()
     };
-    let out = run_engagement(world, room(), 0, pos(25, 1), &mut DrainAgent, 1, pos(25, 22), &mut HoldAgent, 15);
+    let out = run_engagement(
+        world,
+        room(),
+        0,
+        pos(25, 1),
+        &mut DrainAgent,
+        1,
+        pos(25, 22),
+        &mut HoldAgent,
+        15,
+    );
     result(
         "EXP-TOWER-1",
         "an edge drain sustains via self-heal and bleeds tower energy to 0",
         vec![
-            boolean("the drain tank survives the falloff tower", "survives", out.side_a_alive == 1),
-            measured("tower energy remaining", out.side_b_tower_energy as f64, "== 0 (drained)", out.side_b_tower_energy == 0),
+            boolean(
+                "the drain tank survives the falloff tower",
+                "survives",
+                out.side_a_alive == 1,
+            ),
+            measured(
+                "tower energy remaining",
+                out.side_b_tower_energy as f64,
+                "== 0 (drained)",
+                out.side_b_tower_energy == 0,
+            ),
         ],
     )
 }
@@ -223,7 +370,17 @@ fn exp_comp_1() -> ExperimentResult {
             1,
             &[Unit::new(vec![(Part::Heal, 10)], vec![pos(25, 25)])],
         );
-        let out = run_engagement(world, room(), 0, pos(25, 22), &mut IbexAgent, 1, pos(25, 25), &mut TurtleAgent, 80);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 22),
+            &mut IbexAgent,
+            1,
+            pos(25, 25),
+            &mut TurtleAgent,
+            80,
+        );
         (out.side_b_alive == 0).then_some(out.ticks)
     };
     let duo = clear_ticks(2);
@@ -233,8 +390,18 @@ fn exp_comp_1() -> ExperimentResult {
         "EXP-COMP-1",
         "a higher-DPS composition clears a heal-wall strictly faster",
         vec![
-            measured("duo (2×RA) ticks-to-clear", duo.map(|t| t as f64).unwrap_or(f64::INFINITY), "cleared", duo.is_some()),
-            measured("quad (4×RA) ticks-to-clear", quad.map(|t| t as f64).unwrap_or(f64::INFINITY), "cleared", quad.is_some()),
+            measured(
+                "duo (2×RA) ticks-to-clear",
+                duo.map(|t| t as f64).unwrap_or(f64::INFINITY),
+                "cleared",
+                duo.is_some(),
+            ),
+            measured(
+                "quad (4×RA) ticks-to-clear",
+                quad.map(|t| t as f64).unwrap_or(f64::INFINITY),
+                "cleared",
+                quad.is_some(),
+            ),
             boolean("quad clears faster than duo", "quad < duo", faster),
         ],
     )
@@ -250,14 +417,27 @@ fn exp_breach_1() -> ExperimentResult {
     let mut b = ScenarioBuilder::from_units(
         room(),
         0,
-        &[Unit::new(vec![(Part::RangedAttack, 10)], vec![pos(25, 23), pos(24, 23), pos(26, 23)])],
+        &[Unit::new(
+            vec![(Part::RangedAttack, 10)],
+            vec![pos(25, 23), pos(24, 23), pos(26, 23)],
+        )],
         1,
         &[],
     );
     b.structure(StructureKind::Rampart, Some(1), 25, 25, 3000, 3000);
     b.structure(StructureKind::Spawn, Some(1), 25, 25, 5000, 5000);
     let world = b.build();
-    let out = run_engagement(world, room(), 0, pos(25, 23), &mut IbexAgent, 1, pos(25, 25), &mut HoldAgent, 50);
+    let out = run_engagement(
+        world,
+        room(),
+        0,
+        pos(25, 23),
+        &mut IbexAgent,
+        1,
+        pos(25, 25),
+        &mut HoldAgent,
+        50,
+    );
     let m = SideMetrics::from_recording(&out.recording, 0);
     // Gate the breach MECHANIC (U3 shield-first apply + U5 structure DPS), not bot siege navigation:
     // the shield must fall first (a `Rampart` is destroyed), proving the apply layer targets the
@@ -268,9 +448,23 @@ fn exp_breach_1() -> ExperimentResult {
         "EXP-BREACH-1",
         "a ranged siege breaks the hostile rampart SHIELD first (shield-over-spawn apply layer)",
         vec![
-            measured("structure damage dealt", m.structure_damage_dealt as f64, ">= 3000 (shield)", m.structure_damage_dealt >= 3000),
-            boolean("the rampart shield is destroyed", "rampart fell", rampart_fell),
-            measured("siege survivors", m.survivors as f64, "== 3 (unopposed)", m.survivors == 3),
+            measured(
+                "structure damage dealt",
+                m.structure_damage_dealt as f64,
+                ">= 3000 (shield)",
+                m.structure_damage_dealt >= 3000,
+            ),
+            boolean(
+                "the rampart shield is destroyed",
+                "rampart fell",
+                rampart_fell,
+            ),
+            measured(
+                "siege survivors",
+                m.survivors as f64,
+                "== 3 (unopposed)",
+                m.survivors == 3,
+            ),
         ],
     )
 }
@@ -283,12 +477,21 @@ fn exp_breach_1() -> ExperimentResult {
 /// goal keeps the block together through the pinch (it funnels, then re-forms to kite) — it never
 /// scatters, focus-fires the threat, and survives (a ranged block out-ranges a stationary melee).
 fn exp_cohesion_1() -> ExperimentResult {
-    let ra_body: Vec<Part> = std::iter::repeat_n(Part::RangedAttack, 5).chain(std::iter::repeat_n(Part::Move, 5)).collect();
+    let ra_body: Vec<Part> = std::iter::repeat_n(Part::RangedAttack, 5)
+        .chain(std::iter::repeat_n(Part::Move, 5))
+        .collect();
     let squad_ids = [1u32, 2, 3];
     let mut creeps: Vec<SimCreep> = squad_ids
         .iter()
         .enumerate()
-        .map(|(i, &id)| SimCreep { id, owner: 0, pos: pos(10, 24 + i as u8), body: SimBody::unboosted(&ra_body), fatigue: 0 })
+        .map(|(i, &id)| SimCreep {
+            id,
+            owner: 0,
+            pos: pos(10, 24 + i as u8),
+            body: SimBody::unboosted(&ra_body),
+            fatigue: 0,
+            carry_used: 0,
+        })
         .collect();
     // A high-HP TOUGH melee keeper on the FAR side of the wall — a stationary focus the squad must
     // cross the corridor to engage (and then out-range).
@@ -296,17 +499,36 @@ fn exp_cohesion_1() -> ExperimentResult {
         .chain(std::iter::repeat_n(Part::Move, 5))
         .chain(std::iter::repeat_n(Part::Tough, 10))
         .collect();
-    creeps.push(SimCreep { id: 99, owner: 1, pos: pos(35, 25), body: SimBody::unboosted(&keeper_body), fatigue: 0 });
+    creeps.push(SimCreep {
+        id: 99,
+        owner: 1,
+        pos: pos(35, 25),
+        body: SimBody::unboosted(&keeper_body),
+        fatigue: 0,
+        carry_used: 0,
+    });
 
-    let mut world = CombatWorld { creeps, ..Default::default() };
+    let mut world = CombatWorld {
+        movement: MovementState {
+            creeps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     // A wall column at x=20 with a 3-wide gap (y=24..=26): the squad can pass nearly abreast, so cohesion
     // is *achievable* through the pinch — the test is whether the shared goal keeps them together.
     for y in 0..=49u8 {
         if !(24..=26).contains(&y) {
-            world.terrain.walls.insert((20, y));
+            world.movement.terrain.walls.insert((20, y));
         }
     }
-    let keeper_hits_0 = world.creeps.iter().find(|c| c.id == 99).map(|c| c.body.hits).unwrap_or(0);
+    let keeper_hits_0 = world
+        .movement
+        .creeps
+        .iter()
+        .find(|c| c.id == 99)
+        .map(|c| c.body.hits)
+        .unwrap_or(0);
 
     let mut squad = ManagedSimSquad::new(0, squad_ids.to_vec(), pos(35, 25));
     let mut worst_pairwise = 0u32;
@@ -314,19 +536,38 @@ fn exp_cohesion_1() -> ExperimentResult {
     for _ in 0..90 {
         let intents = squad.step(&world);
         resolve_tick(&mut world, &intents);
-        let positions: Vec<Position> = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).map(|c| c.pos).collect();
+        let positions: Vec<Position> = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == 0 && c.is_alive())
+            .map(|c| c.pos)
+            .collect();
         if positions.len() >= 2 {
-            worst_pairwise = worst_pairwise.max(cohesion::measure(&positions, None, 0).max_pairwise);
+            worst_pairwise =
+                worst_pairwise.max(cohesion::measure(&positions, None, 0).max_pairwise);
         }
         // "Crossed" = the squad's centroid is on the far side of the wall (it threaded the corridor).
         if !positions.is_empty() {
-            let cx = positions.iter().map(|p| p.x().u8() as u32).sum::<u32>() / positions.len() as u32;
+            let cx =
+                positions.iter().map(|p| p.x().u8() as u32).sum::<u32>() / positions.len() as u32;
             crossed |= cx > 20;
         }
     }
 
-    let keeper_hits_1 = world.creeps.iter().find(|c| c.id == 99).map(|c| if c.is_alive() { c.body.hits } else { 0 }).unwrap_or(0);
-    let survivors = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).count();
+    let keeper_hits_1 = world
+        .movement
+        .creeps
+        .iter()
+        .find(|c| c.id == 99)
+        .map(|c| if c.is_alive() { c.body.hits } else { 0 })
+        .unwrap_or(0);
+    let survivors = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 0 && c.is_alive())
+        .count();
     // Cohesion bound: 3 creeps through a 3-wide gap funnel transiently; the shared goal must keep the
     // spread bounded (a scattered block would blow well past this). Generous to the pinch, tight enough
     // to fail a genuine scatter.
@@ -365,10 +606,25 @@ pub(crate) fn run_managed(world: &mut CombatWorld, squads: &mut [ManagedSimSquad
 
 /// A `count`-strong ranged squad (5×RANGED_ATTACK + 5×MOVE each) of `owner`, in a vertical file at
 /// column `x`, rows `y0..y0+count`. Returns the creeps to splice into a world.
-pub(crate) fn ranged_file(owner: PlayerId, first_id: u32, x: u8, y0: u8, count: u8) -> Vec<SimCreep> {
-    let body: Vec<Part> = std::iter::repeat_n(Part::RangedAttack, 5).chain(std::iter::repeat_n(Part::Move, 5)).collect();
+pub(crate) fn ranged_file(
+    owner: PlayerId,
+    first_id: u32,
+    x: u8,
+    y0: u8,
+    count: u8,
+) -> Vec<SimCreep> {
+    let body: Vec<Part> = std::iter::repeat_n(Part::RangedAttack, 5)
+        .chain(std::iter::repeat_n(Part::Move, 5))
+        .collect();
     (0..count)
-        .map(|i| SimCreep { id: first_id + i as u32, owner, pos: pos(x, y0 + i), body: SimBody::unboosted(&body), fatigue: 0 })
+        .map(|i| SimCreep {
+            id: first_id + i as u32,
+            owner,
+            pos: pos(x, y0 + i),
+            body: SimBody::unboosted(&body),
+            fatigue: 0,
+            carry_used: 0,
+        })
         .collect()
 }
 
@@ -380,14 +636,39 @@ pub(crate) fn ranged_file(owner: PlayerId, first_id: u32, x: u8, y0: u8, count: 
 fn exp_pos_selfplay_1() -> ExperimentResult {
     let mut creeps = ranged_file(0, 1, 8, 24, 3);
     creeps.extend(ranged_file(1, 11, 41, 24, 3));
-    let mut world = CombatWorld { creeps, ..Default::default() };
-    let a_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 0).map(|c| c.id).collect();
-    let b_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 1).map(|c| c.id).collect();
+    let mut world = CombatWorld {
+        movement: MovementState {
+            creeps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let a_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 0)
+        .map(|c| c.id)
+        .collect();
+    let b_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 1)
+        .map(|c| c.id)
+        .collect();
     let mut squads = [
         ManagedSimSquad::new(0, a_ids, pos(41, 25)),
         ManagedSimSquad::new(1, b_ids, pos(8, 25)),
     ];
-    let total_hp = |w: &CombatWorld| -> u32 { w.creeps.iter().filter(|c| c.is_alive()).map(|c| c.body.hits).sum() };
+    let total_hp = |w: &CombatWorld| -> u32 {
+        w.movement
+            .creeps
+            .iter()
+            .filter(|c| c.is_alive())
+            .map(|c| c.body.hits)
+            .sum()
+    };
     let start_hp = total_hp(&world);
     let mut worst_pairwise = 0u32;
     for _ in 0..60 {
@@ -399,7 +680,13 @@ fn exp_pos_selfplay_1() -> ExperimentResult {
             all.reasons.extend(i.reasons);
         }
         resolve_tick(&mut world, &all);
-        let ps: Vec<Position> = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).map(|c| c.pos).collect();
+        let ps: Vec<Position> = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == 0 && c.is_alive())
+            .map(|c| c.pos)
+            .collect();
         if ps.len() >= 2 {
             worst_pairwise = worst_pairwise.max(cohesion::measure(&ps, None, 0).max_pairwise);
         }
@@ -469,36 +756,104 @@ impl KiteOutcome {
 ///   melee closes faster than the kiter flees, so survival hinges on positioning quality → the weights
 ///   actually discriminate, giving the sweep a gradient (open-terrain full-MOVE kiting is flat).
 fn run_kite_vs_melee(ranged_tactics: SquadTacticParams, slow_ranged: bool) -> KiteOutcome {
-    let melee_body: Vec<Part> = std::iter::repeat_n(Part::Attack, 5).chain(std::iter::repeat_n(Part::Move, 5)).collect();
+    let melee_body: Vec<Part> = std::iter::repeat_n(Part::Attack, 5)
+        .chain(std::iter::repeat_n(Part::Move, 5))
+        .collect();
     let ra_body: Vec<Part> = if slow_ranged {
         // 5 RANGED + 2 MOVE → fatigues on plains (moves ~1 in 3 ticks), so it can't perfectly maintain
         // range — a slow kiter must position WELL to survive (the gradient the sweep needs).
-        std::iter::repeat_n(Part::RangedAttack, 5).chain(std::iter::repeat_n(Part::Move, 2)).collect()
+        std::iter::repeat_n(Part::RangedAttack, 5)
+            .chain(std::iter::repeat_n(Part::Move, 2))
+            .collect()
     } else {
-        std::iter::repeat_n(Part::RangedAttack, 5).chain(std::iter::repeat_n(Part::Move, 5)).collect()
+        std::iter::repeat_n(Part::RangedAttack, 5)
+            .chain(std::iter::repeat_n(Part::Move, 5))
+            .collect()
     };
     let mut creeps: Vec<SimCreep> = [(30u8, 24u8), (30, 25), (30, 26)]
         .iter()
         .enumerate()
-        .map(|(i, &(x, y))| SimCreep { id: 1 + i as u32, owner: 0, pos: pos(x, y), body: SimBody::unboosted(&ra_body), fatigue: 0 })
+        .map(|(i, &(x, y))| SimCreep {
+            id: 1 + i as u32,
+            owner: 0,
+            pos: pos(x, y),
+            body: SimBody::unboosted(&ra_body),
+            fatigue: 0,
+            carry_used: 0,
+        })
         .collect();
     for (i, &(x, y)) in [(20, 24), (20, 25), (20, 26)].iter().enumerate() {
-        creeps.push(SimCreep { id: 11 + i as u32, owner: 1, pos: pos(x, y), body: SimBody::unboosted(&melee_body), fatigue: 0 });
+        creeps.push(SimCreep {
+            id: 11 + i as u32,
+            owner: 1,
+            pos: pos(x, y),
+            body: SimBody::unboosted(&melee_body),
+            fatigue: 0,
+            carry_used: 0,
+        });
     }
-    let ranged_max: u32 = creeps.iter().filter(|c| c.owner == 0).map(|c| c.body.hits_max()).sum();
-    let melee_max: u32 = creeps.iter().filter(|c| c.owner == 1).map(|c| c.body.hits_max()).sum();
-    let mut world = CombatWorld { creeps, ..Default::default() };
-    let a_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 0).map(|c| c.id).collect();
-    let b_ids: Vec<_> = world.creeps.iter().filter(|c| c.owner == 1).map(|c| c.id).collect();
+    let ranged_max: u32 = creeps
+        .iter()
+        .filter(|c| c.owner == 0)
+        .map(|c| c.body.hits_max())
+        .sum();
+    let melee_max: u32 = creeps
+        .iter()
+        .filter(|c| c.owner == 1)
+        .map(|c| c.body.hits_max())
+        .sum();
+    let mut world = CombatWorld {
+        movement: MovementState {
+            creeps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let a_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 0)
+        .map(|c| c.id)
+        .collect();
+    let b_ids: Vec<_> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 1)
+        .map(|c| c.id)
+        .collect();
     let mut squads = [
         ManagedSimSquad::new(0, a_ids, pos(20, 25)).with_tactics(ranged_tactics),
         ManagedSimSquad::new(1, b_ids, pos(30, 25)),
     ];
     run_managed(&mut world, &mut squads, 60);
-    let ranged_alive = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).count();
-    let melee_alive = world.creeps.iter().filter(|c| c.owner == 1 && c.is_alive()).count();
-    let ranged_hp_now: u32 = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).map(|c| c.body.hits).sum();
-    let melee_hp_now: u32 = world.creeps.iter().filter(|c| c.owner == 1 && c.is_alive()).map(|c| c.body.hits).sum();
+    let ranged_alive = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 0 && c.is_alive())
+        .count();
+    let melee_alive = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 1 && c.is_alive())
+        .count();
+    let ranged_hp_now: u32 = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 0 && c.is_alive())
+        .map(|c| c.body.hits)
+        .sum();
+    let melee_hp_now: u32 = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == 1 && c.is_alive())
+        .map(|c| c.body.hits)
+        .sum();
     KiteOutcome {
         ranged_alive,
         melee_alive,
@@ -521,8 +876,21 @@ fn sweep_kite_weights() -> (KiteScoreParams, i64, i64, usize) {
     let mut scores = std::collections::BTreeSet::new();
     for &w_future in &[0.0f32, 0.5, 1.0, 2.0] {
         for &w_prox in &[0.5f32, 1.0, 1.5, 2.0] {
-            let kite = KiteScoreParams { w_future, w_prox, ..base };
-            let s = run_kite_vs_melee(SquadTacticParams { kite, engage: KiteScoreParams::engage(), healer: KiteScoreParams::healer(), ..Default::default() }, true).score();
+            let kite = KiteScoreParams {
+                w_future,
+                w_prox,
+                ..base
+            };
+            let s = run_kite_vs_melee(
+                SquadTacticParams {
+                    kite,
+                    engage: KiteScoreParams::engage(),
+                    healer: KiteScoreParams::healer(),
+                    ..Default::default()
+                },
+                true,
+            )
+            .score();
             scores.insert(s);
             if s > best.1 {
                 best = (kite, s);
@@ -533,8 +901,15 @@ fn sweep_kite_weights() -> (KiteScoreParams, i64, i64, usize) {
 }
 
 /// How many structures of `kind` were destroyed across the whole run (U2 `destroyed_kinds`).
-fn destroyed_kind_count(rec: &screeps_combat_engine::CombatRecording, kind: StructureKind) -> usize {
-    rec.frames.iter().flat_map(|f| f.destroyed_kinds.iter()).filter(|(_, k)| *k == kind).count()
+fn destroyed_kind_count(
+    rec: &screeps_combat_engine::CombatRecording,
+    kind: StructureKind,
+) -> usize {
+    rec.frames
+        .iter()
+        .flat_map(|f| f.destroyed_kinds.iter())
+        .filter(|(_, k)| *k == kind)
+        .count()
 }
 
 /// EXP-NEST-1 (U7) — a defender **tower nest** (no defender creeps) punishes attackers that walk in:
@@ -545,22 +920,49 @@ fn exp_nest_1() -> ExperimentResult {
     let mut b = ScenarioBuilder::from_units(
         room(),
         0,
-        &[Unit::new(vec![(Part::Attack, 5), (Part::Move, 5)], vec![pos(22, 22), pos(23, 22)])],
+        &[Unit::new(
+            vec![(Part::Attack, 5), (Part::Move, 5)],
+            vec![pos(22, 22), pos(23, 22)],
+        )],
         1,
         &[],
     );
     b = b.tower_nest(1, 25, 25, 3, 1000);
     let world = b.build();
-    let out = run_engagement(world, room(), 0, pos(22, 22), &mut RushAgent, 1, pos(25, 25), &mut HoldAgent, 30);
+    let out = run_engagement(
+        world,
+        room(),
+        0,
+        pos(22, 22),
+        &mut RushAgent,
+        1,
+        pos(25, 25),
+        &mut HoldAgent,
+        30,
+    );
     let attackers = SideMetrics::from_recording(&out.recording, 0);
     let defender = SideMetrics::from_recording(&out.recording, 1);
     result(
         "EXP-NEST-1",
         "a 3-tower nest deals attributed tower damage and bleeds attackers (no defender creeps)",
         vec![
-            measured("defender tower damage dealt", defender.tower_damage_dealt as f64, "> 0", defender.tower_damage_dealt > 0),
-            boolean("none of that is creep DPS (no defender creeps)", "creep DPS == 0", defender.creep_damage_dealt == 0),
-            measured("attacker damage taken", attackers.damage_taken as f64, "> 0 (bled by the nest)", attackers.damage_taken > 0),
+            measured(
+                "defender tower damage dealt",
+                defender.tower_damage_dealt as f64,
+                "> 0",
+                defender.tower_damage_dealt > 0,
+            ),
+            boolean(
+                "none of that is creep DPS (no defender creeps)",
+                "creep DPS == 0",
+                defender.creep_damage_dealt == 0,
+            ),
+            measured(
+                "attacker damage taken",
+                attackers.damage_taken as f64,
+                "> 0 (bled by the nest)",
+                attackers.damage_taken > 0,
+            ),
         ],
     )
 }
@@ -586,7 +988,10 @@ mod tests {
             "[ADR0019 Stage4 sweep] best (w_future={}, w_prox={}) score={} | default score={} | {} distinct outcomes",
             best.w_future, best.w_prox, best_score, default_score, distinct
         );
-        assert!(distinct >= 2, "the sweep lost its signal (flat) — weights no longer affect the outcome");
+        assert!(
+            distinct >= 2,
+            "the sweep lost its signal (flat) — weights no longer affect the outcome"
+        );
         const GROSS: i64 = 600; // gross-misconfig guard; fine retuning is the tournament's job
         assert!(
             best_score - default_score <= GROSS,
@@ -601,7 +1006,12 @@ mod tests {
         let results = register();
         assert_eq!(results.len(), 10, "the register has 10 experiments");
         for r in &results {
-            assert!(r.pass, "{} failed its gates:\n{}", r.id, report(std::slice::from_ref(r)));
+            assert!(
+                r.pass,
+                "{} failed its gates:\n{}",
+                r.id,
+                report(std::slice::from_ref(r))
+            );
         }
     }
 
@@ -609,7 +1019,11 @@ mod tests {
     fn report_renders_the_register() {
         let s = report(&register());
         assert!(s.contains("10/10 experiments passed"), "{s}");
-        assert!(s.contains("EXP-FOUND-1") && s.contains("EXP-COHESION-1") && s.contains("EXP-POS-SELFPLAY-1"));
+        assert!(
+            s.contains("EXP-FOUND-1")
+                && s.contains("EXP-COHESION-1")
+                && s.contains("EXP-POS-SELFPLAY-1")
+        );
     }
 
     // ── ADR 0036 — opportunistic structure targeting: a managed RANGED squad RAZES a hostile core ──
@@ -630,9 +1044,18 @@ mod tests {
 
     /// A `count`-strong fully-MOVE'd ranged quad (10 RANGED + 5 MOVE) of `owner`, filed at column `x`.
     fn ranged_quad(owner: PlayerId, first_id: u32, x: u8, y0: u8, count: u8) -> Vec<SimCreep> {
-        let body: Vec<Part> = std::iter::repeat_n(Part::RangedAttack, 10).chain(std::iter::repeat_n(Part::Move, 5)).collect();
+        let body: Vec<Part> = std::iter::repeat_n(Part::RangedAttack, 10)
+            .chain(std::iter::repeat_n(Part::Move, 5))
+            .collect();
         (0..count)
-            .map(|i| SimCreep { id: first_id + i as u32, owner, pos: pos(x, y0 + i), body: SimBody::unboosted(&body), fatigue: 0 })
+            .map(|i| SimCreep {
+                id: first_id + i as u32,
+                owner,
+                pos: pos(x, y0 + i),
+                body: SimBody::unboosted(&body),
+                fatigue: 0,
+                carry_used: 0,
+            })
             .collect()
     }
 
@@ -646,9 +1069,14 @@ mod tests {
         let core_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 6000, 6000);
         let mut world = b.build();
         for c in ranged_quad(0, 1, 10, 23, 4) {
-            world.creeps.push(c);
+            world.movement.creeps.push(c);
         }
-        let hits0 = world.structures.iter().find(|s| s.id == core_id).unwrap().hits;
+        let hits0 = world
+            .structures
+            .iter()
+            .find(|s| s.id == core_id)
+            .unwrap()
+            .hits;
         let mut squad = ManagedSimSquad::new(0, vec![1, 2, 3, 4], core_pos);
         let mut prev = hits0;
         let mut closed = false;
@@ -656,11 +1084,25 @@ mod tests {
         for _ in 0..60 {
             let intents = squad.step(&world);
             resolve_tick(&mut world, &intents);
-            let hits = world.structures.iter().find(|s| s.id == core_id).map(|s| s.hits).unwrap_or(0);
+            let hits = world
+                .structures
+                .iter()
+                .find(|s| s.id == core_id)
+                .map(|s| s.hits)
+                .unwrap_or(0);
             // Monotonic: structure hits never INCREASE (no enemy repair here) — a strict-decrease-or-equal
             // ledger, so any progress is real raze progress (the determinism + no-regression guard).
-            assert!(hits <= prev, "core hits must never increase: {prev} -> {hits}");
-            if !closed && world.creeps.iter().any(|c| c.owner == 0 && c.is_alive() && c.pos.get_range_to(core_pos) <= 3) {
+            assert!(
+                hits <= prev,
+                "core hits must never increase: {prev} -> {hits}"
+            );
+            if !closed
+                && world
+                    .movement
+                    .creeps
+                    .iter()
+                    .any(|c| c.owner == 0 && c.is_alive() && c.pos.get_range_to(core_pos) <= 3)
+            {
                 closed = true;
             }
             if hits == 0 {
@@ -669,10 +1111,24 @@ mod tests {
             }
             prev = hits;
         }
-        let hits1 = world.structures.iter().find(|s| s.id == core_id).map(|s| s.hits).unwrap_or(0);
-        assert!(closed, "the ranged quad closed to weapon range of the bare core");
-        assert!(hits1 < hits0, "the squad dealt real damage to the core ({hits0} -> {hits1})");
-        assert!(razed, "the squad razed the bare core to 0 within the budget (final {hits1})");
+        let hits1 = world
+            .structures
+            .iter()
+            .find(|s| s.id == core_id)
+            .map(|s| s.hits)
+            .unwrap_or(0);
+        assert!(
+            closed,
+            "the ranged quad closed to weapon range of the bare core"
+        );
+        assert!(
+            hits1 < hits0,
+            "the squad dealt real damage to the core ({hits0} -> {hits1})"
+        );
+        assert!(
+            razed,
+            "the squad razed the bare core to 0 within the budget (final {hits1})"
+        );
     }
 
     /// A `count`-strong ranged+sustain siege body (8 RANGED + 8 HEAL + 4 TOUGH + 8 MOVE) — enough self-
@@ -684,7 +1140,14 @@ mod tests {
         body.extend(std::iter::repeat_n(Part::Heal, 8));
         body.extend(std::iter::repeat_n(Part::Move, 8));
         (0..count)
-            .map(|i| SimCreep { id: first_id + i as u32, owner, pos: pos(x, y0 + i), body: SimBody::unboosted(&body), fatigue: 0 })
+            .map(|i| SimCreep {
+                id: first_id + i as u32,
+                owner,
+                pos: pos(x, y0 + i),
+                body: SimBody::unboosted(&body),
+                fatigue: 0,
+                carry_used: 0,
+            })
             .collect()
     }
 
@@ -706,15 +1169,32 @@ mod tests {
         let tower_id = b.tower(1, 27, 25, 300);
         let mut world = b.build();
         for c in ranged_heal_quad(0, 1, 18, 22, 4) {
-            world.creeps.push(c);
+            world.movement.creeps.push(c);
         }
-        let core_hits0 = world.structures.iter().find(|s| s.id == core_id).unwrap().hits;
+        let core_hits0 = world
+            .structures
+            .iter()
+            .find(|s| s.id == core_id)
+            .unwrap()
+            .hits;
         let mut squad = ManagedSimSquad::new(0, vec![1, 2, 3, 4], core_pos);
         let mut tower_drained_at: Option<u32> = None;
         let mut core_first_damaged_at: Option<u32> = None;
         let mut core_gone = false;
-        let tower_energy = |w: &CombatWorld| w.towers.iter().find(|t| t.id == tower_id).map(|t| t.energy).unwrap_or(0);
-        let core_hits = |w: &CombatWorld| w.structures.iter().find(|s| s.id == core_id).map(|s| s.hits).unwrap_or(0);
+        let tower_energy = |w: &CombatWorld| {
+            w.towers
+                .iter()
+                .find(|t| t.id == tower_id)
+                .map(|t| t.energy)
+                .unwrap_or(0)
+        };
+        let core_hits = |w: &CombatWorld| {
+            w.structures
+                .iter()
+                .find(|s| s.id == core_id)
+                .map(|s| s.hits)
+                .unwrap_or(0)
+        };
         for tick in 0..160u32 {
             let mut intents = squad.step(&world);
             tower_intents(&world, &mut intents); // the defender's tower shoots back + bleeds energy
@@ -725,7 +1205,13 @@ mod tests {
             if core_first_damaged_at.is_none() && core_hits(&world) < core_hits0 {
                 core_first_damaged_at = Some(tick);
             }
-            if world.creeps.iter().filter(|c| c.owner == 0).all(|c| !c.is_alive()) {
+            if world
+                .movement
+                .creeps
+                .iter()
+                .filter(|c| c.owner == 0)
+                .all(|c| !c.is_alive())
+            {
                 break;
             }
             if core_hits(&world) == 0 {
@@ -733,10 +1219,22 @@ mod tests {
                 break;
             }
         }
-        let survivors = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).count();
+        let survivors = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == 0 && c.is_alive())
+            .count();
         let core_hits1 = core_hits(&world);
-        assert!(survivors > 0, "the sustaining siege out-lasted the finite tower (it didn't get wiped)");
-        assert_eq!(tower_energy(&world), 0, "the tower threat is neutralized (drained to 0)");
+        assert!(
+            survivors > 0,
+            "the sustaining siege out-lasted the finite tower (it didn't get wiped)"
+        );
+        assert_eq!(
+            tower_energy(&world),
+            0,
+            "the tower threat is neutralized (drained to 0)"
+        );
         let drained = tower_drained_at.expect("the tower was bled dry");
         // THREAT BEFORE VALUE: the core's value is untouched until the tower threat is neutralized. The
         // squad razes the core only AFTER draining the tower (no fire wasted on the core under live tower
@@ -744,7 +1242,13 @@ mod tests {
         if let Some(cd) = core_first_damaged_at {
             assert!(cd >= drained, "the core takes damage only AFTER the tower threat is neutralized: core@{cd} drained@{drained}");
         }
-        assert!(core_first_damaged_at.is_some(), "the squad eventually bit into the core's value");
-        assert!(core_gone, "and razed the core to 0 once the threat was gone (final {core_hits1})");
+        assert!(
+            core_first_damaged_at.is_some(),
+            "the squad eventually bit into the core's value"
+        );
+        assert!(
+            core_gone,
+            "and razed the core to 0 once the threat was gone (final {core_hits1})"
+        );
     }
 }

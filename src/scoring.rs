@@ -50,7 +50,12 @@ pub struct EngagementScore {
 
 /// Total living-creep HP for `side` in a single frame.
 fn side_hits(frame: &screeps_combat_engine::record::TickFrame, side: PlayerId) -> i64 {
-    frame.creeps.iter().filter(|c| c.owner == side).map(|c| c.hits as i64).sum()
+    frame
+        .creeps
+        .iter()
+        .filter(|c| c.owner == side)
+        .map(|c| c.hits as i64)
+        .sum()
 }
 
 /// HP slope for `side` over the trailing window (`hits(last) − hits(window_start)`); negative ⇒
@@ -91,21 +96,33 @@ pub fn score(rec: &CombatRecording, a_owner: PlayerId, b_owner: PlayerId) -> Eng
         }
     };
 
-    EngagementScore { verdict, decisive, a, b, residual_advantage_a }
+    EngagementScore {
+        verdict,
+        decisive,
+        a,
+        b,
+        residual_advantage_a,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use screeps::{Part, Position, RoomCoordinate, RoomName};
-    use screeps_combat_agent::opponents::{run_engagement, self_play, world_from_units, KiteAgent, TurtleAgent, Unit};
+    use screeps_combat_agent::opponents::{
+        run_engagement, self_play, world_from_units, KiteAgent, TurtleAgent, Unit,
+    };
     use screeps_combat_agent::{HoldAgent, IbexAgent};
 
     fn room() -> RoomName {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room(),
+        )
     }
 
     #[test]
@@ -113,11 +130,24 @@ mod tests {
         // 3×ranged clear a lone turtle → decisive SideA.
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, 7)], vec![pos(25, 22), pos(24, 22), pos(26, 22)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, 7)],
+                vec![pos(25, 22), pos(24, 22), pos(26, 22)],
+            )],
             1,
             &[Unit::new(vec![(Part::Heal, 5)], vec![pos(25, 25)])],
         );
-        let out = run_engagement(world, room(), 0, pos(25, 22), &mut IbexAgent, 1, pos(25, 25), &mut TurtleAgent, 30);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 22),
+            &mut IbexAgent,
+            1,
+            pos(25, 25),
+            &mut TurtleAgent,
+            30,
+        );
         let s = score(&out.recording, 0, 1);
         assert_eq!(s.verdict, Verdict::SideA);
         assert!(s.decisive, "a side was eliminated");
@@ -129,14 +159,35 @@ mod tests {
         // HP-level scoring might pick a marginal HP leader; HP-slope correctly calls it a Draw.
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::Heal, 5), (Part::Move, 1)], vec![pos(20, 25)])],
+            &[Unit::new(
+                vec![(Part::Heal, 5), (Part::Move, 1)],
+                vec![pos(20, 25)],
+            )],
             1,
-            &[Unit::new(vec![(Part::Heal, 5), (Part::Move, 1)], vec![pos(30, 25)])],
+            &[Unit::new(
+                vec![(Part::Heal, 5), (Part::Move, 1)],
+                vec![pos(30, 25)],
+            )],
         );
         // HoldAgents on both sides → no attack ever; both sit at full HP forever.
-        let out = run_engagement(world, room(), 0, pos(20, 25), &mut HoldAgent, 1, pos(30, 25), &mut HoldAgent, 40);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(20, 25),
+            &mut HoldAgent,
+            1,
+            pos(30, 25),
+            &mut HoldAgent,
+            40,
+        );
         let s = score(&out.recording, 0, 1);
-        assert_eq!(s.verdict, Verdict::Draw, "no progress on either side → Draw (advantage {})", s.residual_advantage_a);
+        assert_eq!(
+            s.verdict,
+            Verdict::Draw,
+            "no progress on either side → Draw (advantage {})",
+            s.residual_advantage_a
+        );
         assert!(!s.decisive, "both sides survived");
         assert!(s.a.survivors == 1 && s.b.survivors == 1);
     }
@@ -147,14 +198,38 @@ mod tests {
         // survive the short cap. A should be favored on residual HP slope even though both survive.
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, 20), (Part::Move, 10)], vec![pos(23, 25)])], // 200 dps, 3000 hits
+            &[Unit::new(
+                vec![(Part::RangedAttack, 20), (Part::Move, 10)],
+                vec![pos(23, 25)],
+            )], // 200 dps, 3000 hits
             1,
-            &[Unit::new(vec![(Part::RangedAttack, 5), (Part::Move, 25)], vec![pos(27, 25)])], // 50 dps, 3000 hits
+            &[Unit::new(
+                vec![(Part::RangedAttack, 5), (Part::Move, 25)],
+                vec![pos(27, 25)],
+            )], // 50 dps, 3000 hits
         );
-        let out = run_engagement(world, room(), 0, pos(23, 25), &mut KiteAgent, 1, pos(27, 25), &mut KiteAgent, 10);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(23, 25),
+            &mut KiteAgent,
+            1,
+            pos(27, 25),
+            &mut KiteAgent,
+            10,
+        );
         let s = score(&out.recording, 0, 1);
-        assert!(s.a.survivors > 0 && s.b.survivors > 0, "short cap → both alive");
-        assert_eq!(s.verdict, Verdict::SideA, "A is out-bleeding B (advantage {})", s.residual_advantage_a);
+        assert!(
+            s.a.survivors > 0 && s.b.survivors > 0,
+            "short cap → both alive"
+        );
+        assert_eq!(
+            s.verdict,
+            Verdict::SideA,
+            "A is out-bleeding B (advantage {})",
+            s.residual_advantage_a
+        );
         assert!(s.residual_advantage_a > 0);
     }
 
@@ -163,13 +238,23 @@ mod tests {
         // The bot vs itself in a symmetric setup should not systematically favor a side.
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, 5), (Part::Move, 5), (Part::Heal, 2)], vec![pos(23, 25)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, 5), (Part::Move, 5), (Part::Heal, 2)],
+                vec![pos(23, 25)],
+            )],
             1,
-            &[Unit::new(vec![(Part::RangedAttack, 5), (Part::Move, 5), (Part::Heal, 2)], vec![pos(27, 25)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, 5), (Part::Move, 5), (Part::Heal, 2)],
+                vec![pos(27, 25)],
+            )],
         );
         let out = self_play(world, room(), 0, pos(23, 25), 1, pos(27, 25), 30);
         let s = score(&out.recording, 0, 1);
         // Either a clean Draw, or a small residual edge — never a runaway (|advantage| stays bounded).
-        assert!(s.residual_advantage_a.abs() < 2000, "mirror match has no runaway, got {}", s.residual_advantage_a);
+        assert!(
+            s.residual_advantage_a.abs() < 2000,
+            "mirror match has no runaway, got {}",
+            s.residual_advantage_a
+        );
     }
 }

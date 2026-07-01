@@ -1,15 +1,15 @@
 //! ADR 0025 §12 Stage 1 — **real terrain import** into the host combat sim. Brings a handful of REAL
 //! mmo:shard3 room terrains (committed in `resources/real-terrain.json`, extracted from the
-//! `screeps-foreman-bench` map dump) into a [`CombatTerrain`], so the EV-kernel tuning + Lanchester
+//! `screeps-foreman-bench` map dump) into a [`SimTerrain`], so the EV-kernel tuning + Lanchester
 //! validation can run on realistic walls/swamps instead of only hand-authored synthetic beds.
 //!
 //! Why committed fixtures, not a live fetch: a room's terrain is a 2500-char digit string (`screeps-
 //! rest-api` `types.rs`), so a handful is ~13 KB — fully deterministic, no credentials, no async, no CI
 //! network. The live rest-api path (rate-capped, credential-gated) is reserved for the offline capture
-//! tool (§12 Stage 3a). The `FastRoomTerrain` ↔ `CombatTerrain` bridge the foreman planner needs lands
+//! tool (§12 Stage 3a). The `FastRoomTerrain` ↔ `SimTerrain` bridge the foreman planner needs lands
 //! with Stage 3 (it pulls the `screeps-foreman` dep); Stage 1 is the decoder + fixtures only.
 
-use screeps_combat_engine::CombatTerrain;
+use screeps_combat_engine::SimTerrain;
 
 /// A committed real-terrain fixture: room name + the 2500-char encoded terrain + the source-object
 /// positions the foreman planner needs in Stage 3 (controller / sources / mineral). Owned (parsed from
@@ -68,7 +68,13 @@ pub fn fixtures() -> Vec<TerrainFixture> {
                 taken.insert(snapped);
                 snapped
             });
-            TerrainFixture { room: r.room, terrain: r.terrain, controller, sources, mineral }
+            TerrainFixture {
+                room: r.room,
+                terrain: r.terrain,
+                controller,
+                sources,
+                mineral,
+            }
         })
         .collect()
 }
@@ -81,7 +87,12 @@ pub fn fixtures() -> Vec<TerrainFixture> {
 /// This is a WORKAROUND for a suspect, not-yet-root-caused dump offset — see
 /// `docs/design/0025a-coordinate-offset-anomaly.md` (terrain decode is verified correct; the dump's
 /// object coords are the bug; revisit when the dump provenance / a live-API cross-check is available).
-pub fn snap_to_open(terrain: &CombatTerrain, x: u8, y: u8, taken: &std::collections::HashSet<(u8, u8)>) -> (u8, u8) {
+pub fn snap_to_open(
+    terrain: &SimTerrain,
+    x: u8,
+    y: u8,
+    taken: &std::collections::HashSet<(u8, u8)>,
+) -> (u8, u8) {
     use std::collections::{HashSet, VecDeque};
     let mut seen: HashSet<(i32, i32)> = HashSet::new();
     let mut q = VecDeque::from([(x as i32, y as i32)]);
@@ -93,21 +104,30 @@ pub fn snap_to_open(terrain: &CombatTerrain, x: u8, y: u8, taken: &std::collecti
         if !terrain.is_wall(t.0, t.1) && !taken.contains(&t) {
             return t;
         }
-        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)] {
+        for (dx, dy) in [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (-1, 1),
+            (1, -1),
+            (-1, -1),
+        ] {
             q.push_back((cx + dx, cy + dy));
         }
     }
     (x, y)
 }
 
-/// Decode a 2500-char shard terrain string into the engine's sparse [`CombatTerrain`]. The screeps
+/// Decode a 2500-char shard terrain string into the engine's sparse [`SimTerrain`]. The screeps
 /// `/api/game/room-terrain?encoded=1` string is **COLUMN-MAJOR** (`index = x*50 + y`, matching the
 /// bindings' `LocalCostMatrix` `xy_to_linear_index`), verified empirically against the official server
 /// (ADR 0025a): under this convention room objects land on clear tiles and rooms render coherently;
 /// row-major puts 100% of objects on walls. Each char is a hex digit: bit `1`=wall, `2`=swamp (`3` ⇒
 /// wall wins). Out-of-spec chars decode as plain.
-pub fn decode_terrain(encoded: &str) -> CombatTerrain {
-    let mut t = CombatTerrain::default();
+pub fn decode_terrain(encoded: &str) -> SimTerrain {
+    let mut t = SimTerrain::default();
     for (i, ch) in encoded.chars().enumerate().take(2500) {
         let v = ch.to_digit(16).unwrap_or(0) as u8;
         let (x, y) = ((i / 50) as u8, (i % 50) as u8); // column-major: i = x*50 + y
@@ -126,7 +146,11 @@ pub fn decode_terrain(encoded: &str) -> CombatTerrain {
 /// string[x*50+y]`. Then `fast.is_wall(x,y)` (reading `buffer[y*50+x]`) returns tile `(x,y)`'s value —
 /// agreeing with [`decode_terrain`]. (bit 0 = wall, bit 1 = swamp.)
 pub fn decode_fast(encoded: &str) -> screeps_foreman::terrain::FastRoomTerrain {
-    let chars: Vec<u8> = encoded.chars().take(2500).map(|c| c.to_digit(16).unwrap_or(0) as u8).collect();
+    let chars: Vec<u8> = encoded
+        .chars()
+        .take(2500)
+        .map(|c| c.to_digit(16).unwrap_or(0) as u8)
+        .collect();
     let mut buffer = vec![0u8; 2500];
     for x in 0..50usize {
         for y in 0..50usize {
@@ -136,11 +160,11 @@ pub fn decode_fast(encoded: &str) -> screeps_foreman::terrain::FastRoomTerrain {
     screeps_foreman::terrain::FastRoomTerrain::new(buffer)
 }
 
-/// Bridge the foreman dense [`FastRoomTerrain`] to the engine sparse [`CombatTerrain`] (the inverse of
+/// Bridge the foreman dense [`FastRoomTerrain`] to the engine sparse [`SimTerrain`] (the inverse of
 /// what the planner consumes). Used where a plan was built over a `FastRoomTerrain` but the sim needs the
-/// `CombatTerrain` form. Walls dominate swamps (matching [`decode_terrain`]).
-pub fn fast_to_combat(fast: &screeps_foreman::terrain::FastRoomTerrain) -> CombatTerrain {
-    let mut t = CombatTerrain::default();
+/// `SimTerrain` form. Walls dominate swamps (matching [`decode_terrain`]).
+pub fn fast_to_combat(fast: &screeps_foreman::terrain::FastRoomTerrain) -> SimTerrain {
+    let mut t = SimTerrain::default();
     for y in 0..50u8 {
         for x in 0..50u8 {
             if fast.is_wall(x, y) {
@@ -153,9 +177,9 @@ pub fn fast_to_combat(fast: &screeps_foreman::terrain::FastRoomTerrain) -> Comba
     t
 }
 
-/// Encode a [`CombatTerrain`] back to the 2500-char COLUMN-MAJOR form (walls→`'1'`, swamps→`'2'`,
+/// Encode a [`SimTerrain`] back to the 2500-char COLUMN-MAJOR form (walls→`'1'`, swamps→`'2'`,
 /// plain→`'0'`). The inverse of [`decode_terrain`] — used by the round-trip test (and handy for fixtures).
-pub fn encode_terrain(t: &CombatTerrain) -> String {
+pub fn encode_terrain(t: &SimTerrain) -> String {
     (0..2500)
         .map(|i| {
             let (x, y) = ((i / 50) as u8, (i % 50) as u8); // column-major: i = x*50 + y
@@ -176,7 +200,7 @@ mod tests {
 
     #[test]
     fn decode_roundtrips_a_known_pattern() {
-        let mut t = CombatTerrain::default();
+        let mut t = SimTerrain::default();
         t.walls.insert((0, 0));
         t.walls.insert((49, 49));
         t.walls.insert((10, 3)); // index 3*50+10 = 160
@@ -195,19 +219,30 @@ mod tests {
         s[2] = '2';
         let t = decode_terrain(&s.into_iter().collect::<String>());
         assert!(t.is_wall(3, 10) && t.walls.len() == 1, "wall at (3,10)");
-        assert!(t.swamps.contains(&(0, 2)) && t.swamps.len() == 1, "swamp at (0,2)");
+        assert!(
+            t.swamps.contains(&(0, 2)) && t.swamps.len() == 1,
+            "swamp at (0,2)"
+        );
         // '3' (wall+swamp bits) is a WALL, not a swamp.
         let mut s2 = vec!['0'; 2500];
         s2[0] = '3';
         let t2 = decode_terrain(&s2.into_iter().collect::<String>());
-        assert!(t2.is_wall(0, 0) && t2.swamps.is_empty(), "'3' decodes as wall");
+        assert!(
+            t2.is_wall(0, 0) && t2.swamps.is_empty(),
+            "'3' decodes as wall"
+        );
     }
 
     /// Largest 4-connected open (non-wall) component as a fraction of all open tiles — a navigability
     /// measure (a real room's interior is one big connected space, not fragmented pockets).
-    fn largest_open_fraction(t: &CombatTerrain) -> f64 {
-        let open = |x: i32, y: i32| (0..50).contains(&x) && (0..50).contains(&y) && !t.is_wall(x as u8, y as u8);
-        let total = (0..50).flat_map(|x| (0..50).map(move |y| (x, y))).filter(|&(x, y)| open(x, y)).count();
+    fn largest_open_fraction(t: &SimTerrain) -> f64 {
+        let open = |x: i32, y: i32| {
+            (0..50).contains(&x) && (0..50).contains(&y) && !t.is_wall(x as u8, y as u8)
+        };
+        let total = (0..50)
+            .flat_map(|x| (0..50).map(move |y| (x, y)))
+            .filter(|&(x, y)| open(x, y))
+            .count();
         if total == 0 {
             return 0.0;
         }
@@ -236,30 +271,71 @@ mod tests {
     #[test]
     fn fixtures_are_real_navigable_rooms() {
         let fx = fixtures();
-        assert!(fx.len() >= 3, "a handful of real-terrain fixtures ({} found)", fx.len());
+        assert!(
+            fx.len() >= 3,
+            "a handful of real-terrain fixtures ({} found)",
+            fx.len()
+        );
         for f in &fx {
-            assert_eq!(f.terrain.chars().count(), 2500, "{} terrain is a full 50x50 room", f.room);
+            assert_eq!(
+                f.terrain.chars().count(),
+                2500,
+                "{} terrain is a full 50x50 room",
+                f.room
+            );
             assert!(!f.sources.is_empty(), "{} carries source metadata", f.room);
             let terrain = decode_terrain(&f.terrain);
             // A REAL room: meaningful walls, but not sealed.
-            assert!(terrain.walls.len() > 50, "{} has real terrain ({} walls)", f.room, terrain.walls.len());
-            assert!(terrain.walls.len() < 2400, "{} is not fully walled ({} walls)", f.room, terrain.walls.len());
+            assert!(
+                terrain.walls.len() > 50,
+                "{} has real terrain ({} walls)",
+                f.room,
+                terrain.walls.len()
+            );
+            assert!(
+                terrain.walls.len() < 2400,
+                "{} is not fully walled ({} walls)",
+                f.room,
+                terrain.walls.len()
+            );
             // Navigable: the open interior is one big connected component (a squad can traverse it).
             let frac = largest_open_fraction(&terrain);
-            assert!(frac > 0.6, "{} interior is navigable (largest open component {:.0}% of open tiles)", f.room, frac * 100.0);
+            assert!(
+                frac > 0.6,
+                "{} interior is navigable (largest open component {:.0}% of open tiles)",
+                f.room,
+                frac * 100.0
+            );
             // The COORDINATE FIX: snapped object positions are on clear tiles + distinct.
-            assert!(!terrain.is_wall(f.controller.0, f.controller.1), "{} controller snapped to a clear tile", f.room);
+            assert!(
+                !terrain.is_wall(f.controller.0, f.controller.1),
+                "{} controller snapped to a clear tile",
+                f.room
+            );
             for &(sx, sy) in &f.sources {
-                assert!(!terrain.is_wall(sx, sy), "{} source ({sx},{sy}) snapped to a clear tile", f.room);
+                assert!(
+                    !terrain.is_wall(sx, sy),
+                    "{} source ({sx},{sy}) snapped to a clear tile",
+                    f.room
+                );
             }
             let mut all: Vec<(u8, u8)> = vec![f.controller];
             all.extend(&f.sources);
             if let Some(m) = f.mineral {
-                assert!(!terrain.is_wall(m.0, m.1), "{} mineral snapped to a clear tile", f.room);
+                assert!(
+                    !terrain.is_wall(m.0, m.1),
+                    "{} mineral snapped to a clear tile",
+                    f.room
+                );
                 all.push(m);
             }
             let distinct: std::collections::HashSet<_> = all.iter().collect();
-            assert_eq!(distinct.len(), all.len(), "{} objects snap to distinct tiles", f.room);
+            assert_eq!(
+                distinct.len(),
+                all.len(),
+                "{} objects snap to distinct tiles",
+                f.room
+            );
         }
     }
 
@@ -271,8 +347,16 @@ mod tests {
         let f = &fx[0];
         let via_fast = fast_to_combat(&decode_fast(&f.terrain));
         let direct = decode_terrain(&f.terrain);
-        assert_eq!(via_fast.walls, direct.walls, "{}: fast/direct walls agree", f.room);
-        assert_eq!(via_fast.swamps, direct.swamps, "{}: fast/direct swamps agree", f.room);
+        assert_eq!(
+            via_fast.walls, direct.walls,
+            "{}: fast/direct walls agree",
+            f.room
+        );
+        assert_eq!(
+            via_fast.swamps, direct.swamps,
+            "{}: fast/direct swamps agree",
+            f.room
+        );
     }
 
     #[test]
@@ -281,7 +365,8 @@ mod tests {
         // large majority (snap is then a no-op). The residual few that still read wall are the "other
         // anomaly" tracked in ADR 0025a; `snap_to_open` mops them up. (Under the old row-major decode this
         // was 0% — the regression guard for the transpose fix.)
-        let raw: FixtureFile = serde_json::from_str(include_str!("../../resources/real-terrain.json")).unwrap();
+        let raw: FixtureFile =
+            serde_json::from_str(include_str!("../../resources/real-terrain.json")).unwrap();
         let (mut open, mut total) = (0, 0);
         for r in &raw.rooms {
             let terrain = decode_terrain(&r.terrain);

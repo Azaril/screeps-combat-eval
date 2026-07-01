@@ -3,8 +3,8 @@
 //! produces these; a [`Validator`](crate::harness::validate::Validator) consumes them. Single- or
 //! multi-room.
 
-use screeps_combat_engine::{CombatWorld, PlayerId, StructureId};
 use screeps::{Position, RoomName};
+use screeps_combat_engine::{CombatWorld, PlayerId, StructureId};
 
 /// What KIND of objective the attacker pursues (ADR 0025 §12 Stage 2). Drives the run-until stop
 /// condition + (Declaim) the world population; the staging geometry is shared. (`EngageObjective` in the

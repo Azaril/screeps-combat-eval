@@ -15,7 +15,8 @@
 use screeps::local::LocalCostMatrix;
 use screeps::{Part, Position, RoomCoordinate, RoomName};
 use screeps_combat_decision::kite::{
-    plan_kite_anchor, KiteScoreParams, KiteThreat, KiteTower, PositionLayers, SquadKiteView, ThreatKind, MAX_KITE_OPS,
+    plan_kite_anchor, KiteScoreParams, KiteThreat, KiteTower, PositionLayers, SquadKiteView,
+    ThreatKind, MAX_KITE_OPS,
 };
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,11 @@ fn room() -> RoomName {
     "W1N1".parse().unwrap()
 }
 fn pos(x: u8, y: u8) -> Position {
-    Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+    Position::new(
+        RoomCoordinate::new(x).unwrap(),
+        RoomCoordinate::new(y).unwrap(),
+        room(),
+    )
 }
 
 /// The result of a position-selection CPU bench run.
@@ -45,10 +50,24 @@ fn worst_case_threats() -> Vec<KiteThreat> {
     let ranged = [(20, 20), (30, 20), (20, 30), (30, 30), (25, 18)];
     let mut v = Vec::new();
     for &(x, y) in &melee {
-        v.push(KiteThreat { pos: pos(x, y), kind: ThreatKind::MeleeOnly, reach: 2, step_ticks: Some(1), attack_power: 300, ranged_power: 0 });
+        v.push(KiteThreat {
+            pos: pos(x, y),
+            kind: ThreatKind::MeleeOnly,
+            reach: 2,
+            step_ticks: Some(1),
+            attack_power: 300,
+            ranged_power: 0,
+        });
     }
     for &(x, y) in &ranged {
-        v.push(KiteThreat { pos: pos(x, y), kind: ThreatKind::Ranged, reach: 0, step_ticks: Some(1), attack_power: 0, ranged_power: 100 });
+        v.push(KiteThreat {
+            pos: pos(x, y),
+            kind: ThreatKind::Ranged,
+            reach: 0,
+            step_ticks: Some(1),
+            attack_power: 0,
+            ranged_power: 100,
+        });
     }
     v
 }
@@ -56,7 +75,10 @@ fn worst_case_threats() -> Vec<KiteThreat> {
 /// 6 enemy towers clustered near the room centre (full whole-room falloff coverage = the safety term's
 /// worst case for every tile a block's search visits).
 fn worst_case_towers() -> Vec<KiteTower> {
-    [(23, 23), (25, 23), (27, 23), (23, 25), (25, 25), (27, 25)].iter().map(|&(x, y)| KiteTower { pos: pos(x, y) }).collect()
+    [(23, 23), (25, 23), (27, 23), (23, 25), (25, 25), (27, 25)]
+        .iter()
+        .map(|&(x, y)| KiteTower { pos: pos(x, y) })
+        .collect()
 }
 
 /// Run the position-selection worst case: 4 blocks (corners) each `plan_kite_anchor` per tick, over an
@@ -89,7 +111,8 @@ fn run_worst_case(ticks: usize, shared: bool) -> BenchResult {
     for _ in 0..ticks {
         // Build-once-per-room: one PositionLayers per tick, shared by every block this tick (live, the
         // SquadManager does this in its per-tick room cache). The per-squad path rebuilds inside the loop.
-        let layers = shared.then(|| PositionLayers::build(&threats, &towers, room(), &matrix, MAX_KITE_OPS));
+        let layers =
+            shared.then(|| PositionLayers::build(&threats, &towers, room(), &matrix, MAX_KITE_OPS));
         for &c in &centroids {
             let view = SquadKiteView {
                 centroid: c,
@@ -137,7 +160,8 @@ mod tests {
         let ticks = 25;
         let unshared = run_compound_worst_case(ticks);
         let shared = run_compound_worst_case_shared(ticks);
-        let speedup = unshared.total.as_secs_f64() / shared.total.as_secs_f64().max(f64::MIN_POSITIVE);
+        let speedup =
+            unshared.total.as_secs_f64() / shared.total.as_secs_f64().max(f64::MIN_POSITIVE);
         println!(
             "[ADR0019 Stage3b default-on gate] {} blocks x {} ticks: per-squad {:.1} us/bt ({} plans) | \
              build-once-per-room {:.1} us/bt ({} plans) | sharing speedup {:.2}x",
@@ -164,6 +188,9 @@ mod tests {
         );
         // (3) Build-once-per-room is behaviour-preserving: sharing the layers must not change which
         // tiles are chosen, so the plan count is identical to the per-squad path.
-        assert_eq!(shared.plans, unshared.plans, "build-once-per-room changed tactics");
+        assert_eq!(
+            shared.plans, unshared.plans,
+            "build-once-per-room changed tactics"
+        );
     }
 }

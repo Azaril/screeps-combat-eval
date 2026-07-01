@@ -8,8 +8,11 @@ use crate::harness::foreman_capture::CapturedBase;
 use crate::harness::scenario::{Objective, ObjectiveKind, Scenario};
 use crate::harness::terrain_import::{decode_terrain, fixtures, TerrainFixture};
 use screeps::{Part, Position, RoomCoordinate, RoomName};
-use screeps_combat_engine::{CombatTerrain, CombatWorld, PlayerId, SimBody, SimController, SimCreep, StructureId, StructureKind};
 use screeps_combat_agent::scenario::ScenarioBuilder;
+use screeps_combat_engine::{
+    CombatWorld, PlayerId, SimBody, SimController, SimCreep, SimTerrain, StructureId, StructureKind,
+};
+use screeps_sim_core::rng::Rng;
 
 pub const ATTACKER: PlayerId = 0;
 pub const DEFENDER: PlayerId = 1;
@@ -26,19 +29,37 @@ fn room() -> RoomName {
     "W1N1".parse().unwrap()
 }
 fn pos_in(room: RoomName, x: u8, y: u8) -> Position {
-    Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+    Position::new(
+        RoomCoordinate::new(x).unwrap(),
+        RoomCoordinate::new(y).unwrap(),
+        room,
+    )
 }
 
 /// Breach staging for a `core` with the gate to its WEST. Returns `(assault, front_tiles, support_tiles,
 /// rampart_xy)`: the assault corner (NW of the core), the front (range 1 to BOTH gate + core), the
 /// support (adjacent to the assault, core-range ≥ 2 → full adjacent HEAL, never the focus), and the
 /// rampart tile. (For `core == (25,25)` this is exactly the Move B layout.)
-pub(crate) fn breach_geometry(rm: RoomName, core: (u8, u8)) -> (Position, Vec<Position>, Vec<Position>, (u8, u8)) {
+pub(crate) fn breach_geometry(
+    rm: RoomName,
+    core: (u8, u8),
+) -> (Position, Vec<Position>, Vec<Position>, (u8, u8)) {
     let (cx, cy) = core;
     let p = |x: u8, y: u8| pos_in(rm, x, y);
     let assault = p(cx - 1, cy - 1);
-    let front = vec![p(cx - 1, cy - 1), p(cx, cy - 1), p(cx - 1, cy + 1), p(cx, cy + 1)];
-    let support = vec![p(cx - 2, cy - 2), p(cx - 1, cy - 2), p(cx, cy - 2), p(cx - 2, cy - 1), p(cx - 2, cy)];
+    let front = vec![
+        p(cx - 1, cy - 1),
+        p(cx, cy - 1),
+        p(cx - 1, cy + 1),
+        p(cx, cy + 1),
+    ];
+    let support = vec![
+        p(cx - 2, cy - 2),
+        p(cx - 1, cy - 2),
+        p(cx, cy - 2),
+        p(cx - 2, cy - 1),
+        p(cx - 2, cy),
+    ];
     (assault, front, support, (cx - 1, cy))
 }
 
@@ -50,31 +71,8 @@ pub trait Generator {
     fn generate(&self, index: u32) -> Scenario;
 }
 
-// ── Seeded RNG (SplitMix64 — per-index reproducible; no `rand`/`Date`/`Math.random`) ───────────────
-pub(crate) struct Rng(u64);
-impl Rng {
-    pub(crate) fn seeded(index: u32) -> Self {
-        Rng(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(index as u64 + 1))
-    }
-    pub(crate) fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    /// Inclusive range `[lo, hi]`.
-    pub(crate) fn range(&mut self, lo: u32, hi: u32) -> u32 {
-        debug_assert!(hi >= lo);
-        lo + (self.next_u64() % (hi - lo + 1) as u64) as u32
-    }
-    pub(crate) fn chance(&mut self, pct: u32) -> bool {
-        self.range(0, 99) < pct
-    }
-    pub(crate) fn pick(&mut self, xs: &[u32]) -> u32 {
-        xs[(self.next_u64() % xs.len() as u64) as usize]
-    }
-}
+// Seeded RNG (SplitMix64) is shared from the kernel now — `screeps_sim_core::rng::Rng` (ADR 0033),
+// imported at the top of this module. The private copy that used to live here was removed.
 
 /// The seeded single-room defended-base generator (the oracle-calibration substrate): a core behind a
 /// (usually present) rampart, 0–6 towers of varied energy/range, a small safe-mode chance, and RCL-ish
@@ -96,7 +94,11 @@ impl Generator for RandomDefendedBase {
         let member_energy = rng.pick(&[1300, 1800, 2300, 3300, 5600, 12_900]);
         let onsite_budget = rng.range(600, 1400);
         let core_hits = rng.range(20_000, 100_000);
-        let rampart_hits = if rng.chance(70) { rng.range(1, 80_000) } else { 0 };
+        let rampart_hits = if rng.chance(70) {
+            rng.range(1, 80_000)
+        } else {
+            0
+        };
         let n_towers = rng.range(0, 6);
         let safe_mode = rng.chance(5);
 
@@ -104,13 +106,25 @@ impl Generator for RandomDefendedBase {
         const CORE: (u8, u8) = (25, 25);
         let (assault_pos, front_tiles, support_tiles, rampart_xy) = breach_geometry(rm, CORE);
         let mut b = ScenarioBuilder::empty(rm);
-        let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), CORE.0, CORE.1, core_hits, core_hits);
+        let core_id = b.structure(
+            StructureKind::Spawn,
+            Some(DEFENDER),
+            CORE.0,
+            CORE.1,
+            core_hits,
+            core_hits,
+        );
         for &(tx, ty) in TOWER_TILES.iter().take(n_towers as usize) {
-            let energy = if rng.chance(25) { rng.range(0, 9) } else { rng.range(100, 100_000) };
+            let energy = if rng.chance(25) {
+                rng.range(0, 9)
+            } else {
+                rng.range(100, 100_000)
+            };
             b.tower(DEFENDER, tx, ty, energy);
         }
         let mut world: CombatWorld = if rampart_hits > 0 {
-            b.rampart(DEFENDER, rampart_xy.0, rampart_xy.1, rampart_hits).build()
+            b.rampart(DEFENDER, rampart_xy.0, rampart_xy.1, rampart_hits)
+                .build()
         } else {
             b.build()
         };
@@ -219,7 +233,13 @@ pub enum ForceSpec {
 
 /// Place a [`ForceSpec`]'s defender creeps in `world` around `core`, owned by `defender`. Ids start at
 /// 10_000 so they never collide with attacker ids (1..N).
-fn place_force(world: &mut CombatWorld, rm: RoomName, core: (u8, u8), spec: ForceSpec, defender: PlayerId) {
+fn place_force(
+    world: &mut CombatWorld,
+    rm: RoomName,
+    core: (u8, u8),
+    spec: ForceSpec,
+    defender: PlayerId,
+) {
     let (cx, cy) = core;
     // A ring of guard tiles around the core (skip the core + the western breach approach).
     let ring: [(i32, i32); 6] = [(1, 0), (2, 0), (1, 2), (2, 1), (1, -2), (2, -1)];
@@ -227,23 +247,57 @@ fn place_force(world: &mut CombatWorld, rm: RoomName, core: (u8, u8), spec: Forc
         let (dx, dy) = ring[i % ring.len()];
         let x = (cx as i32 + dx).clamp(0, 49) as u8;
         let y = (cy as i32 + dy).clamp(0, 49) as u8;
-        let pos = Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), rm);
-        world.creeps.push(SimCreep { id, owner: defender, pos, body: SimBody::unboosted(parts), fatigue: 0 });
+        let pos = Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            rm,
+        );
+        world.movement.creeps.push(SimCreep {
+            id,
+            owner: defender,
+            pos,
+            body: SimBody::unboosted(parts),
+            fatigue: 0,
+            carry_used: 0,
+        });
     };
     match spec {
         ForceSpec::None => {}
         ForceSpec::Skirmishers(n) => {
-            let body = [Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::Move, Part::Move, Part::Move];
+            let body = [
+                Part::RangedAttack,
+                Part::RangedAttack,
+                Part::RangedAttack,
+                Part::Move,
+                Part::Move,
+                Part::Move,
+            ];
             for i in 0..n as usize {
                 push(i, &body, 10_000 + i as u32);
             }
         }
         ForceSpec::Guard(n) => {
-            let melee = [Part::Tough, Part::Tough, Part::Attack, Part::Attack, Part::Move, Part::Move, Part::Move, Part::Move];
+            let melee = [
+                Part::Tough,
+                Part::Tough,
+                Part::Attack,
+                Part::Attack,
+                Part::Move,
+                Part::Move,
+                Part::Move,
+                Part::Move,
+            ];
             for i in 0..n as usize {
                 push(i, &melee, 10_000 + i as u32);
             }
-            let healer = [Part::Heal, Part::Heal, Part::Heal, Part::Move, Part::Move, Part::Move];
+            let healer = [
+                Part::Heal,
+                Part::Heal,
+                Part::Heal,
+                Part::Move,
+                Part::Move,
+                Part::Move,
+            ];
             push(n as usize, &healer, 10_000 + n);
         }
     }
@@ -275,9 +329,23 @@ pub(crate) fn assemble_single_room(
     for (x, y) in swamps {
         b.world_mut().terrain_mut(rm).swamps.insert((x, y));
     }
-    let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000);
+    let core_id = b.structure(
+        StructureKind::Spawn,
+        Some(DEFENDER),
+        core.0,
+        core.1,
+        50_000,
+        50_000,
+    );
     if rampart_hits > 0 {
-        b.structure(StructureKind::Rampart, Some(DEFENDER), rampart_xy.0, rampart_xy.1, rampart_hits, rampart_hits);
+        b.structure(
+            StructureKind::Rampart,
+            Some(DEFENDER),
+            rampart_xy.0,
+            rampart_xy.1,
+            rampart_hits,
+            rampart_hits,
+        );
     }
     for &((tx, ty), e) in towers {
         b.tower(DEFENDER, tx, ty, e);
@@ -313,7 +381,12 @@ pub(crate) fn assemble_single_room(
 /// is enumerable, not sampled. `count()` is the grid size; `generate(i)` decodes `i` into a feature tuple.
 pub struct Permutations;
 
-const PERM_LAYOUTS: [Layout; 4] = [Layout::Open, Layout::Corridor, Layout::SwampApproach, Layout::Bunker];
+const PERM_LAYOUTS: [Layout; 4] = [
+    Layout::Open,
+    Layout::Corridor,
+    Layout::SwampApproach,
+    Layout::Bunker,
+];
 const PERM_RAMPARTS: [u32; 3] = [0, 20_000, 60_000];
 const PERM_TOWERS: [u32; 3] = [0, 2, 4];
 const PERM_ENERGY: [u32; 3] = [2300, 5600, 12_900];
@@ -329,9 +402,16 @@ impl Generator for Permutations {
         let i = index as usize;
         let layout = PERM_LAYOUTS[i % PERM_LAYOUTS.len()];
         let rampart = PERM_RAMPARTS[(i / PERM_LAYOUTS.len()) % PERM_RAMPARTS.len()];
-        let n_towers = PERM_TOWERS[(i / (PERM_LAYOUTS.len() * PERM_RAMPARTS.len())) % PERM_TOWERS.len()];
-        let energy = PERM_ENERGY[(i / (PERM_LAYOUTS.len() * PERM_RAMPARTS.len() * PERM_TOWERS.len())) % PERM_ENERGY.len()];
-        let towers: Vec<((u8, u8), u32)> = TOWER_TILES.iter().take(n_towers as usize).map(|&t| (t, 100_000)).collect();
+        let n_towers =
+            PERM_TOWERS[(i / (PERM_LAYOUTS.len() * PERM_RAMPARTS.len())) % PERM_TOWERS.len()];
+        let energy = PERM_ENERGY[(i
+            / (PERM_LAYOUTS.len() * PERM_RAMPARTS.len() * PERM_TOWERS.len()))
+            % PERM_ENERGY.len()];
+        let towers: Vec<((u8, u8), u32)> = TOWER_TILES
+            .iter()
+            .take(n_towers as usize)
+            .map(|&t| (t, 100_000))
+            .collect();
         assemble_single_room(
             format!("perm#{index} {layout:?} r{rampart} t{n_towers} e{energy}"),
             index as u64,
@@ -373,7 +453,18 @@ impl Generator for CreepClearBed {
         };
         // Open room, RCL7 energy, no rampart/towers — a pure creep fight. Override the objective kind to
         // Secure so the run stops when the defender creeps are wiped (the clear).
-        let mut s = assemble_single_room(format!("creep-clear#{index} {name}"), index as u64, 5600, 600, (25, 25), 0, &[], Layout::Open, force, false);
+        let mut s = assemble_single_room(
+            format!("creep-clear#{index} {name}"),
+            index as u64,
+            5600,
+            600,
+            (25, 25),
+            0,
+            &[],
+            Layout::Open,
+            force,
+            false,
+        );
         s.objectives[0].kind = ObjectiveKind::Secure;
         s
     }
@@ -393,14 +484,69 @@ impl Generator for Designed {
     }
     fn generate(&self, index: u32) -> Scenario {
         match index {
-            0 => assemble_single_room("designed#0 open + skirmishers".into(), 0, 5600, 1200, (25, 25), 30_000, &[((24, 16), 100_000)], Layout::Open, ForceSpec::Skirmishers(3), false),
-            1 => assemble_single_room("designed#1 wall-corridor + guard".into(), 1, 5600, 1200, (32, 25), 20_000, &[((32, 12), 100_000), ((28, 12), 100_000)], Layout::Corridor, ForceSpec::Guard(2), false),
-            2 => assemble_single_room("designed#2 swamp-approach".into(), 2, 12_900, 1300, (25, 25), 40_000, &[((24, 14), 100_000)], Layout::SwampApproach, ForceSpec::None, false),
-            3 => assemble_single_room("designed#3 bunker + guard".into(), 3, 12_900, 1300, (25, 25), 60_000, &[((25, 22), 100_000), ((25, 28), 100_000)], Layout::Bunker, ForceSpec::Guard(3), false),
+            0 => assemble_single_room(
+                "designed#0 open + skirmishers".into(),
+                0,
+                5600,
+                1200,
+                (25, 25),
+                30_000,
+                &[((24, 16), 100_000)],
+                Layout::Open,
+                ForceSpec::Skirmishers(3),
+                false,
+            ),
+            1 => assemble_single_room(
+                "designed#1 wall-corridor + guard".into(),
+                1,
+                5600,
+                1200,
+                (32, 25),
+                20_000,
+                &[((32, 12), 100_000), ((28, 12), 100_000)],
+                Layout::Corridor,
+                ForceSpec::Guard(2),
+                false,
+            ),
+            2 => assemble_single_room(
+                "designed#2 swamp-approach".into(),
+                2,
+                12_900,
+                1300,
+                (25, 25),
+                40_000,
+                &[((24, 14), 100_000)],
+                Layout::SwampApproach,
+                ForceSpec::None,
+                false,
+            ),
+            3 => assemble_single_room(
+                "designed#3 bunker + guard".into(),
+                3,
+                12_900,
+                1300,
+                (25, 25),
+                60_000,
+                &[((25, 22), 100_000), ((25, 28), 100_000)],
+                Layout::Bunker,
+                ForceSpec::Guard(3),
+                false,
+            ),
             4 => twin_room_siege(),
             // Open field, NO towers, ranged defenders — a clean two-managed-squad skirmish (both sides
             // move + trade fire), the self-play realism case.
-            _ => assemble_single_room("designed#5 open skirmish (self-play)".into(), 5, 5600, 600, (25, 25), 0, &[], Layout::Open, ForceSpec::Skirmishers(3), false),
+            _ => assemble_single_room(
+                "designed#5 open skirmish (self-play)".into(),
+                5,
+                5600,
+                600,
+                (25, 25),
+                0,
+                &[],
+                Layout::Open,
+                ForceSpec::Skirmishers(3),
+                false,
+            ),
         }
     }
 }
@@ -414,19 +560,81 @@ impl Generator for Designed {
 pub fn realistic_bases() -> Vec<Scenario> {
     let nest = |cx: u8, cy: u8| -> Vec<((u8, u8), u32)> {
         // a tight 3-tower nest around (cx,cy), all energized.
-        [(0i32, 0i32), (1, 0), (0, 1)].iter().map(|&(dx, dy)| (((cx as i32 + dx) as u8, (cy as i32 + dy) as u8), 100_000u32)).collect()
+        [(0i32, 0i32), (1, 0), (0, 1)]
+            .iter()
+            .map(|&(dx, dy)| (((cx as i32 + dx) as u8, (cy as i32 + dy) as u8), 100_000u32))
+            .collect()
     };
     vec![
         // Open base, full tower nest, no rampart — the attacker must close under heavy crossfire.
-        assemble_single_room("base#0 open tower-nest".into(), 100, 12_900, 1400, (25, 25), 0, &nest(24, 16), Layout::Open, ForceSpec::Skirmishers(3), false),
+        assemble_single_room(
+            "base#0 open tower-nest".into(),
+            100,
+            12_900,
+            1400,
+            (25, 25),
+            0,
+            &nest(24, 16),
+            Layout::Open,
+            ForceSpec::Skirmishers(3),
+            false,
+        ),
         // Corridor-choked guarded base behind a moderate rampart + two towers.
-        assemble_single_room("base#1 corridor choke + guard".into(), 101, 12_900, 1400, (32, 25), 30_000, &[((32, 12), 100_000), ((28, 14), 100_000)], Layout::Corridor, ForceSpec::Guard(3), false),
+        assemble_single_room(
+            "base#1 corridor choke + guard".into(),
+            101,
+            12_900,
+            1400,
+            (32, 25),
+            30_000,
+            &[((32, 12), 100_000), ((28, 14), 100_000)],
+            Layout::Corridor,
+            ForceSpec::Guard(3),
+            false,
+        ),
         // Bunker behind a THICK rampart, tower crossfire N+S, a strong guard+healer — the turtle.
-        assemble_single_room("base#2 bunker turtle (thick rampart)".into(), 102, 12_900, 1500, (25, 25), 120_000, &[((25, 21), 100_000), ((25, 29), 100_000), ((21, 25), 100_000)], Layout::Bunker, ForceSpec::Guard(4), false),
+        assemble_single_room(
+            "base#2 bunker turtle (thick rampart)".into(),
+            102,
+            12_900,
+            1500,
+            (25, 25),
+            120_000,
+            &[
+                ((25, 21), 100_000),
+                ((25, 29), 100_000),
+                ((21, 25), 100_000),
+            ],
+            Layout::Bunker,
+            ForceSpec::Guard(4),
+            false,
+        ),
         // Bunker, lighter rampart, 2 towers, melee guard — the common mid-RCL base.
-        assemble_single_room("base#3 bunker + 2 towers".into(), 103, 12_900, 1400, (25, 25), 50_000, &[((23, 23), 100_000), ((27, 27), 100_000)], Layout::Bunker, ForceSpec::Guard(2), false),
+        assemble_single_room(
+            "base#3 bunker + 2 towers".into(),
+            103,
+            12_900,
+            1400,
+            (25, 25),
+            50_000,
+            &[((23, 23), 100_000), ((27, 27), 100_000)],
+            Layout::Bunker,
+            ForceSpec::Guard(2),
+            false,
+        ),
         // Swamp-slowed approach to a ramparted core + a tower — terrain attrition before the wall.
-        assemble_single_room("base#4 swamp turtle".into(), 104, 12_900, 1500, (25, 25), 40_000, &[((24, 14), 100_000)], Layout::SwampApproach, ForceSpec::Guard(1), false),
+        assemble_single_room(
+            "base#4 swamp turtle".into(),
+            104,
+            12_900,
+            1500,
+            (25, 25),
+            40_000,
+            &[((24, 14), 100_000)],
+            Layout::SwampApproach,
+            ForceSpec::Guard(1),
+            false,
+        ),
     ]
 }
 
@@ -445,21 +653,49 @@ fn twin_room_siege() -> Scenario {
             b.world_mut().terrain_mut(target).walls.insert((5, y));
         }
     }
-    let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000);
-    b.structure(StructureKind::Rampart, Some(DEFENDER), rampart_xy.0, rampart_xy.1, 30_000, 30_000);
+    let core_id = b.structure(
+        StructureKind::Spawn,
+        Some(DEFENDER),
+        core.0,
+        core.1,
+        50_000,
+        50_000,
+    );
+    b.structure(
+        StructureKind::Rampart,
+        Some(DEFENDER),
+        rampart_xy.0,
+        rampart_xy.1,
+        30_000,
+        30_000,
+    );
     let mut world = b.build();
     // No tower here — this fixture demonstrates cross-room MOVEMENT + engagement (the assault crosses
     // W1N1→W2N1 and fights the defenders) rather than a tower-turtle the squad would retreat from.
-    place_force(&mut world, target, core, ForceSpec::Skirmishers(2), DEFENDER);
+    place_force(
+        &mut world,
+        target,
+        core,
+        ForceSpec::Skirmishers(2),
+        DEFENDER,
+    );
     let objective = Objective {
         id: core_id,
         room: target,
-        pos: Position::new(RoomCoordinate::new(core.0).unwrap(), RoomCoordinate::new(core.1).unwrap(), target),
+        pos: Position::new(
+            RoomCoordinate::new(core.0).unwrap(),
+            RoomCoordinate::new(core.1).unwrap(),
+            target,
+        ),
         assault_pos,
         front_tiles,
         support_tiles,
         // Stage near the W1N1 west border so the cross into W2N1 is a short, reliably-pathable hop.
-        entry: Position::new(RoomCoordinate::new(5).unwrap(), RoomCoordinate::new(25).unwrap(), home),
+        entry: Position::new(
+            RoomCoordinate::new(5).unwrap(),
+            RoomCoordinate::new(25).unwrap(),
+            home,
+        ),
         kind: ObjectiveKind::Raze,
     };
     Scenario {
@@ -478,15 +714,22 @@ fn twin_room_siege() -> Scenario {
 
 /// The objective kinds the imported-room generator enumerates — a VARIETY of attacker goals over real
 /// terrain (ADR 0025 §12 Stage 2).
-const OBJECTIVE_KINDS: [ObjectiveKind; 5] =
-    [ObjectiveKind::Raze, ObjectiveKind::Breach, ObjectiveKind::Secure, ObjectiveKind::Farm, ObjectiveKind::Declaim];
+const OBJECTIVE_KINDS: [ObjectiveKind; 5] = [
+    ObjectiveKind::Raze,
+    ObjectiveKind::Breach,
+    ObjectiveKind::Secure,
+    ObjectiveKind::Farm,
+    ObjectiveKind::Declaim,
+];
 
 /// Nearest non-wall interior tile (1..=48) to `(tx,ty)` by 8-connected BFS — anchors a base on real
 /// terrain. (The fixture's own object coords are not reliably aligned to the terrain index — the Stage 1
 /// caveat — so placement is derived from the decoded terrain itself.)
-fn nearest_open(terrain: &CombatTerrain, tx: u8, ty: u8) -> (u8, u8) {
+fn nearest_open(terrain: &SimTerrain, tx: u8, ty: u8) -> (u8, u8) {
     use std::collections::{HashSet, VecDeque};
-    let open = |x: i32, y: i32| (1..=48).contains(&x) && (1..=48).contains(&y) && !terrain.is_wall(x as u8, y as u8);
+    let open = |x: i32, y: i32| {
+        (1..=48).contains(&x) && (1..=48).contains(&y) && !terrain.is_wall(x as u8, y as u8)
+    };
     let mut seen: HashSet<(i32, i32)> = HashSet::new();
     let mut q = VecDeque::from([(tx as i32, ty as i32)]);
     while let Some((x, y)) = q.pop_front() {
@@ -496,7 +739,16 @@ fn nearest_open(terrain: &CombatTerrain, tx: u8, ty: u8) -> (u8, u8) {
         if open(x, y) {
             return (x as u8, y as u8);
         }
-        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)] {
+        for (dx, dy) in [
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+            (1, 1),
+            (-1, 1),
+            (1, -1),
+            (-1, -1),
+        ] {
             let (nx, ny) = (x + dx, y + dy);
             if (0..50).contains(&nx) && (0..50).contains(&ny) {
                 q.push_back((nx, ny));
@@ -508,9 +760,11 @@ fn nearest_open(terrain: &CombatTerrain, tx: u8, ty: u8) -> (u8, u8) {
 
 /// The 4-connected open component reachable from `start` — the navigable region the squad shares with the
 /// objective (guarantees a chosen entry can path to the core).
-fn open_component(terrain: &CombatTerrain, start: (u8, u8)) -> Vec<(u8, u8)> {
+fn open_component(terrain: &SimTerrain, start: (u8, u8)) -> Vec<(u8, u8)> {
     use std::collections::HashSet;
-    let open = |x: i32, y: i32| (0..50).contains(&x) && (0..50).contains(&y) && !terrain.is_wall(x as u8, y as u8);
+    let open = |x: i32, y: i32| {
+        (0..50).contains(&x) && (0..50).contains(&y) && !terrain.is_wall(x as u8, y as u8)
+    };
     let mut seen: HashSet<(u8, u8)> = HashSet::new();
     let mut stack = vec![(start.0 as i32, start.1 as i32)];
     let mut out = Vec::new();
@@ -552,7 +806,12 @@ fn west_neighbor(room: RoomName) -> RoomName {
 /// [`Scenario`] (ADR 0025 §12 Stage 2). Base placement is derived from the decoded terrain (clear,
 /// navigable tiles), not the fixture's object coords. `multi_room` stages the moving assault in the
 /// western-neighbour room so it crosses the border to engage.
-fn assemble_imported(fixture: &TerrainFixture, kind: ObjectiveKind, comp_seed: u32, multi_room: bool) -> Scenario {
+fn assemble_imported(
+    fixture: &TerrainFixture,
+    kind: ObjectiveKind,
+    comp_seed: u32,
+    multi_room: bool,
+) -> Scenario {
     let mut rng = Rng::seeded(comp_seed.wrapping_mul(31).wrapping_add(kind as u32 + 1));
     let terrain = decode_terrain(&fixture.terrain);
     let target: RoomName = fixture.room.parse().unwrap_or_else(|_| room());
@@ -563,31 +822,68 @@ fn assemble_imported(fixture: &TerrainFixture, kind: ObjectiveKind, comp_seed: u
     let component = open_component(&terrain, core);
     let comp_set: std::collections::HashSet<(u8, u8)> = component.iter().copied().collect();
     let neigh = |c: (u8, u8)| {
-        [(-1i32, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)].into_iter().filter_map(move |(dx, dy)| {
+        [
+            (-1i32, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ]
+        .into_iter()
+        .filter_map(move |(dx, dy)| {
             let (nx, ny) = (c.0 as i32 + dx, c.1 as i32 + dy);
             ((0..50).contains(&nx) && (0..50).contains(&ny)).then_some((nx as u8, ny as u8))
         })
     };
-    let mut front: Vec<(u8, u8)> = neigh(core).filter(|t| comp_set.contains(t)).take(4).collect();
+    let mut front: Vec<(u8, u8)> = neigh(core)
+        .filter(|t| comp_set.contains(t))
+        .take(4)
+        .collect();
     if front.is_empty() {
         front.push(core);
     }
     let assault = front[0];
-    let support: Vec<(u8, u8)> = neigh(assault).filter(|t| comp_set.contains(t) && *t != core && !front.contains(t)).take(3).collect();
-    let entry_xy = component.iter().copied().min_by_key(|&(x, _)| x).unwrap_or(core);
+    let support: Vec<(u8, u8)> = neigh(assault)
+        .filter(|t| comp_set.contains(t) && *t != core && !front.contains(t))
+        .take(3)
+        .collect();
+    let entry_xy = component
+        .iter()
+        .copied()
+        .min_by_key(|&(x, _)| x)
+        .unwrap_or(core);
 
     // ── world: real terrain + a realistic base in the target room ──
     let mut b = ScenarioBuilder::empty(target).in_room(target);
     *b.world_mut().terrain_mut(target) = terrain;
-    let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000);
+    let core_id = b.structure(
+        StructureKind::Spawn,
+        Some(DEFENDER),
+        core.0,
+        core.1,
+        50_000,
+        50_000,
+    );
     let rampart_hits = rng.range(15_000, 70_000); // the breach gate shielding the core
-    let breach_id = b.structure(StructureKind::Rampart, Some(DEFENDER), core.0, core.1, rampart_hits, rampart_hits);
+    let breach_id = b.structure(
+        StructureKind::Rampart,
+        Some(DEFENDER),
+        core.0,
+        core.1,
+        rampart_hits,
+        rampart_hits,
+    );
     // 1-3 energized towers spread over open tiles a few rings out from the core.
     let tower_tiles: Vec<(u8, u8)> = component
         .iter()
         .copied()
         .filter(|&t| {
-            let d = (t.0 as i32 - core.0 as i32).abs().max((t.1 as i32 - core.1 as i32).abs());
+            let d = (t.0 as i32 - core.0 as i32)
+                .abs()
+                .max((t.1 as i32 - core.1 as i32).abs());
             (3..=8).contains(&d)
         })
         .collect();
@@ -603,22 +899,45 @@ fn assemble_imported(fixture: &TerrainFixture, kind: ObjectiveKind, comp_seed: u
     // ── defenders: a seeded random force on near-core open tiles ──
     let n_def = rng.range(1, 3);
     let bodies = crate::harness::roster::random_squad(&mut rng, 2300, n_def as u8);
-    let mut def_tiles: Vec<(u8, u8)> = component.iter().copied().filter(|&t| t != core && !front.contains(&t)).collect();
-    def_tiles.sort_by_key(|&(x, y)| (x as i32 - core.0 as i32).abs().max((y as i32 - core.1 as i32).abs()));
+    let mut def_tiles: Vec<(u8, u8)> = component
+        .iter()
+        .copied()
+        .filter(|&t| t != core && !front.contains(&t))
+        .collect();
+    def_tiles.sort_by_key(|&(x, y)| {
+        (x as i32 - core.0 as i32)
+            .abs()
+            .max((y as i32 - core.1 as i32).abs())
+    });
     for (i, body) in bodies.iter().enumerate() {
         if let Some(&(dx, dy)) = def_tiles.get(i) {
-            world.creeps.push(SimCreep { id: 10_000 + i as u32, owner: DEFENDER, pos: pos_in(target, dx, dy), body: SimBody::unboosted(body), fatigue: 0 });
+            world.movement.creeps.push(SimCreep {
+                id: 10_000 + i as u32,
+                owner: DEFENDER,
+                pos: pos_in(target, dx, dy),
+                body: SimBody::unboosted(body),
+                fatigue: 0,
+                carry_used: 0,
+            });
         }
     }
 
     // ── declaim: a controller at the core ──
     if kind == ObjectiveKind::Declaim {
-        world.controllers.push(SimController { pos: p(core.0, core.1), owner: Some(DEFENDER), downgrade_ticks: 50_000 });
+        world.controllers.push(SimController {
+            pos: p(core.0, core.1),
+            owner: Some(DEFENDER),
+            downgrade_ticks: 50_000,
+        });
     }
 
     // Breach targets the rampart gate; every other kind targets the spawn core. Declaim's stop condition
     // reads the controller at `pos` (= the core tile).
-    let obj_id = if kind == ObjectiveKind::Breach { breach_id } else { core_id };
+    let obj_id = if kind == ObjectiveKind::Breach {
+        breach_id
+    } else {
+        core_id
+    };
     let entry = if multi_room {
         // Stage at the western-neighbour room's EAST border so the cross into the target is a short hop.
         pos_in(west_neighbor(target), 48, entry_xy.1.clamp(1, 48))
@@ -643,7 +962,11 @@ fn assemble_imported(fixture: &TerrainFixture, kind: ObjectiveKind, comp_seed: u
         defender_owner: DEFENDER,
         member_energy: 12_900,
         onsite_budget: 1400,
-        label: format!("imported-{}{}-{kind:?}#{comp_seed}", fixture.room, if multi_room { "-multi" } else { "" }),
+        label: format!(
+            "imported-{}{}-{kind:?}#{comp_seed}",
+            fixture.room,
+            if multi_room { "-multi" } else { "" }
+        ),
         seed: comp_seed as u64,
     }
 }
@@ -687,37 +1010,72 @@ pub fn captured_bases() -> Vec<CapturedBase> {
     struct Cache {
         bases: Vec<CapturedBase>,
     }
-    let cache: Cache = serde_json::from_str(include_str!("../../resources/captured-bases.json")).expect("embedded captured-bases.json parses");
+    let cache: Cache = serde_json::from_str(include_str!("../../resources/captured-bases.json"))
+        .expect("embedded captured-bases.json parses");
     cache.bases
 }
 
 /// Breach staging derived from a real rampart ring: `(assault_pos, front_tiles, support_tiles, entry,
 /// breach_rampart_pos)`.
-type BreachStaging = (Position, Vec<Position>, Vec<Position>, Position, Option<(u8, u8)>);
+type BreachStaging = (
+    Position,
+    Vec<Position>,
+    Vec<Position>,
+    Position,
+    Option<(u8, u8)>,
+);
 
 /// Derive breach staging from the foreman base's REAL rampart ring (ADR 0025 §12 Stage 3b) — the adaptive
 /// replacement for the synthetic west-gate [`breach_geometry`]. Picks the rampart on the attacker's
 /// natural approach (nearest a navigable room-edge tile), stages range-1 to it, and enters from a clear
 /// border tile in the core's navigable component (so the squad can path in). `breach_pos` is the chosen
 /// rampart tile (if any).
-fn breach_from_ramparts(target: RoomName, core: (u8, u8), ramparts: &[(u8, u8)], terrain: &CombatTerrain) -> BreachStaging {
+fn breach_from_ramparts(
+    target: RoomName,
+    core: (u8, u8),
+    ramparts: &[(u8, u8)],
+    terrain: &SimTerrain,
+) -> BreachStaging {
     let p = |x: u8, y: u8| pos_in(target, x, y);
     let component = open_component(terrain, core);
     let comp_set: std::collections::HashSet<(u8, u8)> = component.iter().copied().collect();
     let open_neigh = |c: (u8, u8)| -> Vec<(u8, u8)> {
-        [(-1i32, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
-            .into_iter()
-            .filter_map(|(dx, dy)| {
-                let (nx, ny) = (c.0 as i32 + dx, c.1 as i32 + dy);
-                ((0..50).contains(&nx) && (0..50).contains(&ny) && comp_set.contains(&(nx as u8, ny as u8))).then_some((nx as u8, ny as u8))
-            })
-            .collect()
+        [
+            (-1i32, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ]
+        .into_iter()
+        .filter_map(|(dx, dy)| {
+            let (nx, ny) = (c.0 as i32 + dx, c.1 as i32 + dy);
+            ((0..50).contains(&nx)
+                && (0..50).contains(&ny)
+                && comp_set.contains(&(nx as u8, ny as u8)))
+            .then_some((nx as u8, ny as u8))
+        })
+        .collect()
     };
     // Navigable border tiles = where a moving assault can enter the room + reach the core.
-    let border: Vec<(u8, u8)> = component.iter().copied().filter(|&(x, y)| x == 0 || y == 0 || x == 49 || y == 49).collect();
-    let cheby = |a: (u8, u8), b: (u8, u8)| (a.0 as i32 - b.0 as i32).abs().max((a.1 as i32 - b.1 as i32).abs());
+    let border: Vec<(u8, u8)> = component
+        .iter()
+        .copied()
+        .filter(|&(x, y)| x == 0 || y == 0 || x == 49 || y == 49)
+        .collect();
+    let cheby = |a: (u8, u8), b: (u8, u8)| {
+        (a.0 as i32 - b.0 as i32)
+            .abs()
+            .max((a.1 as i32 - b.1 as i32).abs())
+    };
     // The breach rampart = the one nearest a navigable entry (the attacker's natural approach).
-    let breach = ramparts.iter().copied().min_by_key(|&r| border.iter().map(|&bd| cheby(r, bd)).min().unwrap_or(99));
+    let breach = ramparts
+        .iter()
+        .copied()
+        .min_by_key(|&r| border.iter().map(|&bd| cheby(r, bd)).min().unwrap_or(99));
     let pivot = breach.unwrap_or(core);
     let mut front: Vec<(u8, u8)> = open_neigh(pivot);
     if front.is_empty() {
@@ -728,7 +1086,11 @@ fn breach_from_ramparts(target: RoomName, core: (u8, u8), ramparts: &[(u8, u8)],
     }
     front.truncate(4);
     let assault = front[0];
-    let mut support: Vec<(u8, u8)> = open_neigh(assault).into_iter().filter(|t| *t != core && !front.contains(t)).take(3).collect();
+    let mut support: Vec<(u8, u8)> = open_neigh(assault)
+        .into_iter()
+        .filter(|t| *t != core && !front.contains(t))
+        .take(3)
+        .collect();
     if support.is_empty() {
         support.push(core); // never empty (the oracle's staging needs a support tile)
     }
@@ -766,7 +1128,14 @@ fn realize_base(base: &CapturedBase, kind: ObjectiveKind, comp_seed: u32) -> Sce
     for s in &base.structures {
         match s.kind.as_str() {
             "spawn" => {
-                let id = b.structure(StructureKind::Spawn, Some(DEFENDER), s.x, s.y, 50_000, 50_000);
+                let id = b.structure(
+                    StructureKind::Spawn,
+                    Some(DEFENDER),
+                    s.x,
+                    s.y,
+                    50_000,
+                    50_000,
+                );
                 if core_id.is_none() {
                     core_id = Some(id);
                     core = (s.x, s.y);
@@ -776,7 +1145,14 @@ fn realize_base(base: &CapturedBase, kind: ObjectiveKind, comp_seed: u32) -> Sce
                 b.tower(DEFENDER, s.x, s.y, 100_000); // energized, ready to fire (foreman carries no energy)
             }
             "rampart" => {
-                let id = b.structure(StructureKind::Rampart, Some(DEFENDER), s.x, s.y, rampart_hits, rampart_hits);
+                let id = b.structure(
+                    StructureKind::Rampart,
+                    Some(DEFENDER),
+                    s.x,
+                    s.y,
+                    rampart_hits,
+                    rampart_hits,
+                );
                 rampart_ids.push(((s.x, s.y), id));
             }
             "wall" => {
@@ -786,7 +1162,16 @@ fn realize_base(base: &CapturedBase, kind: ObjectiveKind, comp_seed: u32) -> Sce
             _ => {}
         }
     }
-    let core_id = core_id.unwrap_or_else(|| b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 50_000, 50_000));
+    let core_id = core_id.unwrap_or_else(|| {
+        b.structure(
+            StructureKind::Spawn,
+            Some(DEFENDER),
+            core.0,
+            core.1,
+            50_000,
+            50_000,
+        )
+    });
     let ramparts: Vec<(u8, u8)> = rampart_ids.iter().map(|(xy, _)| *xy).collect();
     let mut world = b.build();
 
@@ -795,19 +1180,42 @@ fn realize_base(base: &CapturedBase, kind: ObjectiveKind, comp_seed: u32) -> Sce
     let bodies = crate::harness::roster::random_squad(&mut rng, 2300, n_def as u8);
     let component = open_component(&terrain, core);
     let mut def_tiles: Vec<(u8, u8)> = component.iter().copied().filter(|&t| t != core).collect();
-    def_tiles.sort_by_key(|&(x, y)| (x as i32 - core.0 as i32).abs().max((y as i32 - core.1 as i32).abs()));
+    def_tiles.sort_by_key(|&(x, y)| {
+        (x as i32 - core.0 as i32)
+            .abs()
+            .max((y as i32 - core.1 as i32).abs())
+    });
     for (i, body) in bodies.iter().enumerate() {
         if let Some(&(dx, dy)) = def_tiles.get(i) {
-            world.creeps.push(SimCreep { id: 10_000 + i as u32, owner: DEFENDER, pos: p(dx, dy), body: SimBody::unboosted(body), fatigue: 0 });
+            world.movement.creeps.push(SimCreep {
+                id: 10_000 + i as u32,
+                owner: DEFENDER,
+                pos: p(dx, dy),
+                body: SimBody::unboosted(body),
+                fatigue: 0,
+                carry_used: 0,
+            });
         }
     }
 
-    let (assault_pos, front_tiles, support_tiles, entry, breach_pos) = breach_from_ramparts(target, core, &ramparts, &terrain);
+    let (assault_pos, front_tiles, support_tiles, entry, breach_pos) =
+        breach_from_ramparts(target, core, &ramparts, &terrain);
     if kind == ObjectiveKind::Declaim {
-        world.controllers.push(SimController { pos: p(core.0, core.1), owner: Some(DEFENDER), downgrade_ticks: 50_000 });
+        world.controllers.push(SimController {
+            pos: p(core.0, core.1),
+            owner: Some(DEFENDER),
+            downgrade_ticks: 50_000,
+        });
     }
     let obj_id = if kind == ObjectiveKind::Breach {
-        breach_pos.and_then(|bp| rampart_ids.iter().find(|(xy, _)| *xy == bp).map(|(_, id)| *id)).unwrap_or(core_id)
+        breach_pos
+            .and_then(|bp| {
+                rampart_ids
+                    .iter()
+                    .find(|(xy, _)| *xy == bp)
+                    .map(|(_, id)| *id)
+            })
+            .unwrap_or(core_id)
     } else {
         core_id
     };

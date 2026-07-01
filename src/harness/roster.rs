@@ -10,12 +10,15 @@
 //!    fights; the **outliers** (predicted-favoured but lost, or a flat-prediction blowout) surface
 //!    mispredicted or degenerate ("broken") compositions worth a closer look or a model fix.
 
-use crate::harness::generate::Rng;
 use crate::run_managed;
 use screeps::{Part, Position, RoomCoordinate, RoomName};
+use screeps_sim_core::rng::Rng;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_agent::SimView;
-use screeps_combat_decision::{predict_engage, CombatCreepDto, EnginePrediction, EngageObjective, SquadMemberView, SquadOrderState, SquadView};
+use screeps_combat_decision::{
+    predict_engage, CombatCreepDto, EngageObjective, EnginePrediction, SquadMemberView,
+    SquadOrderState, SquadView,
+};
 use screeps_combat_engine::constants::{ATTACK_POWER, RANGED_ATTACK_POWER};
 use screeps_combat_engine::{CombatWorld, PlayerId, SimBody, SimCreep};
 
@@ -23,7 +26,11 @@ fn room() -> RoomName {
     "W1N1".parse().unwrap()
 }
 fn pos(x: u8, y: u8) -> Position {
-    Position::new(RoomCoordinate::new(x.min(49)).unwrap(), RoomCoordinate::new(y.min(49)).unwrap(), room())
+    Position::new(
+        RoomCoordinate::new(x.min(49)).unwrap(),
+        RoomCoordinate::new(y.min(49)).unwrap(),
+        room(),
+    )
 }
 
 /// Energy cost of a body part (the standard Screeps costs) — bounds the random body to a budget.
@@ -123,11 +130,25 @@ pub fn sample_squad(seed: u32, energy: u32, n: u8) -> Vec<Vec<Part>> {
 }
 
 /// Place a squad's bodies as a vertical file of `owner` creeps at column `x`, ids from `first_id`.
-fn place(world: &mut CombatWorld, owner: PlayerId, first_id: u32, bodies: &[Vec<Part>], x: u8, y0: u8) -> Vec<u32> {
+fn place(
+    world: &mut CombatWorld,
+    owner: PlayerId,
+    first_id: u32,
+    bodies: &[Vec<Part>],
+    x: u8,
+    y0: u8,
+) -> Vec<u32> {
     let mut ids = Vec::new();
     for (i, b) in bodies.iter().enumerate() {
         let id = first_id + i as u32;
-        world.creeps.push(SimCreep { id, owner, pos: pos(x, y0 + i as u8), body: SimBody::unboosted(b), fatigue: 0 });
+        world.movement.creeps.push(SimCreep {
+            id,
+            owner,
+            pos: pos(x, y0 + i as u8),
+            body: SimBody::unboosted(b),
+            fatigue: 0,
+            carry_used: 0,
+        });
         ids.push(id);
     }
     ids
@@ -166,7 +187,13 @@ fn predict_for(world: &CombatWorld, owner: PlayerId) -> EnginePrediction {
 
 /// Total living HP of `owner` in `world`.
 fn living_hp(world: &CombatWorld, owner: PlayerId) -> i64 {
-    world.creeps.iter().filter(|c| c.owner == owner && c.is_alive()).map(|c| c.body.hits as i64).sum()
+    world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == owner && c.is_alive())
+        .map(|c| c.body.hits as i64)
+        .sum()
 }
 
 /// One validated matchup: the side-0 prediction vs what actually happened.
@@ -229,7 +256,8 @@ pub fn lanchester_validation(trials: usize, energy: u32, ticks: usize) -> Valida
             predicted_win_permille: pred.win_permille,
             predicted_unwinnable: pred.unwinnable,
             actual_net_hp: net,
-            agree: pred.balance.signum() == net.signum() || (pred.balance.abs() < CLEAR_BALANCE && net.abs() < DECISIVE_HP),
+            agree: pred.balance.signum() == net.signum()
+                || (pred.balance.abs() < CLEAR_BALANCE && net.abs() < DECISIVE_HP),
         };
         matchups.push(m);
         if pred.balance.abs() >= CLEAR_BALANCE && net.abs() >= DECISIVE_HP {
@@ -243,7 +271,11 @@ pub fn lanchester_validation(trials: usize, energy: u32, ticks: usize) -> Valida
     }
     ValidationReport {
         trials,
-        sign_accuracy: if decisive == 0 { 1.0 } else { correct as f64 / decisive as f64 },
+        sign_accuracy: if decisive == 0 {
+            1.0
+        } else {
+            correct as f64 / decisive as f64
+        },
         outliers,
     }
 }
@@ -253,10 +285,22 @@ pub fn report(r: &ValidationReport) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     let _ = writeln!(s, "Lanchester validation — {} random matchups:", r.trials);
-    let _ = writeln!(s, "  predicted-favourite sign accuracy (decisive matchups): {:.1}%", r.sign_accuracy * 100.0);
-    let _ = writeln!(s, "  outliers (predicted a clear winner that LOST): {}", r.outliers.len());
+    let _ = writeln!(
+        s,
+        "  predicted-favourite sign accuracy (decisive matchups): {:.1}%",
+        r.sign_accuracy * 100.0
+    );
+    let _ = writeln!(
+        s,
+        "  outliers (predicted a clear winner that LOST): {}",
+        r.outliers.len()
+    );
     for o in r.outliers.iter().take(10) {
-        let _ = writeln!(s, "    seed {:>4}: predicted balance {:+5} ({}‰ win) → actual net HP {:+6}", o.seed, o.predicted_balance, o.predicted_win_permille, o.actual_net_hp);
+        let _ = writeln!(
+            s,
+            "    seed {:>4}: predicted balance {:+5} ({}‰ win) → actual net HP {:+6}",
+            o.seed, o.predicted_balance, o.predicted_win_permille, o.actual_net_hp
+        );
     }
     s
 }
@@ -272,10 +316,20 @@ mod tests {
             let energy = [1300, 2300, 5600, 12_900][seed as usize % 4];
             let body = random_body(&mut rng, energy);
             let cost: u32 = body.iter().map(|&p| part_cost(p)).sum();
-            assert!(cost <= energy, "body within budget (cost {cost} <= {energy})");
-            assert!(body.len() <= 50, "body within the 50-part cap ({} parts)", body.len());
             assert!(
-                body.iter().any(|&p| matches!(p, Part::Attack | Part::RangedAttack | Part::Heal | Part::Work)),
+                cost <= energy,
+                "body within budget (cost {cost} <= {energy})"
+            );
+            assert!(
+                body.len() <= 50,
+                "body within the 50-part cap ({} parts)",
+                body.len()
+            );
+            assert!(
+                body.iter().any(|&p| matches!(
+                    p,
+                    Part::Attack | Part::RangedAttack | Part::Heal | Part::Work
+                )),
                 "body has a useful part (not inert): {body:?}"
             );
             assert!(body.contains(&Part::Move), "body has MOVE for mobility");

@@ -131,7 +131,11 @@ impl SideMetrics {
         // A frame snapshots START-of-tick state, so a creep that dies *this* tick still appears in the
         // last frame's `creeps`; survivors must subtract the distinct creeps that ever died.
         let survivors = fielded - deaths;
-        let survival_rate = if fielded == 0 { 1.0 } else { survivors as f64 / fielded as f64 };
+        let survival_rate = if fielded == 0 {
+            1.0
+        } else {
+            survivors as f64 / fielded as f64
+        };
 
         // ── tower damage attribution (must-fix 1) + tower energy spent ──
         let (tower_damage_dealt, tower_shots) = tower_attack_output(rec, side, &owner_of);
@@ -181,14 +185,20 @@ impl SideMetrics {
 /// count the shots (for energy spent). Towers are looked up by id in the same frame's `towers`
 /// snapshot, the target creep in the same frame's `creeps` snapshot (start-of-tick positions, which
 /// is what the engine fires from).
-fn tower_attack_output(rec: &CombatRecording, side: PlayerId, owner_of: &HashMap<CreepId, PlayerId>) -> (u32, u32) {
+fn tower_attack_output(
+    rec: &CombatRecording,
+    side: PlayerId,
+    owner_of: &HashMap<CreepId, PlayerId>,
+) -> (u32, u32) {
     let mut damage = 0u32;
     let mut shots = 0u32;
     for f in &rec.frames {
         let tower_by_id: HashMap<_, &TowerFrame> = f.towers.iter().map(|t| (t.id, t)).collect();
         let creep_by_id: HashMap<_, &CreepFrame> = f.creeps.iter().map(|c| (c.id, c)).collect();
         for (tid, action) in &f.tower_intents {
-            let Some(tower) = tower_by_id.get(tid) else { continue };
+            let Some(tower) = tower_by_id.get(tid) else {
+                continue;
+            };
             if tower.owner != side {
                 continue;
             }
@@ -227,7 +237,10 @@ fn enemy_structure_hp_lost(rec: &CombatRecording, side: PlayerId) -> u32 {
             }
         }
     }
-    first.iter().map(|(id, &fh)| fh.saturating_sub(*last.get(id).unwrap_or(&fh))).sum()
+    first
+        .iter()
+        .map(|(id, &fh)| fh.saturating_sub(*last.get(id).unwrap_or(&fh)))
+        .sum()
 }
 
 /// Positioning: mean nearest-enemy range over living `side` creep-ticks, and the **melee-exposure
@@ -240,16 +253,29 @@ fn positioning(rec: &CombatRecording, side: PlayerId) -> (f64, f64) {
     let mut samples = 0u64;
     let mut melee_ticks = 0u64;
     for f in &rec.frames {
-        let enemies: Vec<Position> = f.creeps.iter().filter(|c| c.owner != side).map(|c| synth_pos(c.x, c.y)).collect();
+        let enemies: Vec<Position> = f
+            .creeps
+            .iter()
+            .filter(|c| c.owner != side)
+            .map(|c| synth_pos(c.x, c.y))
+            .collect();
         if enemies.is_empty() {
             continue;
         }
         // Only enemies that can still deal melee damage count toward melee exposure.
-        let armed: Vec<Position> =
-            f.creeps.iter().filter(|c| c.owner != side && c.attack_power > 0).map(|c| synth_pos(c.x, c.y)).collect();
+        let armed: Vec<Position> = f
+            .creeps
+            .iter()
+            .filter(|c| c.owner != side && c.attack_power > 0)
+            .map(|c| synth_pos(c.x, c.y))
+            .collect();
         for c in f.creeps.iter().filter(|c| c.owner == side) {
             let p = synth_pos(c.x, c.y);
-            let nearest = enemies.iter().map(|e| p.get_range_to(*e)).min().unwrap_or(0);
+            let nearest = enemies
+                .iter()
+                .map(|e| p.get_range_to(*e))
+                .min()
+                .unwrap_or(0);
             range_sum += nearest as u64;
             if armed.iter().any(|e| p.get_range_to(*e) <= 1) {
                 melee_ticks += 1;
@@ -260,7 +286,10 @@ fn positioning(rec: &CombatRecording, side: PlayerId) -> (f64, f64) {
     if samples == 0 {
         (0.0, 0.0)
     } else {
-        (range_sum as f64 / samples as f64, melee_ticks as f64 / samples as f64)
+        (
+            range_sum as f64 / samples as f64,
+            melee_ticks as f64 / samples as f64,
+        )
     }
 }
 
@@ -270,7 +299,12 @@ pub fn cohesion_series(rec: &CombatRecording, side: PlayerId, tol: u32) -> Vec<C
     rec.frames
         .iter()
         .map(|f| {
-            let positions: Vec<Position> = f.creeps.iter().filter(|c| c.owner == side).map(|c| synth_pos(c.x, c.y)).collect();
+            let positions: Vec<Position> = f
+                .creeps
+                .iter()
+                .filter(|c| c.owner == side)
+                .map(|c| synth_pos(c.x, c.y))
+                .collect();
             measure(&positions, None, tol)
         })
         .collect()
@@ -279,7 +313,11 @@ pub fn cohesion_series(rec: &CombatRecording, side: PlayerId, tol: u32) -> Vec<C
 /// The worst (largest) `max_pairwise` cohesion spread `side` ever reached — the scatter peak (lower
 /// is tighter). 0 if the side never had ≥2 creeps co-present.
 pub fn worst_cohesion(rec: &CombatRecording, side: PlayerId) -> u32 {
-    cohesion_series(rec, side, 0).iter().map(|s| s.max_pairwise).max().unwrap_or(0)
+    cohesion_series(rec, side, 0)
+        .iter()
+        .map(|s| s.max_pairwise)
+        .max()
+        .unwrap_or(0)
 }
 
 /// **Period-2 positional oscillation rate** for `side` (ADR 0024 — the durable replacement for the
@@ -316,15 +354,21 @@ pub fn oscillation_rate(rec: &CombatRecording, side: PlayerId) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use screeps_combat_agent::opponents::{run_engagement, world_from_units, KiteAgent, RushAgent, TurtleAgent, Unit};
-    use screeps_combat_agent::IbexAgent;
     use screeps::Part;
+    use screeps_combat_agent::opponents::{
+        run_engagement, world_from_units, KiteAgent, RushAgent, TurtleAgent, Unit,
+    };
+    use screeps_combat_agent::IbexAgent;
 
     fn room() -> RoomName {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room(),
+        )
     }
 
     #[test]
@@ -335,11 +379,27 @@ mod tests {
         // we measure before that). 1v1 nearest-range is symmetric, so we compare ACROSS scenarios.
         let kite = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, 7), (Part::Move, 7)], vec![pos(30, 25)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, 7), (Part::Move, 7)],
+                vec![pos(30, 25)],
+            )],
             1,
-            &[Unit::new(vec![(Part::Attack, 10), (Part::Move, 10)], vec![pos(27, 25)])],
+            &[Unit::new(
+                vec![(Part::Attack, 10), (Part::Move, 10)],
+                vec![pos(27, 25)],
+            )],
         );
-        let ko = run_engagement(kite, room(), 0, pos(30, 25), &mut KiteAgent, 1, pos(27, 25), &mut RushAgent, 12);
+        let ko = run_engagement(
+            kite,
+            room(),
+            0,
+            pos(30, 25),
+            &mut KiteAgent,
+            1,
+            pos(27, 25),
+            &mut RushAgent,
+            12,
+        );
         let km = SideMetrics::from_recording(&ko.recording, 0);
 
         // TOUGH-front so the ATTACK parts survive the fight (front-to-back degradation strips TOUGH
@@ -347,11 +407,27 @@ mod tests {
         // enemies only) stays high through the run rather than collapsing as parts strip.
         let brawl = world_from_units(
             0,
-            &[Unit::new(vec![(Part::Tough, 10), (Part::Attack, 10), (Part::Move, 10)], vec![pos(30, 25)])],
+            &[Unit::new(
+                vec![(Part::Tough, 10), (Part::Attack, 10), (Part::Move, 10)],
+                vec![pos(30, 25)],
+            )],
             1,
-            &[Unit::new(vec![(Part::Tough, 10), (Part::Attack, 10), (Part::Move, 10)], vec![pos(27, 25)])],
+            &[Unit::new(
+                vec![(Part::Tough, 10), (Part::Attack, 10), (Part::Move, 10)],
+                vec![pos(27, 25)],
+            )],
         );
-        let bo = run_engagement(brawl, room(), 0, pos(30, 25), &mut RushAgent, 1, pos(27, 25), &mut RushAgent, 16);
+        let bo = run_engagement(
+            brawl,
+            room(),
+            0,
+            pos(30, 25),
+            &mut RushAgent,
+            1,
+            pos(27, 25),
+            &mut RushAgent,
+            16,
+        );
         let bm = SideMetrics::from_recording(&bo.recording, 0);
 
         // No towers in either → zero tower contamination, all DPS is creep DPS (must-fix 1).
@@ -370,8 +446,16 @@ mod tests {
             km.melee_exposure_rate,
             bm.melee_exposure_rate
         );
-        assert!(km.melee_exposure_rate < 0.2, "a kiter barely touches melee pre-corner, got {}", km.melee_exposure_rate);
-        assert!(bm.melee_exposure_rate > 0.3, "a brawl lives in (armed) melee, got {}", bm.melee_exposure_rate);
+        assert!(
+            km.melee_exposure_rate < 0.2,
+            "a kiter barely touches melee pre-corner, got {}",
+            km.melee_exposure_rate
+        );
+        assert!(
+            bm.melee_exposure_rate > 0.3,
+            "a brawl lives in (armed) melee, got {}",
+            bm.melee_exposure_rate
+        );
     }
 
     #[test]
@@ -382,14 +466,34 @@ mod tests {
         // creeps are at range 1 for many ticks (raw adjacency would read ~0.45 here).
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, 7), (Part::Move, 7)], vec![pos(30, 25)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, 7), (Part::Move, 7)],
+                vec![pos(30, 25)],
+            )],
             1,
-            &[Unit::new(vec![(Part::Attack, 10), (Part::Move, 10)], vec![pos(27, 25)])],
+            &[Unit::new(
+                vec![(Part::Attack, 10), (Part::Move, 10)],
+                vec![pos(27, 25)],
+            )],
         );
-        let out = run_engagement(world, room(), 0, pos(30, 25), &mut IbexAgent, 1, pos(27, 25), &mut RushAgent, 40);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(30, 25),
+            &mut IbexAgent,
+            1,
+            pos(27, 25),
+            &mut RushAgent,
+            40,
+        );
         let m = SideMetrics::from_recording(&out.recording, 0);
         assert_eq!(m.damage_taken, 0, "the kiter is never actually hit");
-        assert!(m.melee_exposure_rate < 0.1, "adjacency to a disarmed chaser isn't exposure, got {}", m.melee_exposure_rate);
+        assert!(
+            m.melee_exposure_rate < 0.1,
+            "adjacency to a disarmed chaser isn't exposure, got {}",
+            m.melee_exposure_rate
+        );
     }
 
     #[test]
@@ -407,7 +511,17 @@ mod tests {
         );
         b.tower(0, 25, 25, 1000); // our tower
         let world = b.build();
-        let out = run_engagement(world, room(), 0, pos(25, 24), &mut IbexAgent, 1, pos(25, 27), &mut HoldAgent, 12);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 24),
+            &mut IbexAgent,
+            1,
+            pos(25, 27),
+            &mut HoldAgent,
+            12,
+        );
         let m = SideMetrics::from_recording(&out.recording, 0);
         assert!(m.tower_damage_dealt > 0, "the tower fired on the attacker");
         assert!(m.creep_damage_dealt > 0, "the defender also chipped it");
@@ -424,15 +538,31 @@ mod tests {
         // A 5-HEAL turtle out-healed by 3×ranged should die (survival 0) but record heals received.
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, 7)], vec![pos(25, 22), pos(24, 22), pos(26, 22)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, 7)],
+                vec![pos(25, 22), pos(24, 22), pos(26, 22)],
+            )],
             1,
             &[Unit::new(vec![(Part::Heal, 5)], vec![pos(25, 25)])],
         );
-        let out = run_engagement(world, room(), 0, pos(25, 22), &mut IbexAgent, 1, pos(25, 25), &mut TurtleAgent, 30);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 22),
+            &mut IbexAgent,
+            1,
+            pos(25, 25),
+            &mut TurtleAgent,
+            30,
+        );
         let attacker = SideMetrics::from_recording(&out.recording, 0);
         let turtle = SideMetrics::from_recording(&out.recording, 1);
         assert_eq!(attacker.fielded, 3);
-        assert_eq!(attacker.survivors, 3, "no losses focus-firing a lone turtle");
+        assert_eq!(
+            attacker.survivors, 3,
+            "no losses focus-firing a lone turtle"
+        );
         assert_eq!(turtle.deaths, 1);
         assert_eq!(turtle.survival_rate, 0.0);
         assert!(turtle.hp_healed > 0, "the turtle self-healed before dying");
@@ -444,12 +574,28 @@ mod tests {
         // Three friendly creeps standing together → worst_cohesion is small (tight).
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::Move, 1)], vec![pos(25, 25), pos(26, 25), pos(25, 26)])],
+            &[Unit::new(
+                vec![(Part::Move, 1)],
+                vec![pos(25, 25), pos(26, 25), pos(25, 26)],
+            )],
             1,
             &[],
         );
-        let out = run_engagement(world, room(), 0, pos(25, 25), &mut IbexAgent, 1, pos(40, 40), &mut IbexAgent, 3);
-        assert!(worst_cohesion(&out.recording, 0) <= 2, "a clustered trio stays tight");
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 25),
+            &mut IbexAgent,
+            1,
+            pos(40, 40),
+            &mut IbexAgent,
+            3,
+        );
+        assert!(
+            worst_cohesion(&out.recording, 0) <= 2,
+            "a clustered trio stays tight"
+        );
     }
 }
 
@@ -464,7 +610,11 @@ mod u8 {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room(),
+        )
     }
 
     #[test]
@@ -475,16 +625,36 @@ mod u8 {
         // Kiter: fast (10 MOVE), low DPS (5 RA) so the TOUGH chaser stays armed the whole run.
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::RangedAttack, 5), (Part::Move, 10)], vec![pos(47, 47)])],
+            &[Unit::new(
+                vec![(Part::RangedAttack, 5), (Part::Move, 10)],
+                vec![pos(47, 47)],
+            )],
             1,
-            &[Unit::new(vec![(Part::Attack, 10), (Part::Move, 8), (Part::Tough, 10)], vec![pos(45, 45)])],
+            &[Unit::new(
+                vec![(Part::Attack, 10), (Part::Move, 8), (Part::Tough, 10)],
+                vec![pos(45, 45)],
+            )],
         );
-        let out = run_engagement(world, room(), 0, pos(47, 47), &mut IbexAgent, 1, pos(45, 45), &mut RushAgent, 30);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(47, 47),
+            &mut IbexAgent,
+            1,
+            pos(45, 45),
+            &mut RushAgent,
+            30,
+        );
         let m = SideMetrics::from_recording(&out.recording, 0);
         assert_eq!(m.survivors, 1, "the kiter escapes the corner and lives");
 
         let last = out.recording.frames.last().unwrap();
-        let kiter = last.creeps.iter().find(|c| c.owner == 0).expect("kiter alive");
+        let kiter = last
+            .creeps
+            .iter()
+            .find(|c| c.owner == 0)
+            .expect("kiter alive");
         let corner = synth_pos(49, 49);
         assert!(
             synth_pos(kiter.x, kiter.y).get_range_to(corner) >= 10,
@@ -496,12 +666,18 @@ mod u8 {
         let half = out.recording.frames.len() / 2;
         let (mut sum, mut n) = (0u32, 0u32);
         for f in &out.recording.frames[half..] {
-            if let (Some(k), Some(e)) = (f.creeps.iter().find(|c| c.owner == 0), f.creeps.iter().find(|c| c.owner == 1)) {
+            if let (Some(k), Some(e)) = (
+                f.creeps.iter().find(|c| c.owner == 0),
+                f.creeps.iter().find(|c| c.owner == 1),
+            ) {
                 sum += synth_pos(k.x, k.y).get_range_to(synth_pos(e.x, e.y));
                 n += 1;
             }
         }
-        assert!(n > 0 && (sum as f64 / n as f64) > 2.0, "holds standoff after breaking out");
+        assert!(
+            n > 0 && (sum as f64 / n as f64) > 2.0,
+            "holds standoff after breaking out"
+        );
     }
 
     #[test]
@@ -510,13 +686,32 @@ mod u8 {
         // melee chaser. It now evades + self-heals — surviving the run and taking far less damage.
         let world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::Heal, 5), (Part::Move, 5)], vec![pos(30, 25)])],
+            &[Unit::new(
+                vec![(Part::Heal, 5), (Part::Move, 5)],
+                vec![pos(30, 25)],
+            )],
             1,
-            &[Unit::new(vec![(Part::Attack, 7), (Part::Move, 7)], vec![pos(27, 25)])],
+            &[Unit::new(
+                vec![(Part::Attack, 7), (Part::Move, 7)],
+                vec![pos(27, 25)],
+            )],
         );
-        let out = run_engagement(world, room(), 0, pos(30, 25), &mut IbexAgent, 1, pos(27, 25), &mut RushAgent, 40);
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(30, 25),
+            &mut IbexAgent,
+            1,
+            pos(27, 25),
+            &mut RushAgent,
+            40,
+        );
         let m = SideMetrics::from_recording(&out.recording, 0);
-        assert_eq!(m.survivors, 1, "the healer evades + self-heals instead of standing to die");
+        assert_eq!(
+            m.survivors, 1,
+            "the healer evades + self-heals instead of standing to die"
+        );
         assert!(m.hp_healed > 0, "it self-heals while kiting");
     }
 }

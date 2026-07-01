@@ -24,19 +24,23 @@
 //! Host-only (the eval crate is `--workspace --exclude`'d from the wasm build).
 
 use screeps::{Part, Position, RoomCoordinate, RoomName};
-use screeps_combat_engine::{CombatTerrain, CombatWorld, PlayerId, SimBody, SimCreep, StructureKind};
+use screeps_combat_agent::scenario::ScenarioBuilder;
+use screeps_combat_engine::{PlayerId, SimBody, SimCreep, SimTerrain, StructureKind};
 use screeps_combat_eval::harness::roster::sample_squad;
 use screeps_combat_eval::harness::scenario::{Objective, ObjectiveKind, Scenario};
 use screeps_combat_eval::harness::terrain_import::{decode_terrain, fixtures, TerrainFixture};
 use screeps_combat_eval::harness::validate::render_self_play_replay_bodies;
-use screeps_combat_agent::scenario::ScenarioBuilder;
 
 const ATTACKER: PlayerId = 0;
 const DEFENDER: PlayerId = 1;
 const OUT_DIR: &str = "combat-renders";
 
 fn pos_in(room: RoomName, x: u8, y: u8) -> Position {
-    Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+    Position::new(
+        RoomCoordinate::new(x).unwrap(),
+        RoomCoordinate::new(y).unwrap(),
+        room,
+    )
 }
 
 /// The composition FLAVOUR each side fields — a human descriptor + how `sample_squad` is parameterised.
@@ -52,19 +56,53 @@ struct Flavour {
 }
 
 const FLAVOURS: [Flavour; 6] = [
-    Flavour { name: "ranged-heavy", energy: 12_900, size: 4, seed_salt: 11 },
-    Flavour { name: "melee+heal", energy: 8_400, size: 4, seed_salt: 23 },
-    Flavour { name: "mixed", energy: 5_600, size: 3, seed_salt: 37 },
-    Flavour { name: "lean-drain", energy: 2_300, size: 2, seed_salt: 53 },
-    Flavour { name: "big-brawl", energy: 12_900, size: 5, seed_salt: 71 },
-    Flavour { name: "small-skirmish", energy: 3_400, size: 3, seed_salt: 97 },
+    Flavour {
+        name: "ranged-heavy",
+        energy: 12_900,
+        size: 4,
+        seed_salt: 11,
+    },
+    Flavour {
+        name: "melee+heal",
+        energy: 8_400,
+        size: 4,
+        seed_salt: 23,
+    },
+    Flavour {
+        name: "mixed",
+        energy: 5_600,
+        size: 3,
+        seed_salt: 37,
+    },
+    Flavour {
+        name: "lean-drain",
+        energy: 2_300,
+        size: 2,
+        seed_salt: 53,
+    },
+    Flavour {
+        name: "big-brawl",
+        energy: 12_900,
+        size: 5,
+        seed_salt: 71,
+    },
+    Flavour {
+        name: "small-skirmish",
+        energy: 3_400,
+        size: 3,
+        seed_salt: 97,
+    },
 ];
 
 impl Flavour {
     /// Sample this side's roster deterministically from the scenario seed (the flavour salt keeps the two
     /// sides distinct even at the same seed/flavour).
     fn roster(&self, seed: u32) -> Vec<Vec<Part>> {
-        sample_squad(seed.wrapping_mul(131).wrapping_add(self.seed_salt), self.energy, self.size)
+        sample_squad(
+            seed.wrapping_mul(131).wrapping_add(self.seed_salt),
+            self.energy,
+            self.size,
+        )
     }
 }
 
@@ -73,9 +111,9 @@ impl Flavour {
 /// (west entry + east core approach, mid-band in y) so both squads always field and can move out. The
 /// interior walls/swamps between the corridors still CHANNEL the approach + SLOW the crossing — terrain
 /// that matters, not an empty room. (Same construction the tournament's `Bed::Imported` uses.)
-fn symmetric_terrain(fixture: &TerrainFixture) -> CombatTerrain {
+fn symmetric_terrain(fixture: &TerrainFixture) -> SimTerrain {
     let real = decode_terrain(&fixture.terrain);
-    let mut t = CombatTerrain::default();
+    let mut t = SimTerrain::default();
     for x in 0..25u8 {
         for y in 0..50u8 {
             let (wall, swamp) = (real.is_wall(x, y), real.swamps.contains(&(x, y)));
@@ -103,9 +141,11 @@ fn symmetric_terrain(fixture: &TerrainFixture) -> CombatTerrain {
 /// Largest 4-connected open (non-wall) component's tiles, from a seed near room centre — the navigable
 /// interior both squads share. Used to place the core + defender ring + attacker entry on tiles the sim
 /// can actually path between (never in a walled-off pocket).
-fn open_component(t: &CombatTerrain, seed: (u8, u8)) -> Vec<(u8, u8)> {
+fn open_component(t: &SimTerrain, seed: (u8, u8)) -> Vec<(u8, u8)> {
     use std::collections::{HashSet, VecDeque};
-    let open = |x: i32, y: i32| (0..50).contains(&x) && (0..50).contains(&y) && !t.is_wall(x as u8, y as u8);
+    let open = |x: i32, y: i32| {
+        (0..50).contains(&x) && (0..50).contains(&y) && !t.is_wall(x as u8, y as u8)
+    };
     // Snap the seed to the nearest open tile.
     let start = {
         let mut best = (seed.0, seed.1);
@@ -176,8 +216,17 @@ struct SelfPlayCase {
 /// Assemble ONE symmetric self-play scenario on a real fixture: real (mirrored) terrain in the fixture's
 /// room, a defender core/ring near the east-of-centre, the attacker forming at a west entry. Both sides'
 /// rosters are seeded random comps. The attacker paths east across the channelled interior to engage.
-fn assemble(seed: u32, fixture: &TerrainFixture, obj_kind: Objectiv, att: Flavour, def: Flavour) -> SelfPlayCase {
-    let room: RoomName = fixture.room.parse().unwrap_or_else(|_| "W1N1".parse().unwrap());
+fn assemble(
+    seed: u32,
+    fixture: &TerrainFixture,
+    obj_kind: Objectiv,
+    att: Flavour,
+    def: Flavour,
+) -> SelfPlayCase {
+    let room: RoomName = fixture
+        .room
+        .parse()
+        .unwrap_or_else(|_| "W1N1".parse().unwrap());
     let terrain = symmetric_terrain(fixture);
 
     // The shared navigable interior (from room centre) — everything places on it so the fight is pathable.
@@ -201,14 +250,25 @@ fn assemble(seed: u32, fixture: &TerrainFixture, obj_kind: Objectiv, att: Flavou
 
     // Breach staging: the attacker assaults from the open tiles just WEST of the core (facing the entry).
     let neigh = |c: (u8, u8)| {
-        [(-1i32, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-            .into_iter()
-            .filter_map(move |(dx, dy)| {
-                let (nx, ny) = (c.0 as i32 + dx, c.1 as i32 + dy);
-                ((0..50).contains(&nx) && (0..50).contains(&ny)).then_some((nx as u8, ny as u8))
-            })
+        [
+            (-1i32, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+        .into_iter()
+        .filter_map(move |(dx, dy)| {
+            let (nx, ny) = (c.0 as i32 + dx, c.1 as i32 + dy);
+            ((0..50).contains(&nx) && (0..50).contains(&ny)).then_some((nx as u8, ny as u8))
+        })
     };
-    let mut front: Vec<(u8, u8)> = neigh(core).filter(|&(x, y)| is_open(x, y) && x <= core.0).collect();
+    let mut front: Vec<(u8, u8)> = neigh(core)
+        .filter(|&(x, y)| is_open(x, y) && x <= core.0)
+        .collect();
     if front.is_empty() {
         front = neigh(core).filter(|&(x, y)| is_open(x, y)).collect();
     }
@@ -217,8 +277,10 @@ fn assemble(seed: u32, fixture: &TerrainFixture, obj_kind: Objectiv, att: Flavou
     }
     front.truncate(4);
     let assault = front[0];
-    let support: Vec<(u8, u8)> =
-        neigh(assault).filter(|&t| is_open(t.0, t.1) && t != core && !front.contains(&t)).take(4).collect();
+    let support: Vec<(u8, u8)> = neigh(assault)
+        .filter(|&t| is_open(t.0, t.1) && t != core && !front.contains(&t))
+        .take(4)
+        .collect();
 
     // ── build the world: real symmetric terrain + the defender objective + defender ring ──
     let mut b = ScenarioBuilder::empty(room).in_room(room);
@@ -227,21 +289,51 @@ fn assemble(seed: u32, fixture: &TerrainFixture, obj_kind: Objectiv, att: Flavou
     let (obj_id, obj_kind_enum) = match obj_kind {
         Objectiv::Clear => {
             // No structure: a pure clear (Secure = wipe the defender squad). Nominal spawn id, stop on wipe.
-            let id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 6_000, 6_000);
+            let id = b.structure(
+                StructureKind::Spawn,
+                Some(DEFENDER),
+                core.0,
+                core.1,
+                6_000,
+                6_000,
+            );
             (id, ObjectiveKind::Secure)
         }
         Objectiv::Core => {
-            let id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 30_000, 30_000);
+            let id = b.structure(
+                StructureKind::Spawn,
+                Some(DEFENDER),
+                core.0,
+                core.1,
+                30_000,
+                30_000,
+            );
             (id, ObjectiveKind::Raze)
         }
         Objectiv::ToweredCore => {
-            let id = b.structure(StructureKind::Spawn, Some(DEFENDER), core.0, core.1, 30_000, 30_000);
+            let id = b.structure(
+                StructureKind::Spawn,
+                Some(DEFENDER),
+                core.0,
+                core.1,
+                30_000,
+                30_000,
+            );
             // A rampart gate just west of the core + a FINITE tower a few rings out → drain-then-raze.
             if is_open(core.0.saturating_sub(1), core.1) {
-                b.structure(StructureKind::Rampart, Some(DEFENDER), core.0.saturating_sub(1), core.1, 25_000, 25_000);
+                b.structure(
+                    StructureKind::Rampart,
+                    Some(DEFENDER),
+                    core.0.saturating_sub(1),
+                    core.1,
+                    25_000,
+                    25_000,
+                );
             }
             if let Some(&(tx, ty)) = interior.iter().find(|&&(x, y)| {
-                let d = (x as i32 - core.0 as i32).abs().max((y as i32 - core.1 as i32).abs());
+                let d = (x as i32 - core.0 as i32)
+                    .abs()
+                    .max((y as i32 - core.1 as i32).abs());
                 (3..=6).contains(&d)
             }) {
                 b.tower(DEFENDER, tx, ty, 600);
@@ -259,15 +351,18 @@ fn assemble(seed: u32, fixture: &TerrainFixture, obj_kind: Objectiv, att: Flavou
         .copied()
         .filter(|&t| t != core && !front.contains(&t) && t.0 >= core.0.saturating_sub(2))
         .collect();
-    def_tiles.sort_by_key(|&(x, y)| (x as i32 - core.0 as i32).pow(2) + (y as i32 - core.1 as i32).pow(2));
+    def_tiles.sort_by_key(|&(x, y)| {
+        (x as i32 - core.0 as i32).pow(2) + (y as i32 - core.1 as i32).pow(2)
+    });
     for (i, body) in def_bodies.iter().enumerate() {
         if let Some(&(dx, dy)) = def_tiles.get(i) {
-            world.creeps.push(SimCreep {
+            world.movement.creeps.push(SimCreep {
                 id: 10_000 + i as u32,
                 owner: DEFENDER,
                 pos: pos_in(room, dx, dy),
                 body: SimBody::unboosted(body),
                 fatigue: 0,
+                carry_used: 0,
             });
         }
     }
@@ -291,12 +386,29 @@ fn assemble(seed: u32, fixture: &TerrainFixture, obj_kind: Objectiv, att: Flavou
         defender_owner: DEFENDER,
         member_energy: att.energy,
         onsite_budget: 1400,
-        label: format!("self-play {} | {} [{}] vs {} [{}]", fixture.room, att.name, obj_kind.tag(), def.name, "hold"),
+        label: format!(
+            "self-play {} | {} [{}] vs {} [{}]",
+            fixture.room,
+            att.name,
+            obj_kind.tag(),
+            def.name,
+            "hold"
+        ),
         seed: seed as u64,
     };
 
     SelfPlayCase {
-        file: format!("{:02}_selfplay_{}", seed, slug(&format!("{}-{}-{}-{}", fixture.room, att.name, obj_kind.tag(), def.name))),
+        file: format!(
+            "{:02}_selfplay_{}",
+            seed,
+            slug(&format!(
+                "{}-{}-{}-{}",
+                fixture.room,
+                att.name,
+                obj_kind.tag(),
+                def.name
+            ))
+        ),
         fixture_room: fixture.room.clone(),
         att_flavour: att.name,
         def_flavour: def.name,
@@ -311,7 +423,10 @@ fn assemble(seed: u32, fixture: &TerrainFixture, obj_kind: Objectiv, att: Flavou
 fn cases() -> Vec<SelfPlayCase> {
     let fx = fixtures();
     // A spread of the 13 real fixtures (varied wall/swamp density) — prefer distinct rooms across the grid.
-    let picks: Vec<usize> = (0..fx.len()).step_by(2).chain((1..fx.len()).step_by(4)).collect();
+    let picks: Vec<usize> = (0..fx.len())
+        .step_by(2)
+        .chain((1..fx.len()).step_by(4))
+        .collect();
     let objectives = [Objectiv::Clear, Objectiv::Core, Objectiv::ToweredCore];
 
     let mut out = Vec::new();
@@ -336,7 +451,13 @@ fn cases() -> Vec<SelfPlayCase> {
 /// Filesystem-safe slug.
 fn slug(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|p| !p.is_empty())
@@ -355,7 +476,11 @@ fn rooms_in_html(html: &str) -> Vec<String> {
             let name = &html[start..start + end_rel];
             if !name.is_empty()
                 && name.len() <= 8
-                && name.chars().next().map(|c| c == 'W' || c == 'E').unwrap_or(false)
+                && name
+                    .chars()
+                    .next()
+                    .map(|c| c == 'W' || c == 'E')
+                    .unwrap_or(false)
                 && name.chars().all(|c| c.is_ascii_alphanumeric())
             {
                 set.insert(name.to_string());
@@ -369,7 +494,9 @@ fn rooms_in_html(html: &str) -> Vec<String> {
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// One rendered row for the index.
@@ -407,7 +534,12 @@ fn main() {
         // TERRAIN PROOF: the render's embedded walls must be the REAL fixture's walls (mirror-symmetrized),
         // NOT the old synthetic corridor `(15,y)`. Confirm the render's wall set matches the bed terrain's
         // wall count within the target room (a non-trivial real wall field, > a single column).
-        let bed_walls = c.scenario.world.terrain_for(c.scenario.objectives[0].room).walls.len();
+        let bed_walls = c
+            .scenario
+            .world
+            .terrain_for(c.scenario.objectives[0].room)
+            .walls
+            .len();
         let terrain_real = bed_walls > 60 && frames;
 
         let file = format!("{}.html", c.file);
@@ -422,7 +554,11 @@ fn main() {
             outcome,
             rooms.len(),
             bed_walls,
-            if terrain_real { "REAL-TERRAIN✓" } else { "??" },
+            if terrain_real {
+                "REAL-TERRAIN✓"
+            } else {
+                "??"
+            },
         );
         rows.push(Row {
             file,
@@ -482,5 +618,9 @@ fn main() {
 
     // Sanity gates (not a CI test, but fail loudly if the corpus regresses to empty/synthetic).
     assert!(rows.len() >= 20, "corpus too small ({} < 20)", rows.len());
-    assert!(real * 4 >= rows.len() * 3, "too few renders embed real terrain ({real}/{})", rows.len());
+    assert!(
+        real * 4 >= rows.len() * 3,
+        "too few renders embed real terrain ({real}/{})",
+        rows.len()
+    );
 }

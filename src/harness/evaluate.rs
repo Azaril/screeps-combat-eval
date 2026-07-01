@@ -7,7 +7,9 @@
 //! resolved tick. [`evaluate_recorded`] is the same loop but captures a [`CombatRecording`] for the
 //! visualizer.
 
-use screeps_combat_engine::{record_tick, resolve_tick, CombatRecording, CombatWorld, Intents, PlayerId, StructureId};
+use screeps_combat_engine::{
+    record_tick, resolve_tick, CombatRecording, CombatWorld, Intents, PlayerId, StructureId,
+};
 
 /// Why an evaluation stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +42,8 @@ pub struct ObjectivesDestroyed(pub Vec<StructureId>);
 impl RunUntil for ObjectivesDestroyed {
     fn check(&self, world: &CombatWorld, _tick: u32) -> Option<StopReason> {
         let alive = |id: StructureId| {
-            world.structures.iter().any(|s| s.id == id && s.is_alive()) || world.towers.iter().any(|t| t.id == id && t.is_alive())
+            world.structures.iter().any(|s| s.id == id && s.is_alive())
+                || world.towers.iter().any(|t| t.id == id && t.is_alive())
         };
         if self.0.iter().all(|&id| !alive(id)) {
             Some(StopReason::ObjectivesComplete)
@@ -54,7 +57,12 @@ impl RunUntil for ObjectivesDestroyed {
 pub struct SideWiped(pub PlayerId);
 impl RunUntil for SideWiped {
     fn check(&self, world: &CombatWorld, _tick: u32) -> Option<StopReason> {
-        if world.creeps.iter().any(|c| c.owner == self.0 && c.is_alive()) {
+        if world
+            .movement
+            .creeps
+            .iter()
+            .any(|c| c.owner == self.0 && c.is_alive())
+        {
             None
         } else {
             Some(StopReason::SideWiped(self.0))
@@ -67,7 +75,10 @@ impl RunUntil for SideWiped {
 pub struct ControllerNeutralized(pub screeps::Position);
 impl RunUntil for ControllerNeutralized {
     fn check(&self, world: &CombatWorld, _tick: u32) -> Option<StopReason> {
-        let still_owned = world.controllers.iter().any(|c| c.pos == self.0 && c.owner.is_some());
+        let still_owned = world
+            .controllers
+            .iter()
+            .any(|c| c.pos == self.0 && c.owner.is_some());
         if still_owned {
             None
         } else {
@@ -116,7 +127,11 @@ fn run(
             return EvalOutcome { world, ticks, stop };
         }
         if ticks >= max_ticks {
-            return EvalOutcome { world, ticks, stop: StopReason::Timeout };
+            return EvalOutcome {
+                world,
+                ticks,
+                stop: StopReason::Timeout,
+            };
         }
         step(&mut world, attacker, defender, rec.as_deref_mut());
         ticks += 1;
@@ -143,6 +158,13 @@ pub fn evaluate_recorded(
     max_ticks: u32,
 ) -> (EvalOutcome, CombatRecording) {
     let mut rec = CombatRecording::new();
-    let outcome = run(world, attacker, defender, run_until, max_ticks, Some(&mut rec));
+    let outcome = run(
+        world,
+        attacker,
+        defender,
+        run_until,
+        max_ticks,
+        Some(&mut rec),
+    );
     (outcome, rec)
 }

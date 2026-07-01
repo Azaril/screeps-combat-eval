@@ -36,7 +36,11 @@ pub struct ReplayMeta {
 
 impl ReplayMeta {
     /// Build the per-room terrain backdrops by scanning a world for the rooms its entities occupy.
-    pub fn from_world(world: &CombatWorld, title: impl Into<String>, verdict: Option<String>) -> Self {
+    pub fn from_world(
+        world: &CombatWorld,
+        title: impl Into<String>,
+        verdict: Option<String>,
+    ) -> Self {
         Self::from_world_and_recording(world, None, title, verdict)
     }
 
@@ -52,7 +56,7 @@ impl ReplayMeta {
         verdict: Option<String>,
     ) -> Self {
         let mut names: BTreeSet<String> = BTreeSet::new();
-        for c in &world.creeps {
+        for c in &world.movement.creeps {
             names.insert(c.pos.room_name().to_string());
         }
         for s in &world.structures {
@@ -77,7 +81,9 @@ impl ReplayMeta {
         let rooms = names
             .into_iter()
             .map(|name| {
-                let rn = name.parse().expect("a room name from a live Position parses");
+                let rn = name
+                    .parse()
+                    .expect("a room name from a live Position parses");
                 let terrain = world.terrain_for(rn);
                 RoomLayout {
                     name,
@@ -86,7 +92,11 @@ impl ReplayMeta {
                 }
             })
             .collect();
-        ReplayMeta { title: title.into(), verdict, rooms }
+        ReplayMeta {
+            title: title.into(),
+            verdict,
+            rooms,
+        }
     }
 }
 
@@ -113,26 +123,61 @@ struct CollectBackend {
     prims: Vec<String>,
 }
 fn col(c: Option<&str>) -> String {
-    c.map(|s| format!("\"{s}\"")).unwrap_or_else(|| "null".into())
+    c.map(|s| format!("\"{s}\""))
+        .unwrap_or_else(|| "null".into())
 }
 impl VisualBackend for CollectBackend {
-    fn circle(&mut self, x: f32, y: f32, radius: f32, fill: Option<&str>, stroke: Option<&str>, sw: f32, op: f32) {
+    fn circle(
+        &mut self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        fill: Option<&str>,
+        stroke: Option<&str>,
+        sw: f32,
+        op: f32,
+    ) {
         self.prims
             .push(format!("{{\"t\":\"c\",\"x\":{x},\"y\":{y},\"r\":{radius},\"f\":{},\"s\":{},\"sw\":{sw},\"o\":{op}}}", col(fill), col(stroke)));
     }
-    fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, fill: Option<&str>, stroke: Option<&str>, sw: f32, op: f32) {
+    fn rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        fill: Option<&str>,
+        stroke: Option<&str>,
+        sw: f32,
+        op: f32,
+    ) {
         self.prims
             .push(format!("{{\"t\":\"r\",\"x\":{x},\"y\":{y},\"w\":{w},\"h\":{h},\"f\":{},\"s\":{},\"sw\":{sw},\"o\":{op}}}", col(fill), col(stroke)));
     }
-    fn poly(&mut self, points: &[(f32, f32)], fill: Option<&str>, stroke: Option<&str>, sw: f32, op: f32) {
+    fn poly(
+        &mut self,
+        points: &[(f32, f32)],
+        fill: Option<&str>,
+        stroke: Option<&str>,
+        sw: f32,
+        op: f32,
+    ) {
         let pts: Vec<String> = points.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
-        self.prims
-            .push(format!("{{\"t\":\"p\",\"pts\":[{}],\"f\":{},\"s\":{},\"sw\":{sw},\"o\":{op}}}", pts.join(","), col(fill), col(stroke)));
+        self.prims.push(format!(
+            "{{\"t\":\"p\",\"pts\":[{}],\"f\":{},\"s\":{},\"sw\":{sw},\"o\":{op}}}",
+            pts.join(","),
+            col(fill),
+            col(stroke)
+        ));
     }
     fn line(&mut self, from: (f32, f32), to: (f32, f32), color: Option<&str>, w: f32, op: f32) {
         self.prims.push(format!(
             "{{\"t\":\"l\",\"x1\":{},\"y1\":{},\"x2\":{},\"y2\":{},\"c\":{},\"w\":{w},\"o\":{op}}}",
-            from.0, from.1, to.0, to.1, col(color)
+            from.0,
+            from.1,
+            to.0,
+            to.1,
+            col(color)
         ));
     }
 }
@@ -163,8 +208,18 @@ fn esc(s: &str) -> String {
 /// last) — 1 = all frames. Creep schema: `[id, roomIdx, x, y, owner, hits, hitsMax, [T,A,RA,W,C,H,M]]`
 /// (composition = alive part counts). struct: `[roomIdx,x,y,kind,owner,hits,hitsMax]`. tower:
 /// `[roomIdx,x,y,owner,energy,hits]`. notes: per-frame event strings.
-fn build_replay_json(rec: &CombatRecording, meta: &ReplayMeta, stride: usize) -> (String, String, String) {
-    let room_idx = |name: &str| meta.rooms.iter().position(|r| r.name == name).map(|i| i as i64).unwrap_or(-1);
+fn build_replay_json(
+    rec: &CombatRecording,
+    meta: &ReplayMeta,
+    stride: usize,
+) -> (String, String, String) {
+    let room_idx = |name: &str| {
+        meta.rooms
+            .iter()
+            .position(|r| r.name == name)
+            .map(|i| i as i64)
+            .unwrap_or(-1)
+    };
 
     let mut rooms_json = String::from("[");
     for (i, r) in meta.rooms.iter().enumerate() {
@@ -173,11 +228,24 @@ fn build_replay_json(rec: &CombatRecording, meta: &ReplayMeta, stride: usize) ->
         }
         let walls: Vec<String> = r.walls.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
         let swamps: Vec<String> = r.swamps.iter().map(|(x, y)| format!("[{x},{y}]")).collect();
-        let _ = write!(rooms_json, "{{\"name\":\"{}\",\"walls\":[{}],\"swamps\":[{}]}}", esc(&r.name), walls.join(","), swamps.join(","));
+        let _ = write!(
+            rooms_json,
+            "{{\"name\":\"{}\",\"walls\":[{}],\"swamps\":[{}]}}",
+            esc(&r.name),
+            walls.join(","),
+            swamps.join(",")
+        );
     }
     rooms_json.push(']');
-    let verdict_json = meta.verdict.as_deref().map(|v| format!("\"{}\"", esc(v))).unwrap_or_else(|| "null".into());
-    let meta_json = format!("{{\"title\":\"{}\",\"verdict\":{verdict_json},\"rooms\":{rooms_json}}}", esc(&meta.title));
+    let verdict_json = meta
+        .verdict
+        .as_deref()
+        .map(|v| format!("\"{}\"", esc(v)))
+        .unwrap_or_else(|| "null".into());
+    let meta_json = format!(
+        "{{\"title\":\"{}\",\"verdict\":{verdict_json},\"rooms\":{rooms_json}}}",
+        esc(&meta.title)
+    );
 
     let stride = stride.max(1);
     let n = rec.frames.len();
@@ -198,7 +266,20 @@ fn build_replay_json(rec: &CombatRecording, meta: &ReplayMeta, stride: usize) ->
                 let m = c.composition;
                 format!(
                     "[{},{},{},{},{},{},{},[{},{},{},{},{},{},{}]]",
-                    c.id, room_idx(&c.room.to_string()), c.x, c.y, c.owner, c.hits, c.hits_max, m[0], m[1], m[2], m[3], m[4], m[5], m[6]
+                    c.id,
+                    room_idx(&c.room.to_string()),
+                    c.x,
+                    c.y,
+                    c.owner,
+                    c.hits,
+                    c.hits_max,
+                    m[0],
+                    m[1],
+                    m[2],
+                    m[3],
+                    m[4],
+                    m[5],
+                    m[6]
                 )
             })
             .collect();
@@ -208,35 +289,72 @@ fn build_replay_json(rec: &CombatRecording, meta: &ReplayMeta, stride: usize) ->
             .map(|s| {
                 format!(
                     "[{},{},{},{},{},{},{}]",
-                    room_idx(&s.room.to_string()), s.x, s.y, kind_index(s.kind), s.owner.map(|o| o as i64).unwrap_or(-1), s.hits, s.hits_max
+                    room_idx(&s.room.to_string()),
+                    s.x,
+                    s.y,
+                    kind_index(s.kind),
+                    s.owner.map(|o| o as i64).unwrap_or(-1),
+                    s.hits,
+                    s.hits_max
                 )
             })
             .collect();
         let towers: Vec<String> = f
             .towers
             .iter()
-            .map(|t| format!("[{},{},{},{},{},{}]", room_idx(&t.room.to_string()), t.x, t.y, t.owner, t.energy, t.hits))
+            .map(|t| {
+                format!(
+                    "[{},{},{},{},{},{}]",
+                    room_idx(&t.room.to_string()),
+                    t.x,
+                    t.y,
+                    t.owner,
+                    t.energy,
+                    t.hits
+                )
+            })
             .collect();
         let mut notes: Vec<String> = Vec::new();
         for ir in &f.intents {
             if ir.actions.is_empty() && ir.mv.is_none() {
                 continue;
             }
-            let acts = if ir.actions.is_empty() { String::new() } else { format!("{:?}", ir.actions) };
+            let acts = if ir.actions.is_empty() {
+                String::new()
+            } else {
+                format!("{:?}", ir.actions)
+            };
             let mv = ir.mv.map(|d| format!(" mv:{:?}", d)).unwrap_or_default();
-            let why = ir.reason.as_deref().map(|r| format!("  [{r}]")).unwrap_or_default();
-            notes.push(format!("\"#{} {}{}{}\"", ir.id, esc(&acts), esc(&mv), esc(&why)));
+            let why = ir
+                .reason
+                .as_deref()
+                .map(|r| format!("  [{r}]"))
+                .unwrap_or_default();
+            notes.push(format!(
+                "\"#{} {}{}{}\"",
+                ir.id,
+                esc(&acts),
+                esc(&mv),
+                esc(&why)
+            ));
         }
         if !f.deaths.is_empty() {
             notes.push(format!("\"\\u2620 deaths: {:?}\"", f.deaths));
         }
         if !f.destroyed_structures.is_empty() {
-            notes.push(format!("\"\\u2691 destroyed: {:?}\"", f.destroyed_structures));
+            notes.push(format!(
+                "\"\\u2691 destroyed: {:?}\"",
+                f.destroyed_structures
+            ));
         }
         let _ = write!(
             frames_json,
             "{{\"t\":{},\"creeps\":[{}],\"structs\":[{}],\"towers\":[{}],\"notes\":[{}]}}",
-            f.tick, creeps.join(","), structs.join(","), towers.join(","), notes.join(",")
+            f.tick,
+            creeps.join(","),
+            structs.join(","),
+            towers.join(","),
+            notes.join(",")
         );
     }
     frames_json.push(']');
@@ -279,12 +397,20 @@ pub fn replay_to_widget(rec: &CombatRecording, meta: &ReplayMeta, max_frames: us
 /// Write the SPLIT replay (operator-requested): the shared `renderer.js` + `player.js` (once) + a
 /// per-replay shell `<name>.html` and frame-data `<name>.data.js`. The shell `<script src>`s the three
 /// — so the renderer/player are hand-editable and the frame data is isolated for introspection.
-pub fn write_replay(dir: &str, name: &str, rec: &CombatRecording, meta: &ReplayMeta) -> std::io::Result<()> {
+pub fn write_replay(
+    dir: &str,
+    name: &str,
+    rec: &CombatRecording,
+    meta: &ReplayMeta,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     std::fs::write(format!("{dir}/renderer.js"), RENDERER_JS)?;
     std::fs::write(format!("{dir}/player.js"), PLAYER_JS)?;
     let (m, f, s) = build_replay_json(rec, meta, 1);
-    std::fs::write(format!("{dir}/{name}.data.js"), format!("window.REPLAY={{\"meta\":{m},\"frames\":{f},\"shapes\":{s}}};\n"))?;
+    std::fs::write(
+        format!("{dir}/{name}.data.js"),
+        format!("window.REPLAY={{\"meta\":{m},\"frames\":{f},\"shapes\":{s}}};\n"),
+    )?;
     let mut shell = String::new();
     shell.push_str(SHELL_HEAD);
     shell.push_str(SHELL_BODY);
@@ -459,21 +585,59 @@ window.IbexReplay = (function(){
 mod tests {
     use super::*;
     use screeps::{Part, Position, RoomCoordinate};
-    use screeps_combat_engine::{record_tick, CombatAction, CombatWorld, Intents, SimBody, SimCreep, SimStructure, StructureKind};
+    use screeps_combat_engine::{
+        record_tick, CombatAction, CombatWorld, Intents, MovementState, SimBody, SimCreep,
+        SimStructure, StructureKind,
+    };
 
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), "W1N1".parse().unwrap())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            "W1N1".parse().unwrap(),
+        )
     }
 
     fn smoke_recording() -> (CombatRecording, CombatWorld) {
         let mut world = CombatWorld {
-            creeps: vec![
-                SimCreep { id: 1, owner: 0, pos: pos(23, 25), body: SimBody::unboosted(&[Part::Tough, Part::Work, Part::Move]), fatigue: 0 },
-                SimCreep { id: 2, owner: 0, pos: pos(23, 24), body: SimBody::unboosted(&[Part::Heal, Part::Move]), fatigue: 0 },
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    SimCreep {
+                        id: 1,
+                        owner: 0,
+                        pos: pos(23, 25),
+                        body: SimBody::unboosted(&[Part::Tough, Part::Work, Part::Move]),
+                        fatigue: 0,
+                        carry_used: 0,
+                    },
+                    SimCreep {
+                        id: 2,
+                        owner: 0,
+                        pos: pos(23, 24),
+                        body: SimBody::unboosted(&[Part::Heal, Part::Move]),
+                        fatigue: 0,
+                        carry_used: 0,
+                    },
+                ],
+                ..Default::default()
+            },
             structures: vec![
-                SimStructure { id: 1_000_000, kind: StructureKind::Spawn, owner: Some(1), pos: pos(25, 25), hits: 5000, hits_max: 5000 },
-                SimStructure { id: 1_000_001, kind: StructureKind::Rampart, owner: Some(1), pos: pos(24, 25), hits: 3000, hits_max: 3000 },
+                SimStructure {
+                    id: 1_000_000,
+                    kind: StructureKind::Spawn,
+                    owner: Some(1),
+                    pos: pos(25, 25),
+                    hits: 5000,
+                    hits_max: 5000,
+                },
+                SimStructure {
+                    id: 1_000_001,
+                    kind: StructureKind::Rampart,
+                    owner: Some(1),
+                    pos: pos(24, 25),
+                    hits: 3000,
+                    hits_max: 3000,
+                },
             ],
             ..Default::default()
         };
@@ -495,7 +659,10 @@ mod tests {
         assert!(html.contains("IbexRenderer") && html.contains("IbexReplay.start"));
         assert!(html.contains("window.REPLAY="));
         // Creep array carries the 7-slot composition (a tanky TOUGH+WORK creep).
-        assert!(html.contains("[1,0,23,25,0,300,300,[1,0,0,1,0,0,1]]"), "creep id+composition embedded");
+        assert!(
+            html.contains("[1,0,23,25,0,300,300,[1,0,0,1,0,0,1]]"),
+            "creep id+composition embedded"
+        );
     }
 
     #[test]
@@ -505,11 +672,19 @@ mod tests {
         let dir = std::env::temp_dir().join("ibex-replay-split-test");
         let d = dir.to_str().unwrap();
         write_replay(d, "engagement", &rec, &meta).unwrap();
-        for f in ["renderer.js", "player.js", "engagement.html", "engagement.data.js"] {
+        for f in [
+            "renderer.js",
+            "player.js",
+            "engagement.html",
+            "engagement.data.js",
+        ] {
             assert!(dir.join(f).exists(), "{f} written");
         }
         let shell = std::fs::read_to_string(dir.join("engagement.html")).unwrap();
-        assert!(shell.contains("<script src=\"renderer.js\">") && shell.contains("<script src=\"engagement.data.js\">"));
+        assert!(
+            shell.contains("<script src=\"renderer.js\">")
+                && shell.contains("<script src=\"engagement.data.js\">")
+        );
         let data = std::fs::read_to_string(dir.join("engagement.data.js")).unwrap();
         assert!(data.starts_with("window.REPLAY="));
         let _ = std::fs::remove_dir_all(&dir);

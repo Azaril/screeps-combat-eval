@@ -4,7 +4,9 @@
 //! world, assess against the fieldable ceiling, size the REAL force, field it on the objective's
 //! staging tiles, evaluate the siege, and classify false-positive / false-negative.
 
-use crate::harness::evaluate::{evaluate, evaluate_recorded, AnyOf, ObjectivesDestroyed, SideWiped, StopReason};
+use crate::harness::evaluate::{
+    evaluate, evaluate_recorded, AnyOf, ObjectivesDestroyed, SideWiped, StopReason,
+};
 use crate::harness::scenario::{Objective, Scenario};
 use crate::harness::visualize::{replay_to_html, ReplayMeta};
 use screeps::Position;
@@ -12,12 +14,23 @@ use screeps_combat_agent::objective_bed::defense_intents;
 use screeps_combat_agent::opponents::tower_intents;
 use screeps_combat_agent::squad::ManagedSimSquad;
 use screeps_combat_decision::bodies::{build_combat_body, CombatBodySpec, MoveProfile};
-use screeps_combat_decision::composition::{assemble_force, formation_for, optimizer_ceiling_budget, BodyType, SquadComposition, SquadRole, SquadSlot};
+use screeps_combat_decision::composition::{
+    assemble_force, formation_for, optimizer_ceiling_budget, BodyType, SquadComposition, SquadRole,
+    SquadSlot,
+};
 use screeps_combat_decision::damage::tower_repair_at_range;
-use screeps_combat_decision::doctrine::{decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EnemyForce, EngagementContext, ForcePlan};
-use screeps_combat_decision::force_sizing::{clear_force, AssaultMode, DefenseProfile, ForceBudget, TowerThreat, COORDINATED_DPS_MARGIN};
+use screeps_combat_decision::doctrine::{
+    decide_doctrine, default_doctrines, DoctrineObjective, EnemyCoordination, EnemyForce,
+    EngagementContext, ForcePlan,
+};
+use screeps_combat_decision::force_sizing::{
+    clear_force, AssaultMode, DefenseProfile, ForceBudget, TowerThreat, COORDINATED_DPS_MARGIN,
+};
 use screeps_combat_engine::constants::TOWER_ENERGY_COST;
-use screeps_combat_engine::{CombatAction, CombatWorld, CreepId, Intents, PlayerId, SimBody, SimCreep, StructureId};
+use screeps_combat_engine::{
+    CombatAction, CombatWorld, CreepId, Intents, PlayerId, SimBody, SimBodyCombat, SimCreep,
+    StructureId,
+};
 
 /// A validator's judgement of one scenario.
 #[derive(Clone, Debug)]
@@ -91,7 +104,10 @@ impl OracleCalibration {
     }
     /// Build a calibration validator that grades against the given knob set (the sweep injector).
     pub fn with_params(params: screeps_combat_decision::composition::CompositionParams) -> Self {
-        Self { tally: Calibration::default(), params }
+        Self {
+            tally: Calibration::default(),
+            params,
+        }
     }
     pub fn tally(&self) -> &Calibration {
         &self.tally
@@ -112,27 +128,49 @@ impl Validator for OracleCalibration {
         // SYSTEM can field (the ceiling), not the bare template.
         let ceiling = siege_ceiling(scenario.member_energy);
         let budget = ceiling.force_budget(scenario.member_energy, scenario.onsite_budget);
-        let plan = siege_doctrine_plan_with(profile, budget, scenario.member_energy, defender_force(scenario), &self.params);
+        let plan = siege_doctrine_plan_with(
+            profile,
+            budget,
+            scenario.member_energy,
+            defender_force(scenario),
+            &self.params,
+        );
 
         if plan.winnable() {
             if plan.assessment.mode == AssaultMode::Drain {
                 self.tally.drain_winnable += 1;
-                return Verdict { pass: true, label: self.label().into(), detail: "winnable (drain) — diagnostic, not breach-graded".into() };
+                return Verdict {
+                    pass: true,
+                    label: self.label().into(),
+                    detail: "winnable (drain) — diagnostic, not breach-graded".into(),
+                };
             }
             match plan.composition {
                 Some(sized) => match breaches(scenario, objective, &sized) {
                     Some(true) => {
                         self.tally.fielded += 1;
-                        Verdict { pass: true, label: self.label().into(), detail: "winnable + fielded → breached".into() }
+                        Verdict {
+                            pass: true,
+                            label: self.label().into(),
+                            detail: "winnable + fielded → breached".into(),
+                        }
                     }
                     Some(false) => {
                         self.tally.fielded += 1;
                         self.tally.false_positives += 1;
-                        Verdict { pass: false, label: self.label().into(), detail: "FALSE POSITIVE: winnable + fielded but did NOT breach".into() }
+                        Verdict {
+                            pass: false,
+                            label: self.label().into(),
+                            detail: "FALSE POSITIVE: winnable + fielded but did NOT breach".into(),
+                        }
                     }
                     None => {
                         self.tally.unfieldable += 1;
-                        Verdict { pass: true, label: self.label().into(), detail: "winnable but bed geometry can't place it (excluded)".into() }
+                        Verdict {
+                            pass: true,
+                            label: self.label().into(),
+                            detail: "winnable but bed geometry can't place it (excluded)".into(),
+                        }
                     }
                 },
                 None => {
@@ -144,9 +182,17 @@ impl Validator for OracleCalibration {
             self.tally.deferred += 1;
             if let Some(true) = breaches(scenario, objective, &ceiling) {
                 self.tally.false_negatives += 1;
-                Verdict { pass: false, label: self.label().into(), detail: "FALSE NEGATIVE: deferred but the ceiling squad breached".into() }
+                Verdict {
+                    pass: false,
+                    label: self.label().into(),
+                    detail: "FALSE NEGATIVE: deferred but the ceiling squad breached".into(),
+                }
             } else {
-                Verdict { pass: true, label: self.label().into(), detail: "deferred — the ceiling squad could not breach (correct)".into() }
+                Verdict {
+                    pass: true,
+                    label: self.label().into(),
+                    detail: "deferred — the ceiling squad could not breach (correct)".into(),
+                }
             }
         }
     }
@@ -157,7 +203,11 @@ impl Validator for OracleCalibration {
 /// the maintainer's (last energized) `tower_repair_at_range` to the breach rampart; safe-mode from the world.
 /// Tower ranges measured to the objective's assault tile. ADR 0031 #41 — STRUCTURE-only: the defender CREEP
 /// dps is carried separately on the single [`EnemyForce`] channel (`defender_force`), not on this profile.
-pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Objective) -> DefenseProfile {
+pub(crate) fn derive_profile(
+    world: &CombatWorld,
+    defender: PlayerId,
+    obj: &Objective,
+) -> DefenseProfile {
     let energized: Vec<(Position, u32)> = world
         .towers
         .iter()
@@ -167,17 +217,34 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
     let ramparts: Vec<(Position, u32)> = world
         .structures
         .iter()
-        .filter(|s| s.kind == screeps_combat_engine::StructureKind::Rampart && s.owner == Some(defender) && s.is_alive())
+        .filter(|s| {
+            s.kind == screeps_combat_engine::StructureKind::Rampart
+                && s.owner == Some(defender)
+                && s.is_alive()
+        })
         .map(|s| (s.pos, s.hits))
         .collect();
     let breach_hits: u32 = ramparts.iter().map(|(_, h)| *h).sum();
-    let objective_hits = world.structures.iter().find(|s| s.id == obj.id).map(|s| s.hits).unwrap_or(0);
+    let objective_hits = world
+        .structures
+        .iter()
+        .find(|s| s.id == obj.id)
+        .map(|s| s.hits)
+        .unwrap_or(0);
     let repair_per_tick = match (breach_hits > 0, ramparts.first(), energized.last()) {
-        (true, Some((rampart_pos, _)), Some((maintainer_pos, _))) => tower_repair_at_range(maintainer_pos.get_range_to(*rampart_pos)) as f32,
+        (true, Some((rampart_pos, _)), Some((maintainer_pos, _))) => {
+            tower_repair_at_range(maintainer_pos.get_range_to(*rampart_pos)) as f32
+        }
         _ => 0.0,
     };
     DefenseProfile {
-        towers: energized.iter().map(|(p, e)| TowerThreat { range_to_assault: p.get_range_to(obj.assault_pos), energy: *e }).collect(),
+        towers: energized
+            .iter()
+            .map(|(p, e)| TowerThreat {
+                range_to_assault: p.get_range_to(obj.assault_pos),
+                energy: *e,
+            })
+            .collect(),
         breach_hits,
         objective_hits,
         // ADR 0031 #41: the defender CREEP dps is no longer carried on the profile — it lives on the single
@@ -189,7 +256,10 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
         safe_mode: world.safe_mode_owner == Some(defender),
         // ADR 0035 D1: the harness derives a profile FROM a known scenario world, so the towers are always
         // genuinely SEEN (empty ⇒ ScoutedEmpty, non-empty ⇒ Seen) — never the vacuous never-confirmed case.
-        tower_intel: screeps_combat_decision::force_sizing::tower_intel_from(energized.is_empty(), true),
+        tower_intel: screeps_combat_decision::force_sizing::tower_intel_from(
+            energized.is_empty(),
+            true,
+        ),
     }
 }
 
@@ -205,10 +275,21 @@ pub(crate) fn derive_profile(world: &CombatWorld, defender: PlayerId, obj: &Obje
 /// winnable→fielded→breached; a low value must not turn winnable beds into defers).
 const CALIBRATION_TARGET_VALUE: f32 = 1_000_000.0;
 
-pub(crate) fn siege_doctrine_plan(profile: DefenseProfile, budget: ForceBudget, member_energy: u32, enemy_force: Option<EnemyForce>) -> ForcePlan {
+pub(crate) fn siege_doctrine_plan(
+    profile: DefenseProfile,
+    budget: ForceBudget,
+    member_energy: u32,
+    enemy_force: Option<EnemyForce>,
+) -> ForcePlan {
     // The Default-knob plan (the seed): the calibration gates + every existing caller route through here, so
     // Default must reproduce the shipped fielding seeds (ADR 0031 D16 — Default is behavior-preserving).
-    siege_doctrine_plan_with(profile, budget, member_energy, enemy_force, &screeps_combat_decision::composition::CompositionParams::default())
+    siege_doctrine_plan_with(
+        profile,
+        budget,
+        member_energy,
+        enemy_force,
+        &screeps_combat_decision::composition::CompositionParams::default(),
+    )
 }
 
 /// As [`siege_doctrine_plan`] but with chosen [`CompositionParams`] — the TUNING SEAM the param sweep
@@ -245,24 +326,37 @@ pub(crate) fn siege_doctrine_plan_with(
         // beds into defers. window = the scenario's on-site budget (carried on `budget`).
         target_value: CALIBRATION_TARGET_VALUE,
         onsite_window: budget.onsite_budget_ticks,
-        params: screeps_combat_decision::composition::CompositionParams { member_energy: effective_member_energy, ..*params },
+        params: screeps_combat_decision::composition::CompositionParams {
+            member_energy: effective_member_energy,
+            ..*params
+        },
         // The eval bed is a fully-specified, KNOWN defense (reliable intel by construction). Inert here
         // (DismantleStructure → the gated SiegeBreach never reaches the always-field floor), but set
         // truthfully so the field's meaning is unambiguous.
         defense_intel_reliable: true,
     };
     let doctrines = default_doctrines();
-    let doctrine = decide_doctrine(&ctx, &doctrines).expect("DismantleStructure routes to the siege-breach doctrine");
+    let doctrine = decide_doctrine(&ctx, &doctrines)
+        .expect("DismantleStructure routes to the siege-breach doctrine");
     screeps_combat_decision::doctrine::plan_engagement(doctrine, &ctx, Some(budget))
 }
 
 /// Place `comp`'s members as attacker creeps on the objective's staging tiles (dismantlers → front,
 /// healers → support). `false` ⇒ can't be placed faithfully (a body that won't build, or more members
 /// than tiles) → the row is excluded from grading (a geometry limit, not an oracle error).
-fn place_squad(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposition, attacker: PlayerId, member_energy: u32) -> bool {
+fn place_squad(
+    world: &mut CombatWorld,
+    obj: &Objective,
+    comp: &SquadComposition,
+    attacker: PlayerId,
+    member_energy: u32,
+) -> bool {
     let (mut d, mut h, mut next_id) = (0usize, 0usize, 1u32);
     for slot in &comp.slots {
-        let Some(body) = slot.body_type.build_body(member_energy, MoveProfile::Plains) else {
+        let Some(body) = slot
+            .body_type
+            .build_body(member_energy, MoveProfile::Plains)
+        else {
             return false;
         };
         let tile = match slot.role {
@@ -284,7 +378,14 @@ fn place_squad(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposition
             }
             _ => return false,
         };
-        world.creeps.push(SimCreep { id: next_id, owner: attacker, pos: tile, body: SimBody::unboosted(&body), fatigue: 0 });
+        world.movement.creeps.push(SimCreep {
+            id: next_id,
+            owner: attacker,
+            pos: tile,
+            body: SimBody::unboosted(&body),
+            fatigue: 0,
+            carry_used: 0,
+        });
         next_id += 1;
     }
     true
@@ -292,15 +393,26 @@ fn place_squad(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposition
 
 /// The scripted siege attacker (sizing-pure, movement-free): dismantlers break the nearest living
 /// rampart then the core; healers heal the most-wounded ally (adjacent → Heal, ≤3 → RangedHeal).
-fn siege_intents(world: &CombatWorld, attacker: PlayerId, core_id: StructureId, core_pos: Position) -> Intents {
+fn siege_intents(
+    world: &CombatWorld,
+    attacker: PlayerId,
+    core_id: StructureId,
+    core_pos: Position,
+) -> Intents {
     let mut intents = Intents::new();
     let wounded = world
+        .movement
         .creeps
         .iter()
         .filter(|c| c.is_alive() && c.owner == attacker)
         .min_by_key(|c| c.body.hits)
         .map(|c| (c.id, c.pos));
-    for c in world.creeps.iter().filter(|c| c.is_alive() && c.owner == attacker) {
+    for c in world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner == attacker)
+    {
         if c.body.dismantle_power() > 0 {
             let rampart = world
                 .structures
@@ -332,13 +444,22 @@ fn siege_intents(world: &CombatWorld, attacker: PlayerId, core_id: StructureId, 
 /// evaluator; `Some(true)` ⇒ the objective fell within the on-site budget, `None` ⇒ couldn't place.
 fn breaches(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Option<bool> {
     let mut world = scenario.world.clone();
-    if !place_squad(&mut world, obj, comp, scenario.attacker_owner, scenario.member_energy) {
+    if !place_squad(
+        &mut world,
+        obj,
+        comp,
+        scenario.attacker_owner,
+        scenario.member_energy,
+    ) {
         return None;
     }
     let attacker = scenario.attacker_owner;
     let defender = scenario.defender_owner;
     let (core_id, core_pos) = (obj.id, obj.pos);
-    let run_until = AnyOf(vec![Box::new(ObjectivesDestroyed(vec![core_id])), Box::new(SideWiped(attacker))]);
+    let run_until = AnyOf(vec![
+        Box::new(ObjectivesDestroyed(vec![core_id])),
+        Box::new(SideWiped(attacker)),
+    ]);
     let outcome = evaluate(
         world,
         &mut |w| siege_intents(w, attacker, core_id, core_pos),
@@ -357,16 +478,31 @@ fn choose_fielded_comp(scenario: &Scenario, obj: &Objective) -> (SquadCompositio
     let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
     let ceiling = siege_ceiling(scenario.member_energy);
     let budget = ceiling.force_budget(scenario.member_energy, scenario.onsite_budget);
-    let plan = siege_doctrine_plan(profile, budget, scenario.member_energy, defender_force(scenario));
+    let plan = siege_doctrine_plan(
+        profile,
+        budget,
+        scenario.member_energy,
+        defender_force(scenario),
+    );
     if plan.winnable() && plan.assessment.mode == AssaultMode::Breach {
         match plan.composition {
             Some(sized) => (sized, "winnable → fielded the sized force".to_string()),
-            None => (ceiling, "winnable but the comp can't field the required force; showing the ceiling".to_string()),
+            None => (
+                ceiling,
+                "winnable but the comp can't field the required force; showing the ceiling"
+                    .to_string(),
+            ),
         }
     } else if plan.winnable() {
-        (ceiling, "winnable (drain mode); showing the ceiling".to_string())
+        (
+            ceiling,
+            "winnable (drain mode); showing the ceiling".to_string(),
+        )
     } else {
-        (ceiling, format!("deferred ({}); showing the ceiling", plan.assessment.reason))
+        (
+            ceiling,
+            format!("deferred ({}); showing the ceiling", plan.assessment.reason),
+        )
     }
 }
 
@@ -378,14 +514,38 @@ fn choose_fielded_comp(scenario: &Scenario, obj: &Objective) -> (SquadCompositio
 fn managed_assault_comp(scenario: &Scenario) -> SquadComposition {
     use screeps_combat_decision::composition::{FormationMode, FormationShape};
     let energy = scenario.member_energy;
-    let ranged = max_role_parts(|n| CombatBodySpec { ranged_attack: n, ..Default::default() }, energy);
-    let heal = max_role_parts(|n| CombatBodySpec { heal: n, ..Default::default() }, energy);
+    let ranged = max_role_parts(
+        |n| CombatBodySpec {
+            ranged_attack: n,
+            ..Default::default()
+        },
+        energy,
+    );
+    let heal = max_role_parts(
+        |n| CombatBodySpec {
+            heal: n,
+            ..Default::default()
+        },
+        energy,
+    );
     let mut slots = Vec::new();
     for _ in 0..2 {
-        slots.push(SquadSlot { role: SquadRole::RangedDPS, body_type: BodyType::Sized(CombatBodySpec { ranged_attack: ranged, ..Default::default() }) });
+        slots.push(SquadSlot {
+            role: SquadRole::RangedDPS,
+            body_type: BodyType::Sized(CombatBodySpec {
+                ranged_attack: ranged,
+                ..Default::default()
+            }),
+        });
     }
     for _ in 0..2 {
-        slots.push(SquadSlot { role: SquadRole::Healer, body_type: BodyType::Sized(CombatBodySpec { heal, ..Default::default() }) });
+        slots.push(SquadSlot {
+            role: SquadRole::Healer,
+            body_type: BodyType::Sized(CombatBodySpec {
+                heal,
+                ..Default::default()
+            }),
+        });
     }
     SquadComposition {
         label: "Quad Ranged".into(),
@@ -398,8 +558,18 @@ fn managed_assault_comp(scenario: &Scenario) -> SquadComposition {
 
 /// Place `comp`'s members as attacker creeps clustered at the objective's ENTRY (a MOVING assault),
 /// returning their ids in slot order (the `ManagedSimSquad` roster). `None` ⇒ a body wouldn't build.
-fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposition, attacker: PlayerId, energy: u32) -> Option<Vec<CreepId>> {
-    let (ex, ey, rm) = (obj.entry.x().u8() as i32, obj.entry.y().u8() as i32, obj.entry.room_name());
+fn place_at_entry(
+    world: &mut CombatWorld,
+    obj: &Objective,
+    comp: &SquadComposition,
+    attacker: PlayerId,
+    energy: u32,
+) -> Option<Vec<CreepId>> {
+    let (ex, ey, rm) = (
+        obj.entry.x().u8() as i32,
+        obj.entry.y().u8() as i32,
+        obj.entry.room_name(),
+    );
     let need = comp.slots.len();
     // DISTINCT in-bounds, non-wall, unoccupied tiles — one creep per tile, ALWAYS. The previous version
     // spread the original 9 offsets then `.clamp(0,49)`'d them, which COLLAPSED out-of-bounds offsets onto
@@ -410,11 +580,26 @@ fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposit
     // SHAPE first (so a normal in-bounds entry is placed byte-identically — no dynamics change for the
     // single-room beds), but SKIP (never clamp) any out-of-bounds / wall / already-taken tile and fall back
     // to expanding rings only when an edge entry leaves the 9 short. Collision-free either way.
-    const OFF: [(i32, i32); 9] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+    const OFF: [(i32, i32); 9] = [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (-1, 0),
+        (0, -1),
+        (1, 1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+    ];
     let tiles: Vec<(u8, u8)> = {
         let terrain = world.terrain_for(rm);
-        let mut taken: std::collections::HashSet<(u8, u8)> =
-            world.creeps.iter().filter(|c| c.pos.room_name() == rm).map(|c| (c.pos.x().u8(), c.pos.y().u8())).collect();
+        let mut taken: std::collections::HashSet<(u8, u8)> = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.pos.room_name() == rm)
+            .map(|c| (c.pos.x().u8(), c.pos.y().u8()))
+            .collect();
         let mut offsets: Vec<(i32, i32)> = OFF.to_vec();
         for r in 2..=10i32 {
             for dy in -r..=r {
@@ -450,8 +635,19 @@ fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposit
         let body = slot.body_type.build_body(energy, MoveProfile::Plains)?;
         let (x, y) = tiles[i];
         let id = i as u32 + 1;
-        let pos = Position::new(screeps::RoomCoordinate::new(x).unwrap(), screeps::RoomCoordinate::new(y).unwrap(), rm);
-        world.creeps.push(SimCreep { id, owner: attacker, pos, body: SimBody::unboosted(&body), fatigue: 0 });
+        let pos = Position::new(
+            screeps::RoomCoordinate::new(x).unwrap(),
+            screeps::RoomCoordinate::new(y).unwrap(),
+            rm,
+        );
+        world.movement.creeps.push(SimCreep {
+            id,
+            owner: attacker,
+            pos,
+            body: SimBody::unboosted(&body),
+            fatigue: 0,
+            carry_used: 0,
+        });
         ids.push(id);
     }
     Some(ids)
@@ -463,11 +659,16 @@ fn place_at_entry(world: &mut CombatWorld, obj: &Objective, comp: &SquadComposit
 /// neutralizes the controller at the objective tile; `Farm` has no terminal (holds to the on-site budget).
 fn run_until_for(scenario: &Scenario, obj: &Objective) -> AnyOf {
     use crate::harness::scenario::ObjectiveKind;
-    let mut conds: Vec<Box<dyn crate::harness::evaluate::RunUntil>> = vec![Box::new(SideWiped(scenario.attacker_owner))];
+    let mut conds: Vec<Box<dyn crate::harness::evaluate::RunUntil>> =
+        vec![Box::new(SideWiped(scenario.attacker_owner))];
     match obj.kind {
-        ObjectiveKind::Raze | ObjectiveKind::Breach => conds.push(Box::new(ObjectivesDestroyed(vec![obj.id]))),
+        ObjectiveKind::Raze | ObjectiveKind::Breach => {
+            conds.push(Box::new(ObjectivesDestroyed(vec![obj.id])))
+        }
         ObjectiveKind::Secure => conds.push(Box::new(SideWiped(scenario.defender_owner))),
-        ObjectiveKind::Declaim => conds.push(Box::new(crate::harness::evaluate::ControllerNeutralized(obj.pos))),
+        ObjectiveKind::Declaim => conds.push(Box::new(
+            crate::harness::evaluate::ControllerNeutralized(obj.pos),
+        )),
         ObjectiveKind::Farm => {}
     }
     AnyOf(conds)
@@ -475,8 +676,20 @@ fn run_until_for(scenario: &Scenario, obj: &Objective) -> AnyOf {
 
 /// Field `comp` as a MOVING managed squad at the entry and run the REAL `decide_squad_with_pathing`
 /// brain to the objective (recording each tick). `None` ⇒ couldn't field.
-fn run_managed_assault(scenario: &Scenario, obj: &Objective, comp: &SquadComposition) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
-    run_managed_assault_with(scenario, obj, comp, screeps_combat_decision::kite::SquadTacticParams::default())
+fn run_managed_assault(
+    scenario: &Scenario,
+    obj: &Objective,
+    comp: &SquadComposition,
+) -> Option<(
+    crate::harness::evaluate::EvalOutcome,
+    screeps_combat_engine::CombatRecording,
+)> {
+    run_managed_assault_with(
+        scenario,
+        obj,
+        comp,
+        screeps_combat_decision::kite::SquadTacticParams::default(),
+    )
 }
 
 /// As [`run_managed_assault`] but with chosen squad tactics — the seam the base-attack tuning pass uses to
@@ -486,10 +699,20 @@ pub(crate) fn run_managed_assault_with(
     obj: &Objective,
     comp: &SquadComposition,
     tactics: screeps_combat_decision::kite::SquadTacticParams,
-) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
+) -> Option<(
+    crate::harness::evaluate::EvalOutcome,
+    screeps_combat_engine::CombatRecording,
+)> {
     let mut world = scenario.world.clone();
-    let members = place_at_entry(&mut world, obj, comp, scenario.attacker_owner, scenario.member_energy)?;
-    let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos).with_tactics(tactics);
+    let members = place_at_entry(
+        &mut world,
+        obj,
+        comp,
+        scenario.attacker_owner,
+        scenario.member_energy,
+    )?;
+    let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos)
+        .with_tactics(tactics);
     let defender = scenario.defender_owner;
     let core_pos = obj.pos;
     let run_until = run_until_for(scenario, obj);
@@ -514,9 +737,18 @@ pub(crate) fn run_managed_assault_drain(
     obj: &Objective,
     comp: &SquadComposition,
     tactics: screeps_combat_decision::kite::SquadTacticParams,
-) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording)> {
+) -> Option<(
+    crate::harness::evaluate::EvalOutcome,
+    screeps_combat_engine::CombatRecording,
+)> {
     let mut world = scenario.world.clone();
-    let members = place_at_entry(&mut world, obj, comp, scenario.attacker_owner, scenario.member_energy)?;
+    let members = place_at_entry(
+        &mut world,
+        obj,
+        comp,
+        scenario.attacker_owner,
+        scenario.member_energy,
+    )?;
     let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos)
         .with_tactics(tactics)
         .with_drain_stance(true);
@@ -540,7 +772,10 @@ pub fn managed_oscillation_rate(scenario: &Scenario) -> Option<f64> {
     let obj = &scenario.objectives[0];
     let comp = managed_assault_comp(scenario);
     let (_, rec) = run_managed_assault(scenario, obj, &comp)?;
-    Some(crate::metrics::oscillation_rate(&rec, scenario.attacker_owner))
+    Some(crate::metrics::oscillation_rate(
+        &rec,
+        scenario.attacker_owner,
+    ))
 }
 
 /// An attacker squad's assault outcome on a defended base (ADR 0025 base attack/defend lens).
@@ -561,25 +796,53 @@ pub struct AssaultScore {
 /// Score the managed attacker squad's assault on `scenario`'s defended base under `tactics` — the
 /// objective-aware base-attack lens (cf. the symmetric open-combat tournament): how much of the objective
 /// it razed, whether it cracked it, and how much of itself it kept. `None` ⇒ couldn't field at the entry.
-pub fn assault_score(scenario: &Scenario, tactics: screeps_combat_decision::kite::SquadTacticParams) -> Option<AssaultScore> {
+pub fn assault_score(
+    scenario: &Scenario,
+    tactics: screeps_combat_decision::kite::SquadTacticParams,
+) -> Option<AssaultScore> {
     let obj = &scenario.objectives[0];
     // Field a WINNABLE-SIZED siege force (the force-sizing solver's breach comp) — not the weak
     // `quad_ranged` — so the squad can actually crack the mid bases and POSITIONING discriminates the
     // KernelParams (the quad only chipped → all configs tied). The turtle's required force exceeds a
     // single placeable squad, so it stays hard (correctly). (place_at_entry fields up to 9 of the comp.)
     let (comp, _) = choose_fielded_comp(scenario, obj);
-    let obj_hits_0 = scenario.world.structures.iter().find(|s| s.id == obj.id).map(|s| s.hits).unwrap_or(0);
+    let obj_hits_0 = scenario
+        .world
+        .structures
+        .iter()
+        .find(|s| s.id == obj.id)
+        .map(|s| s.hits)
+        .unwrap_or(0);
     let (outcome, rec) = run_managed_assault_with(scenario, obj, &comp, tactics)?;
-    let final_hits = outcome.world.structures.iter().find(|s| s.id == obj.id).map(|s| s.hits);
+    let final_hits = outcome
+        .world
+        .structures
+        .iter()
+        .find(|s| s.id == obj.id)
+        .map(|s| s.hits);
     let destroyed = !matches!(final_hits, Some(h) if h > 0); // gone from the world OR at 0 hits
     let removed = obj_hits_0.saturating_sub(final_hits.unwrap_or(0));
-    let attacker_hp: u32 = outcome.world.creeps.iter().filter(|c| c.owner == scenario.attacker_owner && c.is_alive()).map(|c| c.body.hits).sum();
+    let attacker_hp: u32 = outcome
+        .world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == scenario.attacker_owner && c.is_alive())
+        .map(|c| c.body.hits)
+        .sum();
     let ticks = rec.frames.len() as u32;
     // Efficiency-weighted: razed HP + destroyed bonus + survival×2 (the position-sensitive term — a
     // better-placed assault eats less tower/defender fire) − a per-tick penalty (faster breach is better).
     // Seeds; the tournament tunes the kernel against this, not the score weights themselves.
-    let score = removed as i64 + if destroyed { 50_000 } else { 0 } + (attacker_hp as i64) * 2 - (ticks as i64) * 10;
-    Some(AssaultScore { objective_hp_removed: removed, objective_destroyed: destroyed, attacker_hp_retained: attacker_hp, ticks, score })
+    let score = removed as i64 + if destroyed { 50_000 } else { 0 } + (attacker_hp as i64) * 2
+        - (ticks as i64) * 10;
+    Some(AssaultScore {
+        objective_hp_removed: removed,
+        objective_destroyed: destroyed,
+        attacker_hp_retained: attacker_hp,
+        ticks,
+        score,
+    })
 }
 
 /// The **traversal lens** (ADR 0023a stage 3): field the real moving squad and grade whether it
@@ -600,21 +863,31 @@ impl Validator for ManagedSquadIntegration {
         // siege lens is `OracleCalibration`; this is the movement/engagement lens.
         let comp = managed_assault_comp(scenario);
         let Some((outcome, _rec)) = run_managed_assault(scenario, obj, &comp) else {
-            return Verdict { pass: true, label: self.label().into(), detail: "could not field at the entry (excluded)".into() };
+            return Verdict {
+                pass: true,
+                label: self.label().into(),
+                detail: "could not field at the entry (excluded)".into(),
+            };
         };
-        let reached_vicinity = outcome
-            .world
-            .creeps
-            .iter()
-            .any(|c| c.is_alive() && c.owner == scenario.attacker_owner && c.pos.room_name() == obj.room && c.pos.get_range_to(obj.pos) <= 8);
+        let reached_vicinity = outcome.world.movement.creeps.iter().any(|c| {
+            c.is_alive()
+                && c.owner == scenario.attacker_owner
+                && c.pos.room_name() == obj.room
+                && c.pos.get_range_to(obj.pos) <= 8
+        });
         let pass = match outcome.stop {
-            StopReason::ObjectivesComplete | StopReason::ControllerNeutralized | StopReason::SideWiped(_) => true,
+            StopReason::ObjectivesComplete
+            | StopReason::ControllerNeutralized
+            | StopReason::SideWiped(_) => true,
             StopReason::Timeout => reached_vicinity,
         };
         Verdict {
             pass,
             label: self.label().into(),
-            detail: format!("managed ranged assault → {:?} @ t{} (reached={reached_vicinity})", outcome.stop, outcome.ticks),
+            detail: format!(
+                "managed ranged assault → {:?} @ t{} (reached={reached_vicinity})",
+                outcome.stop, outcome.ticks
+            ),
         }
     }
 }
@@ -633,19 +906,40 @@ fn merge_intents(dst: &mut Intents, src: Intents) {
 /// force) BOTH driven by the real `ManagedSimSquad` brain (`decide_squad_with_pathing` — advance / kite
 /// / focus-fire), with the defender's towers firing (`tower_intents`). Recording. `None` ⇒ couldn't
 /// field the attacker.
-fn run_self_play(scenario: &Scenario, obj: &Objective) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording, Vec<CreepId>)> {
+fn run_self_play(
+    scenario: &Scenario,
+    obj: &Objective,
+) -> Option<(
+    crate::harness::evaluate::EvalOutcome,
+    screeps_combat_engine::CombatRecording,
+    Vec<CreepId>,
+)> {
     let mut world = scenario.world.clone();
     let attacker_comp = managed_assault_comp(scenario);
-    let att_ids = place_at_entry(&mut world, obj, &attacker_comp, scenario.attacker_owner, scenario.member_energy)?;
+    let att_ids = place_at_entry(
+        &mut world,
+        obj,
+        &attacker_comp,
+        scenario.attacker_owner,
+        scenario.member_energy,
+    )?;
     // The defender squad = the scenario's pre-placed defender creeps (the ForceSpec opponent).
-    let def_ids: Vec<CreepId> = world.creeps.iter().filter(|c| c.is_alive() && c.owner == scenario.defender_owner).map(|c| c.id).collect();
+    let def_ids: Vec<CreepId> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner == scenario.defender_owner)
+        .map(|c| c.id)
+        .collect();
     let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos);
     let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids.clone(), obj.pos); // defender holds the core
-    // Stop on objective destroyed or the ATTACKER wiped; only stop on the DEFENDER wiped when there ARE
-    // defender creeps — else `SideWiped(defender)` is true at tick 0 (a tower-only / no-creep defense)
-    // and the engagement records ZERO frames (the empty-recording bug).
-    let mut conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> =
-        vec![Box::new(ObjectivesDestroyed(vec![obj.id])), Box::new(SideWiped(scenario.attacker_owner))];
+                                                                                           // Stop on objective destroyed or the ATTACKER wiped; only stop on the DEFENDER wiped when there ARE
+                                                                                           // defender creeps — else `SideWiped(defender)` is true at tick 0 (a tower-only / no-creep defense)
+                                                                                           // and the engagement records ZERO frames (the empty-recording bug).
+    let mut conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> = vec![
+        Box::new(ObjectivesDestroyed(vec![obj.id])),
+        Box::new(SideWiped(scenario.attacker_owner)),
+    ];
     if !def_ids.is_empty() {
         conditions.push(Box::new(SideWiped(scenario.defender_owner)));
     }
@@ -677,17 +971,33 @@ impl Validator for SelfPlay {
     fn validate(&mut self, scenario: &Scenario) -> Verdict {
         let obj = &scenario.objectives[0];
         // Defender start positions (to detect movement).
-        let starts: std::collections::HashMap<CreepId, Position> =
-            scenario.world.creeps.iter().filter(|c| c.owner == scenario.defender_owner).map(|c| (c.id, c.pos)).collect();
+        let starts: std::collections::HashMap<CreepId, Position> = scenario
+            .world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == scenario.defender_owner)
+            .map(|c| (c.id, c.pos))
+            .collect();
         let Some((outcome, _rec, def_ids)) = run_self_play(scenario, obj) else {
-            return Verdict { pass: true, label: self.label().into(), detail: "could not field the attacker (excluded)".into() };
+            return Verdict {
+                pass: true,
+                label: self.label().into(),
+                detail: "could not field the attacker (excluded)".into(),
+            };
         };
         let defender_moved = outcome
             .world
+            .movement
             .creeps
             .iter()
             .filter(|c| def_ids.contains(&c.id))
-            .any(|c| starts.get(&c.id).map(|s| s.get_range_to(c.pos) > 0).unwrap_or(false));
+            .any(|c| {
+                starts
+                    .get(&c.id)
+                    .map(|s| s.get_range_to(c.pos) > 0)
+                    .unwrap_or(false)
+            });
         let had_defenders = !def_ids.is_empty();
         // The opposing side is genuinely brain-driven (not a static dummy) if it MOVED, or if the fight
         // RESOLVED decisively (a wipe/breach — real combat, not a frozen standoff). Fail only on the old
@@ -727,7 +1037,10 @@ impl SizingWins {
     }
     /// Build a sizing validator that fields against the given knob set (the sweep injector).
     pub fn with_params(params: screeps_combat_decision::composition::CompositionParams) -> Self {
-        Self { params, ..Default::default() }
+        Self {
+            params,
+            ..Default::default()
+        }
     }
     /// Mean spawn cost per WIN — the efficiency metric (cheapest winning force; lower is better). 0 when
     /// nothing won.
@@ -746,8 +1059,15 @@ impl Validator for SizingWins {
     fn validate(&mut self, scenario: &Scenario) -> Verdict {
         let obj = &scenario.objectives[0];
         let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
-        let budget = siege_ceiling(scenario.member_energy).force_budget(scenario.member_energy, scenario.onsite_budget);
-        let plan = siege_doctrine_plan_with(profile, budget, scenario.member_energy, defender_force(scenario), &self.params);
+        let budget = siege_ceiling(scenario.member_energy)
+            .force_budget(scenario.member_energy, scenario.onsite_budget);
+        let plan = siege_doctrine_plan_with(
+            profile,
+            budget,
+            scenario.member_energy,
+            defender_force(scenario),
+            &self.params,
+        );
         if plan.winnable() && plan.assessment.mode == AssaultMode::Breach {
             if let Some(sized) = plan.composition {
                 if let Some(breached) = breaches(scenario, obj, &sized) {
@@ -759,11 +1079,19 @@ impl Validator for SizingWins {
                         let probe = self.params.member_energy.min(scenario.member_energy);
                         self.winning_spawn_cost += sized.estimated_cost(probe) as u64;
                     }
-                    return Verdict { pass: breached, label: self.label().into(), detail: format!("fielded → {}", if breached { "WON" } else { "lost" }) };
+                    return Verdict {
+                        pass: breached,
+                        label: self.label().into(),
+                        detail: format!("fielded → {}", if breached { "WON" } else { "lost" }),
+                    };
                 }
             }
         }
-        Verdict { pass: true, label: self.label().into(), detail: "deferred / drain / unfieldable (not a sizing attempt)".into() }
+        Verdict {
+            pass: true,
+            label: self.label().into(),
+            detail: "deferred / drain / unfieldable (not a sizing attempt)".into(),
+        }
     }
 }
 
@@ -771,8 +1099,17 @@ impl Validator for SizingWins {
 /// dps / hits / heal + whether it's `Coordinated` — grouped (count > 1, they focus-fire / cover each
 /// other) or self-sustaining (mutual heal). A lone enemy is `Individual`.
 fn enemy_force_of(scenario: &Scenario) -> (f32, u32, f32, bool) {
-    let d: Vec<&SimCreep> = scenario.world.creeps.iter().filter(|c| c.owner == scenario.defender_owner && c.is_alive()).collect();
-    let dps: f32 = d.iter().map(|c| (c.body.attack_power() + c.body.ranged_attack_power()) as f32).sum();
+    let d: Vec<&SimCreep> = scenario
+        .world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == scenario.defender_owner && c.is_alive())
+        .collect();
+    let dps: f32 = d
+        .iter()
+        .map(|c| (c.body.attack_power() + c.body.ranged_attack_power()) as f32)
+        .sum();
     let hits: u32 = d.iter().map(|c| c.body.hits).sum();
     let heal: f32 = d.iter().map(|c| c.body.heal_power() as f32).sum();
     (dps, hits, heal, d.len() > 1 || heal > 0.0)
@@ -784,8 +1121,20 @@ fn enemy_force_of(scenario: &Scenario) -> (f32, u32, f32, bool) {
 /// calibration invariant: `SizingWins`/`OracleCalibration` beds are creep-free → `None`).
 pub(crate) fn defender_force(scenario: &Scenario) -> Option<EnemyForce> {
     let (dps, hits, heal, _) = enemy_force_of(scenario);
-    let count = scenario.world.creeps.iter().filter(|c| c.owner == scenario.defender_owner && c.is_alive()).count() as u32;
-    (dps > 0.0).then_some(EnemyForce { dps, heal, hits, count, boosted: false })
+    let count = scenario
+        .world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.owner == scenario.defender_owner && c.is_alive())
+        .count() as u32;
+    (dps > 0.0).then_some(EnemyForce {
+        dps,
+        heal,
+        hits,
+        count,
+        boosted: false,
+    })
 }
 
 /// The outcome of fielding a `clear_force`-sized attacker against a creep-clear bed (ADR 0026 §9.10 L6).
@@ -804,14 +1153,31 @@ pub struct ClearOutcome {
 pub fn clear_outcome_at(scenario: &Scenario, dps_margin: f32) -> Option<ClearOutcome> {
     let obj = &scenario.objectives[0];
     let (enemy_dps, enemy_hits, enemy_heal, _) = enemy_force_of(scenario);
-    let budget = optimizer_ceiling_budget(DoctrineObjective::ClearCreeps, scenario.member_energy, scenario.onsite_budget);
-    let (assessment, required) = clear_force(vec![], enemy_dps, enemy_hits, enemy_heal, &budget, dps_margin, scenario.world.safe_mode_owner.is_some());
+    let budget = optimizer_ceiling_budget(
+        DoctrineObjective::ClearCreeps,
+        scenario.member_energy,
+        scenario.onsite_budget,
+    );
+    let (assessment, required) = clear_force(
+        vec![],
+        enemy_dps,
+        enemy_hits,
+        enemy_heal,
+        &budget,
+        dps_margin,
+        scenario.world.safe_mode_owner.is_some(),
+    );
     if !assessment.winnable {
         return None;
     }
     let comp = assemble_force(&required, scenario.member_energy)?;
     let spawn_cost = comp.estimated_cost(scenario.member_energy);
-    let (outcome, _) = run_managed_assault_with(scenario, obj, &comp, screeps_combat_decision::kite::SquadTacticParams::open_combat())?;
+    let (outcome, _) = run_managed_assault_with(
+        scenario,
+        obj,
+        &comp,
+        screeps_combat_decision::kite::SquadTacticParams::open_combat(),
+    )?;
     Some(ClearOutcome {
         cleared: outcome.stop == StopReason::SideWiped(scenario.defender_owner),
         ticks: outcome.ticks,
@@ -825,19 +1191,43 @@ pub fn clear_outcome_at(scenario: &Scenario, dps_margin: f32) -> Option<ClearOut
 /// the over-match `dps_margin` is `params.over_power_margin` (when the bed's force is coordinated; a lone
 /// enemy still uses `1.0`), and the per-member cap is `min(params.member_energy, bed capacity)` — so the
 /// member_energy + over_power knobs drive the creep-clear bed exactly as they drive the structure bed.
-pub fn clear_outcome_with(scenario: &Scenario, params: &screeps_combat_decision::composition::CompositionParams) -> Option<ClearOutcome> {
+pub fn clear_outcome_with(
+    scenario: &Scenario,
+    params: &screeps_combat_decision::composition::CompositionParams,
+) -> Option<ClearOutcome> {
     let obj = &scenario.objectives[0];
     let (enemy_dps, enemy_hits, enemy_heal, coordinated) = enemy_force_of(scenario);
-    let dps_margin = if coordinated { params.over_power_margin } else { 1.0 };
+    let dps_margin = if coordinated {
+        params.over_power_margin
+    } else {
+        1.0
+    };
     let probe = params.member_energy.min(scenario.member_energy);
-    let budget = optimizer_ceiling_budget(DoctrineObjective::ClearCreeps, probe, scenario.onsite_budget);
-    let (assessment, required) = clear_force(vec![], enemy_dps, enemy_hits, enemy_heal, &budget, dps_margin, scenario.world.safe_mode_owner.is_some());
+    let budget = optimizer_ceiling_budget(
+        DoctrineObjective::ClearCreeps,
+        probe,
+        scenario.onsite_budget,
+    );
+    let (assessment, required) = clear_force(
+        vec![],
+        enemy_dps,
+        enemy_hits,
+        enemy_heal,
+        &budget,
+        dps_margin,
+        scenario.world.safe_mode_owner.is_some(),
+    );
     if !assessment.winnable {
         return None;
     }
     let comp = assemble_force(&required, probe)?;
     let spawn_cost = comp.estimated_cost(probe);
-    let (outcome, _) = run_managed_assault_with(scenario, obj, &comp, screeps_combat_decision::kite::SquadTacticParams::open_combat())?;
+    let (outcome, _) = run_managed_assault_with(
+        scenario,
+        obj,
+        &comp,
+        screeps_combat_decision::kite::SquadTacticParams::open_combat(),
+    )?;
     Some(ClearOutcome {
         cleared: outcome.stop == StopReason::SideWiped(scenario.defender_owner),
         ticks: outcome.ticks,
@@ -871,7 +1261,10 @@ impl CreepClearWins {
     }
     /// Build a creep-clear validator that sizes against the given knob set (the sweep injector).
     pub fn with_params(params: screeps_combat_decision::composition::CompositionParams) -> Self {
-        Self { params, ..Default::default() }
+        Self {
+            params,
+            ..Default::default()
+        }
     }
     /// Mean spawn cost per cleared bed (cheapest winning force; lower is better). 0 when nothing cleared.
     pub fn mean_cost_per_win(&self) -> f64 {
@@ -889,15 +1282,24 @@ impl Validator for CreepClearWins {
     }
     fn validate(&mut self, scenario: &Scenario) -> Verdict {
         // Default params reproduce the seed (`COORDINATED_DPS_MARGIN`); a swept params injects the knobs.
-        let outcome = if self.params == screeps_combat_decision::composition::CompositionParams::default() {
-            let (_, _, _, coordinated) = enemy_force_of(scenario);
-            let dps_margin = if coordinated { COORDINATED_DPS_MARGIN } else { 1.0 };
-            clear_outcome_at(scenario, dps_margin)
-        } else {
-            clear_outcome_with(scenario, &self.params)
-        };
+        let outcome =
+            if self.params == screeps_combat_decision::composition::CompositionParams::default() {
+                let (_, _, _, coordinated) = enemy_force_of(scenario);
+                let dps_margin = if coordinated {
+                    COORDINATED_DPS_MARGIN
+                } else {
+                    1.0
+                };
+                clear_outcome_at(scenario, dps_margin)
+            } else {
+                clear_outcome_with(scenario, &self.params)
+            };
         match outcome {
-            None => Verdict { pass: true, label: self.label().into(), detail: "deferred / unfieldable (excluded)".into() },
+            None => Verdict {
+                pass: true,
+                label: self.label().into(),
+                detail: "deferred / unfieldable (excluded)".into(),
+            },
             Some(o) => {
                 self.attempted += 1;
                 if o.cleared {
@@ -907,7 +1309,13 @@ impl Validator for CreepClearWins {
                 Verdict {
                     pass: o.cleared,
                     label: self.label().into(),
-                    detail: format!("sized→{} @ t{} ({} ranged, {} heal)", if o.cleared { "cleared" } else { "FAILED" }, o.ticks, o.ranged, o.heal),
+                    detail: format!(
+                        "sized→{} @ t{} ({} ranged, {} heal)",
+                        if o.cleared { "cleared" } else { "FAILED" },
+                        o.ticks,
+                        o.ranged,
+                        o.heal
+                    ),
                 }
             }
         }
@@ -916,7 +1324,9 @@ impl Validator for CreepClearWins {
 
 /// The recording + metadata for a SELF-PLAY engagement on `scenario` (both sides managed). Used by the
 /// single-file render + the split-file dashboard writer.
-pub fn self_play_replay_data(scenario: &Scenario) -> (screeps_combat_engine::CombatRecording, ReplayMeta) {
+pub fn self_play_replay_data(
+    scenario: &Scenario,
+) -> (screeps_combat_engine::CombatRecording, ReplayMeta) {
     let obj = &scenario.objectives[0];
     match run_self_play(scenario, obj) {
         Some((outcome, rec, _)) => {
@@ -927,12 +1337,24 @@ pub fn self_play_replay_data(scenario: &Scenario) -> (screeps_combat_engine::Com
                 StopReason::SideWiped(_) => "defender wiped",
                 StopReason::Timeout => "timed out",
             };
-            let meta = ReplayMeta::from_world_and_recording(&scenario.world, Some(&rec), &scenario.label, Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks)));
+            let meta = ReplayMeta::from_world_and_recording(
+                &scenario.world,
+                Some(&rec),
+                &scenario.label,
+                Some(format!(
+                    "self-play (both sides managed) → {result} @ t{}",
+                    outcome.ticks
+                )),
+            );
             (rec, meta)
         }
         None => (
             screeps_combat_engine::CombatRecording::new(),
-            ReplayMeta::from_world(&scenario.world, &scenario.label, Some("self-play — could not field the attacker".into())),
+            ReplayMeta::from_world(
+                &scenario.world,
+                &scenario.label,
+                Some("self-play — could not field the attacker".into()),
+            ),
         ),
     }
 }
@@ -952,18 +1374,29 @@ pub fn render_self_play_replay(scenario: &Scenario) -> String {
 pub fn run_self_play_bodies(
     scenario: &Scenario,
     att_bodies: &[Vec<screeps::Part>],
-) -> Option<(crate::harness::evaluate::EvalOutcome, screeps_combat_engine::CombatRecording, Vec<CreepId>)> {
+) -> Option<(
+    crate::harness::evaluate::EvalOutcome,
+    screeps_combat_engine::CombatRecording,
+    Vec<CreepId>,
+)> {
     let obj = &scenario.objectives[0];
     let mut world = scenario.world.clone();
     // Place the supplied attacker roster at the objective's entry (distinct, non-wall tiles), then run
     // the same both-sides-managed loop `run_self_play` uses.
     let att_ids = place_bodies_at_entry(&mut world, obj, att_bodies, scenario.attacker_owner)?;
-    let def_ids: Vec<CreepId> =
-        world.creeps.iter().filter(|c| c.is_alive() && c.owner == scenario.defender_owner).map(|c| c.id).collect();
+    let def_ids: Vec<CreepId> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner == scenario.defender_owner)
+        .map(|c| c.id)
+        .collect();
     let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos);
     let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids.clone(), obj.pos);
-    let mut conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> =
-        vec![Box::new(ObjectivesDestroyed(vec![obj.id])), Box::new(SideWiped(scenario.attacker_owner))];
+    let mut conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> = vec![
+        Box::new(ObjectivesDestroyed(vec![obj.id])),
+        Box::new(SideWiped(scenario.attacker_owner)),
+    ];
     if !def_ids.is_empty() {
         conditions.push(Box::new(SideWiped(scenario.defender_owner)));
     }
@@ -985,14 +1418,38 @@ pub fn run_self_play_bodies(
 /// Place already-built bodies (not a `SquadComposition`) as `owner` creeps at the objective's entry,
 /// reusing the collision-free ring placement of [`place_at_entry`]. Ids from 1 (attacker) never collide
 /// with the defender creeps (placed from 10_000). `None` ⇒ not enough free tiles near the entry.
-fn place_bodies_at_entry(world: &mut CombatWorld, obj: &Objective, bodies: &[Vec<screeps::Part>], owner: PlayerId) -> Option<Vec<CreepId>> {
-    let (ex, ey, rm) = (obj.entry.x().u8() as i32, obj.entry.y().u8() as i32, obj.entry.room_name());
-    const OFF: [(i32, i32); 9] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+fn place_bodies_at_entry(
+    world: &mut CombatWorld,
+    obj: &Objective,
+    bodies: &[Vec<screeps::Part>],
+    owner: PlayerId,
+) -> Option<Vec<CreepId>> {
+    let (ex, ey, rm) = (
+        obj.entry.x().u8() as i32,
+        obj.entry.y().u8() as i32,
+        obj.entry.room_name(),
+    );
+    const OFF: [(i32, i32); 9] = [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (-1, 0),
+        (0, -1),
+        (1, 1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+    ];
     let need = bodies.len();
     let tiles: Vec<(u8, u8)> = {
         let terrain = world.terrain_for(rm);
-        let mut taken: std::collections::HashSet<(u8, u8)> =
-            world.creeps.iter().filter(|c| c.pos.room_name() == rm).map(|c| (c.pos.x().u8(), c.pos.y().u8())).collect();
+        let mut taken: std::collections::HashSet<(u8, u8)> = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.pos.room_name() == rm)
+            .map(|c| (c.pos.x().u8(), c.pos.y().u8()))
+            .collect();
         let mut offsets: Vec<(i32, i32)> = OFF.to_vec();
         for r in 2..=12i32 {
             for dy in -r..=r {
@@ -1027,8 +1484,19 @@ fn place_bodies_at_entry(world: &mut CombatWorld, obj: &Objective, bodies: &[Vec
     for (i, body) in bodies.iter().enumerate() {
         let (x, y) = tiles[i];
         let id = i as u32 + 1;
-        let pos = Position::new(screeps::RoomCoordinate::new(x).unwrap(), screeps::RoomCoordinate::new(y).unwrap(), rm);
-        world.creeps.push(SimCreep { id, owner, pos, body: SimBody::unboosted(body), fatigue: 0 });
+        let pos = Position::new(
+            screeps::RoomCoordinate::new(x).unwrap(),
+            screeps::RoomCoordinate::new(y).unwrap(),
+            rm,
+        );
+        world.movement.creeps.push(SimCreep {
+            id,
+            owner,
+            pos,
+            body: SimBody::unboosted(body),
+            fatigue: 0,
+            carry_used: 0,
+        });
         ids.push(id);
     }
     Some(ids)
@@ -1037,7 +1505,10 @@ fn place_bodies_at_entry(world: &mut CombatWorld, obj: &Objective, bodies: &[Vec
 /// The recording + a one-line outcome descriptor for a self-play match with an EXPLICIT attacker roster
 /// (`att_bodies`). The corpus driver uses the descriptor (`objective destroyed` / `attacker wiped` /
 /// `defender wiped` / `timed out` / `could not field`) as the per-render outcome label.
-pub fn self_play_bodies_replay_data(scenario: &Scenario, att_bodies: &[Vec<screeps::Part>]) -> (screeps_combat_engine::CombatRecording, ReplayMeta, String) {
+pub fn self_play_bodies_replay_data(
+    scenario: &Scenario,
+    att_bodies: &[Vec<screeps::Part>],
+) -> (screeps_combat_engine::CombatRecording, ReplayMeta, String) {
     match run_self_play_bodies(scenario, att_bodies) {
         Some((outcome, rec, _)) => {
             let result = match outcome.stop {
@@ -1051,13 +1522,20 @@ pub fn self_play_bodies_replay_data(scenario: &Scenario, att_bodies: &[Vec<scree
                 &scenario.world,
                 Some(&rec),
                 &scenario.label,
-                Some(format!("self-play (both sides managed) → {result} @ t{}", outcome.ticks)),
+                Some(format!(
+                    "self-play (both sides managed) → {result} @ t{}",
+                    outcome.ticks
+                )),
             );
             (rec, meta, format!("{result} @ t{}", outcome.ticks))
         }
         None => (
             screeps_combat_engine::CombatRecording::new(),
-            ReplayMeta::from_world(&scenario.world, &scenario.label, Some("self-play — could not field the attacker".into())),
+            ReplayMeta::from_world(
+                &scenario.world,
+                &scenario.label,
+                Some("self-play — could not field the attacker".into()),
+            ),
             "could not field".into(),
         ),
     }
@@ -1065,7 +1543,10 @@ pub fn self_play_bodies_replay_data(scenario: &Scenario, att_bodies: &[Vec<scree
 
 /// Render an interactive single-file HTML replay of a self-play match with an explicit attacker roster,
 /// returning the HTML paired with the one-line outcome descriptor (for the corpus index).
-pub fn render_self_play_replay_bodies(scenario: &Scenario, att_bodies: &[Vec<screeps::Part>]) -> (String, String) {
+pub fn render_self_play_replay_bodies(
+    scenario: &Scenario,
+    att_bodies: &[Vec<screeps::Part>],
+) -> (String, String) {
     let (rec, meta, outcome) = self_play_bodies_replay_data(scenario, att_bodies);
     (replay_to_html(&rec, &meta), outcome)
 }
@@ -1083,11 +1564,23 @@ pub fn render_managed_replay(scenario: &Scenario) -> String {
                 StopReason::SideWiped(_) => "attackers wiped",
                 StopReason::Timeout => "held (timed out)",
             };
-            let meta = ReplayMeta::from_world_and_recording(&scenario.world, Some(&rec), &scenario.label, Some(format!("managed ranged assault → {result} @ t{}", outcome.ticks)));
+            let meta = ReplayMeta::from_world_and_recording(
+                &scenario.world,
+                Some(&rec),
+                &scenario.label,
+                Some(format!(
+                    "managed ranged assault → {result} @ t{}",
+                    outcome.ticks
+                )),
+            );
             replay_to_html(&rec, &meta)
         }
         None => {
-            let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some("managed assault — could not field at the entry".into()));
+            let meta = ReplayMeta::from_world(
+                &scenario.world,
+                &scenario.label,
+                Some("managed assault — could not field at the entry".into()),
+            );
             replay_to_html(&screeps_combat_engine::CombatRecording::new(), &meta)
         }
     }
@@ -1098,19 +1591,34 @@ pub fn render_managed_replay(scenario: &Scenario) -> String {
 /// else the ceiling falsifier), record the scripted siege, and render it with a verdict header. The
 /// full Generation → Evaluation(record) → Visualization chain in one call — for the operator's visual
 /// validation of outcomes + permutation variety.
-pub fn calibration_replay_data(scenario: &Scenario) -> (screeps_combat_engine::CombatRecording, ReplayMeta) {
+pub fn calibration_replay_data(
+    scenario: &Scenario,
+) -> (screeps_combat_engine::CombatRecording, ReplayMeta) {
     let obj = &scenario.objectives[0];
     let (comp, decision) = choose_fielded_comp(scenario, obj);
 
     let mut world = scenario.world.clone();
-    if !place_squad(&mut world, obj, &comp, scenario.attacker_owner, scenario.member_energy) {
-        let meta = ReplayMeta::from_world(&scenario.world, &scenario.label, Some(format!("{decision} — could not place on the bed")));
+    if !place_squad(
+        &mut world,
+        obj,
+        &comp,
+        scenario.attacker_owner,
+        scenario.member_energy,
+    ) {
+        let meta = ReplayMeta::from_world(
+            &scenario.world,
+            &scenario.label,
+            Some(format!("{decision} — could not place on the bed")),
+        );
         return (screeps_combat_engine::CombatRecording::new(), meta);
     }
     let attacker = scenario.attacker_owner;
     let defender = scenario.defender_owner;
     let (core_id, core_pos) = (obj.id, obj.pos);
-    let run_until = AnyOf(vec![Box::new(ObjectivesDestroyed(vec![core_id])), Box::new(SideWiped(attacker))]);
+    let run_until = AnyOf(vec![
+        Box::new(ObjectivesDestroyed(vec![core_id])),
+        Box::new(SideWiped(attacker)),
+    ]);
     let (outcome, rec) = evaluate_recorded(
         world,
         &mut |w| siege_intents(w, attacker, core_id, core_pos),
@@ -1124,7 +1632,12 @@ pub fn calibration_replay_data(scenario: &Scenario) -> (screeps_combat_engine::C
         StopReason::SideWiped(_) => "attackers wiped",
         StopReason::Timeout => "held (timed out)",
     };
-    let meta = ReplayMeta::from_world_and_recording(&scenario.world, Some(&rec), &scenario.label, Some(format!("{decision} → {result} @ t{}", outcome.ticks)));
+    let meta = ReplayMeta::from_world_and_recording(
+        &scenario.world,
+        Some(&rec),
+        &scenario.label,
+        Some(format!("{decision} → {result} @ t{}", outcome.ticks)),
+    );
     (rec, meta)
 }
 
@@ -1146,23 +1659,53 @@ fn max_role_parts(spec_of: impl Fn(u32) -> CombatBodySpec, energy: u32) -> u32 {
 /// verdict and the falsifier reference the same force): siege_quad grown to its practical max within
 /// the 8-member cap + the bed geometry (3 dismantlers + 5 healers), each at its per-member part cap.
 pub(crate) fn siege_ceiling(energy: u32) -> SquadComposition {
-    let work = max_role_parts(|n| CombatBodySpec { work: n, ..Default::default() }, energy);
-    let heal = max_role_parts(|n| CombatBodySpec { heal: n, ..Default::default() }, energy);
+    let work = max_role_parts(
+        |n| CombatBodySpec {
+            work: n,
+            ..Default::default()
+        },
+        energy,
+    );
+    let heal = max_role_parts(
+        |n| CombatBodySpec {
+            heal: n,
+            ..Default::default()
+        },
+        energy,
+    );
     let mut slots = Vec::new();
     if work > 0 {
         for _ in 0..CEILING_DISMANTLERS {
-            slots.push(SquadSlot { role: SquadRole::Dismantler, body_type: BodyType::Sized(CombatBodySpec { work, ..Default::default() }) });
+            slots.push(SquadSlot {
+                role: SquadRole::Dismantler,
+                body_type: BodyType::Sized(CombatBodySpec {
+                    work,
+                    ..Default::default()
+                }),
+            });
         }
     }
     if heal > 0 {
         for _ in 0..CEILING_HEALERS {
-            slots.push(SquadSlot { role: SquadRole::Healer, body_type: BodyType::Sized(CombatBodySpec { heal, ..Default::default() }) });
+            slots.push(SquadSlot {
+                role: SquadRole::Healer,
+                body_type: BodyType::Sized(CombatBodySpec {
+                    heal,
+                    ..Default::default()
+                }),
+            });
         }
     }
     // Derive the formation from the member count (ADR 0031 D14) — NOT Default(None), which on an 8-member
     // force would imply a single (0,0) layout that stacks every member on the anchor.
     let (formation_shape, formation_mode) = formation_for(slots.len());
-    SquadComposition { label: "Siege Ceiling".into(), slots, formation_shape, formation_mode, retreat_threshold: 0.3 }
+    SquadComposition {
+        label: "Siege Ceiling".into(),
+        slots,
+        formation_shape,
+        formation_mode,
+        retreat_threshold: 0.3,
+    }
 }
 
 #[cfg(test)]
@@ -1185,12 +1728,27 @@ mod invariant_tests {
         for scenario in crate::harness::generate::realistic_bases() {
             let obj = &scenario.objectives[0];
             let profile = derive_profile(&scenario.world, scenario.defender_owner, obj);
-            let budget = siege_ceiling(scenario.member_energy).force_budget(scenario.member_energy, scenario.onsite_budget);
+            let budget = siege_ceiling(scenario.member_energy)
+                .force_budget(scenario.member_energy, scenario.onsite_budget);
             let run = || {
-                let p = siege_doctrine_plan(profile.clone(), budget, scenario.member_energy, defender_force(&scenario));
-                (p.assessment, p.required, p.composition.map(|c| format!("{c:?}")))
+                let p = siege_doctrine_plan(
+                    profile.clone(),
+                    budget,
+                    scenario.member_energy,
+                    defender_force(&scenario),
+                );
+                (
+                    p.assessment,
+                    p.required,
+                    p.composition.map(|c| format!("{c:?}")),
+                )
             };
-            assert_eq!(run(), run(), "{}: emitter golden-output is stable", scenario.label);
+            assert_eq!(
+                run(),
+                run(),
+                "{}: emitter golden-output is stable",
+                scenario.label
+            );
         }
     }
 
@@ -1208,7 +1766,10 @@ mod invariant_tests {
                         assert!(
                             seen.insert((format!("{}", c.room), c.x, c.y)),
                             "stack in {} at tick {t}: two creeps on ({},{},{})",
-                            scenario.label, c.x, c.y, c.room
+                            scenario.label,
+                            c.x,
+                            c.y,
+                            c.room
                         );
                     }
                 }
