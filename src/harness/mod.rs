@@ -14,6 +14,9 @@ pub mod report;
 pub mod roster;
 pub mod scenario;
 pub mod terrain_import;
+/// U7 (combat-overhaul-plan.md §5, U-TOWER): the combined squad+tower fire scenario — the
+/// combined-fire-beats-either-alone win, MEASURED (`decide_towers` split-fire against a healy target).
+pub mod tower_fire;
 pub mod validate;
 pub mod visualize;
 
