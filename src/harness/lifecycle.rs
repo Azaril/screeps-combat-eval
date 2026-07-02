@@ -672,6 +672,7 @@ pub fn run_lifecycle_churn_spatial(
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
+            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by this driver
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -1111,6 +1112,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             // ADR 0035 D4 — the in-room LOST-FIGHT signal. Set only on arrival at a towered room with the
             // fixes enabled (the kernel then ABANDONS-with-backoff instead of mis-resolving the retreat).
             retreated_from_contact,
+            retreat_budget_exhausted: false, // REC-003 retreat bound — this driver exercises the D4 abandon, not the budget
         };
         // BUG B2 (fixed state): a defender that has GARRISONED its owned room (in-room, focus-less) and held
         // its lease until the budget elapsed without churning — a single stable generation. Detected when the
@@ -1865,6 +1867,7 @@ pub fn run_lifecycle_churn_extended(
             declaiming: false,
             reassign_available: false,
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
+            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by this driver
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -2339,6 +2342,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available,
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by the v1 reassign flow
+            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by the v1 reassign flow
         };
         match reconcile(snapshot) {
             ReconcileAction::Reassign { withdraw_old } => {
@@ -2504,6 +2508,7 @@ fn offense_candidate_to_objective(
         c.objective,
         &c.defense,
         None,
+        None, // no structure-threat channel on the offense gate beds (REC-013 — defense-side input)
         c.target_value,
         onsite_window,
         EnemyCoordination::Coordinated,
@@ -2641,6 +2646,7 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // offense reassign is v1.2+; this driver isolates production→engage
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
+            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by this driver
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -2879,6 +2885,7 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             declaiming,
             reassign_available: false,
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by the declaim flow
+            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by the declaim flow
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -3789,6 +3796,7 @@ mod tests {
             DoctrineObjective::ClearCreeps,
             &defense,
             Some(enemy),
+            None, // no structure-threat channel on this bed (REC-013)
             1e6,  // defense target_value (always-field)
             1500, // generous on-site window
             EnemyCoordination::Coordinated,
