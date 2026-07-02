@@ -2212,6 +2212,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
                     vec![RawObservation {
                         room: r,
                         hostile_bodies: &bodies,
+                        boost_multipliers: &[], // REC-067: unboosted default (empty ⇒ ×1.0 per body)
                         visible: true,
                         is_owned: false,
                         nearest_owned_dist: nearest,
