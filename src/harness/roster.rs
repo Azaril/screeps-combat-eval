@@ -181,6 +181,7 @@ fn predict_for(world: &CombatWorld, owner: PlayerId) -> EnginePrediction {
         enemy_safe_mode: false,
         engage_objective: EngageObjective::Destroy,
         enemy_stalled: false,
+        structure_stalled: false,
         drain_stance: false,
     };
     predict_engage(&view, centroid)
