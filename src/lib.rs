@@ -1040,9 +1040,9 @@ mod tests {
     // ── ADR 0036 — opportunistic structure targeting: a managed RANGED squad RAZES a hostile core ──
     // REGRESSION GUARD for the DECISION-crate raze path — NOT a RED→GREEN proof for S1's bot-crate wiring.
     // The engine-backed, bit-deterministic sim drives decide_squad_with_pathing → per-member combat/movement
-    // → resolve_tick (real damage). A force-sized ranged quad vs a BARE level-0 invader core (modeled as the
-    // engine's `Spawn` kind — the engine has no `InvaderCore`; the lifecycle harness already models a core as
-    // a hits-only spawn) closes range and razes it to 0.
+    // → resolve_tick (real damage). A force-sized ranged quad vs a BARE level-0 invader core (the engine's
+    // real `InvaderCore` kind — attackable, dismantle-immune; RANGED razes it exactly like the live game)
+    // closes range and razes it to 0.
     // SCOPE (honest): this exercises D1/D2 (struct_target_value pricing/ordering) + the pre-existing kernel
     // approach gradient. It does NOT — and structurally CANNOT — exercise S1's LIVE fixes D3 (bot-crate
     // `resolve_focus`, squad.rs) or D4 (bot-crate `should_drop_anchor_for_structure_siege`, squad_manager.rs):
@@ -1077,7 +1077,7 @@ mod tests {
         // once in range; budget 60 ticks covers the approach (start at x=10, range 15) + the raze.
         let core_pos = pos(25, 25);
         let mut b = ScenarioBuilder::empty(room());
-        let core_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 6000, 6000);
+        let core_id = b.structure(StructureKind::InvaderCore, Some(1), 25, 25, 6000, 6000);
         let mut world = b.build();
         for c in ranged_quad(0, 1, 10, 23, 4) {
             world.movement.creeps.push(c);
@@ -1175,7 +1175,7 @@ mod tests {
         // and the core is razed after. The scripted `tower_intents` fires + bleeds the defender's tower.
         let core_pos = pos(25, 25);
         let mut b = ScenarioBuilder::empty(room());
-        let core_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 6000, 6000);
+        let core_id = b.structure(StructureKind::InvaderCore, Some(1), 25, 25, 6000, 6000);
         // A finite-energy tower so the siege can neutralize the threat by draining it (300 energy ⇒ 30 shots).
         let tower_id = b.tower(1, 27, 25, 300);
         let mut world = b.build();

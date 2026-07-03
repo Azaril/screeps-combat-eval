@@ -106,6 +106,7 @@ fn kind_to_type(kind: StructureKind) -> StructureType {
         StructureKind::Tower => StructureType::Tower,
         StructureKind::Rampart => StructureType::Rampart,
         StructureKind::Wall => StructureType::Wall,
+        StructureKind::InvaderCore => StructureType::InvaderCore,
     }
 }
 fn kind_index(kind: StructureKind) -> u8 {
@@ -114,6 +115,7 @@ fn kind_index(kind: StructureKind) -> u8 {
         StructureKind::Tower => 1,
         StructureKind::Rampart => 2,
         StructureKind::Wall => 3,
+        StructureKind::InvaderCore => 4,
     }
 }
 
@@ -360,11 +362,12 @@ fn build_replay_json(
     frames_json.push(']');
 
     let shapes_json = format!(
-        "[{},{},{},{}]",
+        "[{},{},{},{},{}]",
         shape_json(StructureKind::Spawn),
         shape_json(StructureKind::Tower),
         shape_json(StructureKind::Rampart),
-        shape_json(StructureKind::Wall)
+        shape_json(StructureKind::Wall),
+        shape_json(StructureKind::InvaderCore)
     );
     (meta_json, frames_json, shapes_json)
 }
