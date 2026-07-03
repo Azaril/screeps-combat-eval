@@ -16,6 +16,11 @@ screeps-game-api = "0.23"
 screeps-combat-engine = { git = "https://github.com/Azaril/screeps-combat-engine" }
 screeps-combat-decision = { git = "https://github.com/Azaril/screeps-combat-decision" }
 screeps-combat-agent = { git = "https://github.com/Azaril/screeps-combat-agent" }
+# The shared spawn-queue policy kernel (`spawn_queue::{spawn_step, HomeLanes, QueuedSpawn}`) — the
+# lifecycle harness's K1, moved from combat-decision's `spawn_throughput` to the economy sim engine
+# (ADR 0040 §D8 #3, one implementation per EP-2.6). PATH dep: econ-engine is in-repo only (no
+# standalone repo yet; a git URL 404s even under [patch]) — flip to git + [patch] when minted.
+screeps-econ-engine = { path = "../screeps-econ-engine" }
 # The shared movement kernel — used directly for its seeded RNG (`rng::Rng`, ADR 0033); the scenario
 # generators previously carried a private copy. `rover` = `MoverConfig`, the rover-tunables unit the
 # combat-corpus movement adjudication sweeps (harness/mover_adjudication.rs; already unified on by

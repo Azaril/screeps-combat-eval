@@ -1,5 +1,6 @@
 //! Engine-backed lifecycle harness — the FORMING phase (ADR 0028). Drives the REAL forming kernels
-//! (`fielding` K3 → `spawn_throughput` K1 → `rally` K0) over a deterministic colony model + tick loop, so
+//! (`fielding` K3 → `spawn_queue` K1 (the shared home, ADR 0040 §D8 #3) → `rally` K0) over a
+//! deterministic colony model + tick loop, so
 //! the live "roster stuck at 3/5" failure and the combat-vs-economy spawn-priority lever are reproduced
 //! and TUNED offline instead of guessed on Docker. Pure (no `game::*`, no engine) — the engage handoff
 //! (place the formed roster → `ManagedSimSquad` → `resolve_tick`) is the next harness phase.
@@ -19,7 +20,7 @@
 use screeps::{Position, RoomCoordinate};
 use screeps_combat_decision::bodies::MoveProfile;
 use screeps_combat_decision::composition::SquadComposition;
-use screeps_combat_decision::spawn_throughput::{spawn_step, HomeLanes, QueuedSpawn};
+use screeps_econ_engine::spawn_queue::{spawn_step, HomeLanes, QueuedSpawn};
 use screeps_combat_decision::{fielding, rally};
 use std::collections::BTreeSet;
 
