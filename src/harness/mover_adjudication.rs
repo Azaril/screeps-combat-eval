@@ -58,6 +58,9 @@ pub fn ladder(avoid_friendly: u16) -> StuckThresholds {
         ((v as u32 * avoid_friendly as u32).div_ceil(d.avoid_friendly_creeps as u32)) as u16
     };
     StuckThresholds {
+        // The swept scalar moves the CADENCE and tier 1 together (the historical coupling this
+        // ladder was tuned under; `stuck_repath` decoupled them for per-request combat ladders).
+        stuck_repath: avoid_friendly.max(1),
         avoid_friendly_creeps: avoid_friendly.max(1),
         avoid_all_friendly_creeps: scale(d.avoid_all_friendly_creeps).max(avoid_friendly + 1),
         increase_ops: scale(d.increase_ops),
