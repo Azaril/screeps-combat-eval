@@ -124,11 +124,11 @@ fn defended_forming() -> ColonyFormingScenario {
             })
             .collect(),
         economy: EconomyPressure {
-            hauler: Some((75.0, 1000)),
+            hauler: Some((75_000, 1000)),
             miner: None,
             miner_period: 0,
         },
-        combat_priority: 87.5,
+        combat_priority: 87_500,
         per_member_cap: 12_900,
         budget_ticks: 4000,
         member_ttl: 1500,

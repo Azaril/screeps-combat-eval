@@ -33,21 +33,24 @@ pub struct Home {
 }
 
 /// The economy's per-tick spawn demand at EACH home — the lane contention combat competes against.
+/// Bids are MILLI-e/t (ADR 0040 §D2, M5b — the live `SpawnRequest.priority` currency, ×1000 of the
+/// old f32 bands; every relative ordering the bands encoded is preserved by construction).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EconomyPressure {
-    /// (priority, body_cost) for a HIGH hauler queued EVERY tick (logistics never sleeps).
-    pub hauler: Option<(f32, u32)>,
-    /// (priority, body_cost) for a CRITICAL miner queued every `miner_period` ticks.
-    pub miner: Option<(f32, u32)>,
+    /// (bid, body_cost) for a HIGH hauler queued EVERY tick (logistics never sleeps).
+    pub hauler: Option<(u32, u32)>,
+    /// (bid, body_cost) for a CRITICAL miner queued every `miner_period` ticks.
+    pub miner: Option<(u32, u32)>,
     pub miner_period: u32,
 }
 
-/// A colony forming scenario: who is being fielded, against what economy, at what priority.
+/// A colony forming scenario: who is being fielded, against what economy, at what bid.
 pub struct ColonyFormingScenario {
     pub composition: SquadComposition,
     pub homes: Vec<Home>,
     pub economy: EconomyPressure,
-    pub combat_priority: f32,
+    /// The forming squad's spawn bid — MILLI-e/t (M5b).
+    pub combat_priority: u32,
     pub per_member_cap: u32,
     pub budget_ticks: u32,
     /// Ticks a spawned member lives before dying of old age (CREEP_LIFE_TIME ≈ 1500). A member that ages
@@ -3646,7 +3649,7 @@ mod tests {
     fn forming(
         homes: usize,
         income: u32,
-        combat_priority: f32,
+        combat_priority: u32,
         member_ttl: u32,
         renew: bool,
         budget: u32,
@@ -3661,7 +3664,7 @@ mod tests {
                 })
                 .collect(),
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
@@ -3674,14 +3677,14 @@ mod tests {
     }
 
     /// The baseline 2-home, fresh-member (ttl 1500), no-renew scenario the original forming/lifecycle tests use.
-    fn scenario(combat_priority: f32) -> ColonyFormingScenario {
+    fn scenario(combat_priority: u32) -> ColonyFormingScenario {
         forming(2, 300, combat_priority, 1500, false, 1500)
     }
 
     #[test]
     fn medium_priority_combat_stalls_below_economy() {
         // Combat below the hauler (50 < 75) → the hauler takes every lane → the roster never completes.
-        match run_forming(&scenario(50.0)) {
+        match run_forming(&scenario(50_000)) {
             FormingOutcome::Stalled { filled, of } => assert!(
                 filled < of,
                 "MEDIUM combat stalls below economy ({filled}/{of})"
@@ -3695,7 +3698,7 @@ mod tests {
     #[test]
     fn above_economy_combat_completes_the_roster() {
         // Combat above the hauler (87.5 > 75) → wins lanes → the roster completes within budget.
-        match run_forming(&scenario(87.5)) {
+        match run_forming(&scenario(87_500)) {
             FormingOutcome::Completed { .. } => {}
             FormingOutcome::Stalled { filled, of } => {
                 panic!("above-economy combat should complete ({filled}/{of})")
@@ -3708,7 +3711,7 @@ mod tests {
     #[test]
     fn single_room_forms_the_roster() {
         // One home, fresh members (ttl 1500) → forms serially within budget.
-        match run_forming(&forming(1, 400, 87.5, 1500, false, 3000)) {
+        match run_forming(&forming(1, 400, 87_500, 1500, false, 3000)) {
             FormingOutcome::Completed { .. } => {}
             o => panic!("single-room above-economy should form, got {o:?}"),
         }
@@ -3717,8 +3720,8 @@ mod tests {
     #[test]
     fn multi_room_forms_faster_than_single_room() {
         // Parallel spawning across homes forms the same roster in fewer ticks than one serial home.
-        let single = run_forming(&forming(1, 400, 87.5, 1500, false, 3000));
-        let multi = run_forming(&forming(4, 400, 87.5, 1500, false, 3000));
+        let single = run_forming(&forming(1, 400, 87_500, 1500, false, 3000));
+        let multi = run_forming(&forming(4, 400, 87_500, 1500, false, 3000));
         match (single, multi) {
             (FormingOutcome::Completed { ticks: s }, FormingOutcome::Completed { ticks: m }) => {
                 assert!(
@@ -3735,7 +3738,7 @@ mod tests {
         // A slow single home where forming OUTLASTS a member's life (ttl scaled to 200 for a fast
         // deterministic test; the live equivalent is a form stalled >1500t by spawn contention). Early
         // members age out → drop back to unfilled → the roster never has the full set present at once.
-        match run_forming(&forming(1, 200, 87.5, 200, false, 4000)) {
+        match run_forming(&forming(1, 200, 87_500, 200, false, 4000)) {
             FormingOutcome::Stalled { filled, of } => {
                 assert!(filled < of, "early members die → stuck ({filled}/{of})")
             }
@@ -3749,7 +3752,7 @@ mod tests {
     fn renew_completes_the_stuck_form() {
         // The SAME stuck scenario, but the colony RENEWS the rallying roster (the missing live behavior) →
         // early members stay alive until the full squad forms → it completes.
-        match run_forming(&forming(1, 200, 87.5, 200, true, 4000)) {
+        match run_forming(&forming(1, 200, 87_500, 200, true, 4000)) {
             FormingOutcome::Completed { .. } => {}
             FormingOutcome::Stalled { filled, of } => {
                 panic!("renew should keep the roster alive + complete ({filled}/{of})")
@@ -3759,7 +3762,7 @@ mod tests {
 
     #[test]
     fn forming_is_deterministic() {
-        assert_eq!(run_forming(&scenario(87.5)), run_forming(&scenario(87.5)));
+        assert_eq!(run_forming(&scenario(87_500)), run_forming(&scenario(87_500)));
     }
 
     // ── The CHURN-MODELING lifecycle: the deep "fielded squad never reaches/engages" bug, offline ──
@@ -3826,11 +3829,11 @@ mod tests {
                 start_energy: 2400,
             }],
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 85.0, // SPAWN_PRIORITY_COMBAT_FORMING
+            combat_priority: 85_000, // SPAWN_BID_COMBAT_FORMING (milli-e/t)
             per_member_cap: 3000,
             budget_ticks: 6000,
             member_ttl: 1500,
@@ -3889,11 +3892,11 @@ mod tests {
                 start_energy: 2000,
             }],
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 85.0,
+            combat_priority: 85_000,
             per_member_cap: 3000,
             budget_ticks: 1500,
             member_ttl: 1500,
@@ -3937,11 +3940,11 @@ mod tests {
                 start_energy: 2000,
             }],
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 85.0,
+            combat_priority: 85_000,
             per_member_cap: 3000,
             budget_ticks: 1500,
             member_ttl: 1500,
@@ -4000,11 +4003,11 @@ mod tests {
                 },
             ],
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 85.0,
+            combat_priority: 85_000,
             per_member_cap: 3000,
             budget_ticks: 4000,
             member_ttl: 1500,
@@ -4168,11 +4171,11 @@ mod tests {
                 start_energy: 3000,
             }],
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 87.5,
+            combat_priority: 87_500,
             per_member_cap: 3000,
             budget_ticks: 2000,
             member_ttl: 1500,
@@ -4298,11 +4301,11 @@ mod tests {
                 },
             ],
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 87.5,
+            combat_priority: 87_500,
             per_member_cap: 3000,
             budget_ticks: 2000,
             member_ttl: 1500,
@@ -4481,11 +4484,11 @@ mod tests {
                 })
                 .collect(),
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 87.5,
+            combat_priority: 87_500,
             per_member_cap: 3000,
             budget_ticks: budget,
             member_ttl: 1500,
@@ -4769,7 +4772,7 @@ mod tests {
     #[test]
     fn above_economy_roster_forms_and_kills_an_undefended_core() {
         // The full chain: form above economy (completes) → travel → raze the 50k-hit core.
-        match run_lifecycle(&scenario(87.5)) {
+        match run_lifecycle(&scenario(87_500)) {
             LifecycleOutcome::Killed { .. } => {}
             other => {
                 panic!("expected the formed roster to kill the undefended core, got {other:?}")
@@ -4780,7 +4783,7 @@ mod tests {
     #[test]
     fn medium_priority_never_forms_so_never_engages() {
         // The form gate prevents a doomed engage: MEDIUM stalls forming → NeverFormed (no engage attempt).
-        match run_lifecycle(&scenario(50.0)) {
+        match run_lifecycle(&scenario(50_000)) {
             LifecycleOutcome::NeverFormed { .. } => {}
             other => panic!("MEDIUM should never form, got {other:?}"),
         }
@@ -4789,8 +4792,8 @@ mod tests {
     #[test]
     fn lifecycle_is_deterministic() {
         assert_eq!(
-            run_lifecycle(&scenario(87.5)),
-            run_lifecycle(&scenario(87.5))
+            run_lifecycle(&scenario(87_500)),
+            run_lifecycle(&scenario(87_500))
         );
     }
 
@@ -4810,11 +4813,11 @@ mod tests {
                 })
                 .collect(),
             economy: EconomyPressure {
-                hauler: Some((75.0, 1000)),
+                hauler: Some((75_000, 1000)),
                 miner: None,
                 miner_period: 0,
             },
-            combat_priority: 87.5, // above the hauler (75) → combat wins the lane
+            combat_priority: 87_500, // above the hauler (75) → combat wins the lane
             per_member_cap: 12_900,
             budget_ticks: 4000,
             member_ttl: 1500,
