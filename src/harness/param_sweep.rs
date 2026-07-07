@@ -133,6 +133,7 @@ fn defended_forming() -> ColonyFormingScenario {
         budget_ticks: 4000,
         member_ttl: 1500,
         renew: false,
+        escalating_completion: false,
     }
 }
 

@@ -21,6 +21,9 @@ screeps-combat-agent = { git = "https://github.com/Azaril/screeps-combat-agent" 
 # (ADR 0040 §D8 #3, one implementation per EP-2.6). PATH dep: econ-engine is in-repo only (no
 # standalone repo yet; a git URL 404s even under [patch]) — flip to git + [patch] when minted.
 screeps-econ-engine = { path = "../screeps-econ-engine" }
+# The economy spawn-policy kernel — the lifecycle harness prices the forming-completion bid via the
+# REAL `forming_completion_bid` (no duplicated escalation formula). PATH dep: in-repo only.
+screeps-econ-decision = { path = "../screeps-econ-decision" }
 # The shared movement kernel — used directly for its seeded RNG (`rng::Rng`, ADR 0033); the scenario
 # generators previously carried a private copy. `rover` = `MoverConfig`, the rover-tunables unit the
 # combat-corpus movement adjudication sweeps (harness/mover_adjudication.rs; already unified on by

@@ -61,6 +61,11 @@ pub struct ColonyFormingScenario {
     /// Whether the colony RENEWS aging present members while rallying (keeps the early roster alive until
     /// the full squad forms) — the missing live behavior. Renewing costs a home's spawn lane for the tick.
     pub renew: bool,
+    /// Price the forming bid via the REAL `forming_completion_bid` escalation (present members × ticks
+    /// forming) instead of the static `combat_priority`. Models the atomic-commit fix: a committed squad's
+    /// remaining slots climb from HIGH toward CRITICAL as their lifetime is wasted, so a roster tied with
+    /// economy still COMPLETES instead of stalling. `false` = the historical static-bid behavior.
+    pub escalating_completion: bool,
 }
 
 /// The result of running a forming scenario to completion or the tick budget.
@@ -130,13 +135,22 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
             return FormingOutcome::Completed { ticks: tick };
         }
 
+        // The forming bid: the REAL escalation (present members × ticks forming, priced on wasted
+        // lifetime) when enabled, else the static `combat_priority`. `present` and `tick` ARE the
+        // wasted-member-tick inputs — a committed-but-stalling roster climbs toward CRITICAL to finish.
+        let combat_bid = if s.escalating_completion {
+            screeps_econ_decision::spawn_policy::forming_completion_bid(present as u32, tick)
+        } else {
+            s.combat_priority
+        };
+
         // 3. Field the unfilled combat slots once (K3) — same body broadcast to every home.
         let combat = fielding::slots_to_spawn(
             &s.composition,
             &filled,
             best_capacity,
             s.per_member_cap,
-            s.combat_priority,
+            combat_bid,
             MoveProfile::Plains,
         );
 
@@ -3583,6 +3597,7 @@ pub fn run_defended_lifecycle_with_params(
         budget_ticks: s.budget_ticks,
         member_ttl: s.member_ttl,
         renew: s.renew,
+        escalating_completion: false,
     };
     let form_ticks = match run_forming(&forming_scenario) {
         FormingOutcome::Completed { ticks } => ticks,
@@ -3673,6 +3688,7 @@ mod tests {
             budget_ticks: budget,
             member_ttl,
             renew,
+            escalating_completion: false,
         }
     }
 
@@ -3702,6 +3718,41 @@ mod tests {
             FormingOutcome::Completed { .. } => {}
             FormingOutcome::Stalled { filled, of } => {
                 panic!("above-economy combat should complete ({filled}/{of})")
+            }
+        }
+    }
+
+    #[test]
+    fn tied_with_economy_combat_stalls_the_roster() {
+        // REGRESSION PIN. `SPAWN_BID_COMBAT_FORMING` was set == `SPAWN_BID_HIGH` (75_000) to stop combat
+        // starving the economy — but the hauler (also 75_000) is queued BEFORE combat, so combat loses
+        // every tie and the roster never completes: the live "creeps never reach rooms" root. The fix
+        // (a bounded completion boost for a COMMITTED squad's remaining slots) must move this to Completed.
+        match run_forming(&scenario(75_000)) {
+            FormingOutcome::Stalled { filled, of } => assert!(
+                filled < of,
+                "combat TIED with economy loses ties and stalls ({filled}/{of}) — the fix #1 regression"
+            ),
+            FormingOutcome::Completed { ticks } => {
+                panic!("expected the tie to stall (regression pin); it completed at tick {ticks}")
+            }
+        }
+    }
+
+    #[test]
+    fn escalating_completion_finishes_a_roster_tied_with_economy() {
+        // THE FIX. Same tie that stalls above (combat starts at HIGH == the 75_000 hauler), but now the
+        // bid ESCALATES via `forming_completion_bid` as the present members' lifetime is wasted — so the
+        // roster breaks through the economy tie and COMPLETES. Prices the waste, not a static band.
+        let mut s = scenario(75_000); // static combat_priority ignored when escalating
+        s.escalating_completion = true;
+        match run_forming(&s) {
+            FormingOutcome::Completed { ticks } => assert!(
+                ticks < s.budget_ticks,
+                "escalation completes the tied roster within budget (at tick {ticks})"
+            ),
+            FormingOutcome::Stalled { filled, of } => {
+                panic!("escalation must complete the tied roster; stalled at {filled}/{of}")
             }
         }
     }
@@ -3838,6 +3889,7 @@ mod tests {
             budget_ticks: 6000,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         }
     }
 
@@ -3901,6 +3953,7 @@ mod tests {
             budget_ticks: 1500,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         };
         // A long multi-room hop (> COMMITMENT_BUDGET) so the travel-phase lapse is exercised; uncontested →
         // the quorum gate releases the single member immediately.
@@ -3949,6 +4002,7 @@ mod tests {
             budget_ticks: 1500,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         };
         // Arrives quickly, but the room DTOs stay empty far past the lease window (> COMMITMENT_BUDGET) —
         // the live mapping/visibility timing hole. Pre-fix: no focus → lease lapses → LapsedOnArrival.
@@ -4012,6 +4066,7 @@ mod tests {
             budget_ticks: 4000,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         }
     }
 
@@ -4180,6 +4235,7 @@ mod tests {
             budget_ticks: 2000,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         }
     }
 
@@ -4310,6 +4366,7 @@ mod tests {
             budget_ticks: 2000,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         }
     }
 
@@ -4493,6 +4550,7 @@ mod tests {
             budget_ticks: budget,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         }
     }
 
@@ -4822,6 +4880,7 @@ mod tests {
             budget_ticks: 4000,
             member_ttl: 1500,
             renew: false,
+            escalating_completion: false,
         }
     }
 
