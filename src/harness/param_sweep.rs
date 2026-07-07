@@ -134,6 +134,7 @@ fn defended_forming() -> ColonyFormingScenario {
         member_ttl: 1500,
         renew: false,
         escalating_completion: false,
+        objective_rate_milli: 0,
     }
 }
 

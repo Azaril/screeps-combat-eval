@@ -61,11 +61,14 @@ pub struct ColonyFormingScenario {
     /// Whether the colony RENEWS aging present members while rallying (keeps the early roster alive until
     /// the full squad forms) — the missing live behavior. Renewing costs a home's spawn lane for the tick.
     pub renew: bool,
-    /// Price the forming bid via the REAL `forming_completion_bid` escalation (present members × ticks
-    /// forming) instead of the static `combat_priority`. Models the atomic-commit fix: a committed squad's
-    /// remaining slots climb from HIGH toward CRITICAL as their lifetime is wasted, so a roster tied with
-    /// economy still COMPLETES instead of stalling. `false` = the historical static-bid behavior.
+    /// Price the forming bid via the REAL `forming_completion_bid(objective_rate_milli)` (ADR 0042 the
+    /// R_net model) instead of the static `combat_priority`: the bid orders the objective's completed
+    /// value within the reserved band `[HIGH, CRITICAL)`, so a positive-value roster tied with economy
+    /// COMPLETES (bids above the hauler) while a zero-value one stays at HIGH. `false` = static bid.
     pub escalating_completion: bool,
+    /// The objective's completed rate `R_O = round(p_win_completed·value_e·1000/est_ticks)` in milli-e/t
+    /// (the bot computes it live; the harness supplies it directly). Only read when `escalating_completion`.
+    pub objective_rate_milli: u32,
 }
 
 /// The result of running a forming scenario to completion or the tick budget.
@@ -138,8 +141,9 @@ pub fn run_forming(s: &ColonyFormingScenario) -> FormingOutcome {
         // The forming bid: the REAL escalation (present members × ticks forming, priced on wasted
         // lifetime) when enabled, else the static `combat_priority`. `present` and `tick` ARE the
         // wasted-member-tick inputs — a committed-but-stalling roster climbs toward CRITICAL to finish.
+        // ADR 0042 (R_net): the forming bid now orders the objective's completed VALUE, not waited-time.
         let combat_bid = if s.escalating_completion {
-            screeps_econ_decision::spawn_policy::forming_completion_bid(present as u32, tick)
+            screeps_econ_decision::spawn_policy::forming_completion_bid(s.objective_rate_milli)
         } else {
             s.combat_priority
         };
@@ -3598,6 +3602,7 @@ pub fn run_defended_lifecycle_with_params(
         member_ttl: s.member_ttl,
         renew: s.renew,
         escalating_completion: false,
+        objective_rate_milli: 0,
     };
     let form_ticks = match run_forming(&forming_scenario) {
         FormingOutcome::Completed { ticks } => ticks,
@@ -3689,6 +3694,7 @@ mod tests {
             member_ttl,
             renew,
             escalating_completion: false,
+            objective_rate_milli: 0,
         }
     }
 
@@ -3740,19 +3746,36 @@ mod tests {
     }
 
     #[test]
-    fn escalating_completion_finishes_a_roster_tied_with_economy() {
-        // THE FIX. Same tie that stalls above (combat starts at HIGH == the 75_000 hauler), but now the
-        // bid ESCALATES via `forming_completion_bid` as the present members' lifetime is wasted — so the
-        // roster breaks through the economy tie and COMPLETES. Prices the waste, not a static band.
-        let mut s = scenario(75_000); // static combat_priority ignored when escalating
+    fn value_priced_completion_finishes_a_roster_tied_with_economy() {
+        // THE FIX (ADR 0042 R_net). Same tie that stalls with a static HIGH bid, but now the forming
+        // bid is priced on the objective's COMPLETED VALUE: a positive-value objective (R_O > 0) bids
+        // ABOVE the HIGH economy floor via the reserved band, so it out-bids the 75_000 hauler and the
+        // roster COMPLETES. Value, not waited-time, wins the lane.
+        let mut s = scenario(0); // static combat_priority ignored when escalating
         s.escalating_completion = true;
+        s.objective_rate_milli = 10_000; // a real objective's completed rate ⇒ bid 85_000 > the hauler
         match run_forming(&s) {
             FormingOutcome::Completed { ticks } => assert!(
                 ticks < s.budget_ticks,
-                "escalation completes the tied roster within budget (at tick {ticks})"
+                "a valued objective's bid completes the tied roster within budget (at tick {ticks})"
             ),
             FormingOutcome::Stalled { filled, of } => {
-                panic!("escalation must complete the tied roster; stalled at {filled}/{of}")
+                panic!("a valued objective must complete the tied roster; stalled at {filled}/{of}")
+            }
+        }
+    }
+
+    #[test]
+    fn zero_value_objective_does_not_preempt_economy() {
+        // A zero-value objective (R_O == 0) bids exactly HIGH — it TIES the economy and never wins a
+        // lane, so it does NOT preempt income to form a worthless squad. The give-up (Phase 2) retires it.
+        let mut s = scenario(0);
+        s.escalating_completion = true;
+        s.objective_rate_milli = 0;
+        match run_forming(&s) {
+            FormingOutcome::Stalled { .. } => {}
+            FormingOutcome::Completed { ticks } => {
+                panic!("a zero-value objective must not preempt economy to complete (did at tick {ticks})")
             }
         }
     }
@@ -3890,6 +3913,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         }
     }
 
@@ -3954,6 +3978,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         };
         // A long multi-room hop (> COMMITMENT_BUDGET) so the travel-phase lapse is exercised; uncontested →
         // the quorum gate releases the single member immediately.
@@ -4003,6 +4028,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         };
         // Arrives quickly, but the room DTOs stay empty far past the lease window (> COMMITMENT_BUDGET) —
         // the live mapping/visibility timing hole. Pre-fix: no focus → lease lapses → LapsedOnArrival.
@@ -4067,6 +4093,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         }
     }
 
@@ -4236,6 +4263,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         }
     }
 
@@ -4367,6 +4395,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         }
     }
 
@@ -4551,6 +4580,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         }
     }
 
@@ -4881,6 +4911,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
+            objective_rate_milli: 0,
         }
     }
 
