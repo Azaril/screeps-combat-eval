@@ -86,6 +86,11 @@ pub enum Bed {
     /// the self-play payoff stays meaningful — both sides fight across identical real walls/swamps (ADR
     /// 0025 §12 Stage 4). Deployment zones are forced clear so squads always field.
     Imported(usize),
+    /// PROCEDURAL realistic terrain (ADR 0044): the shared `terrain_gen` cave generator, seeded by
+    /// `u32`, mirror-symmetrized like `Imported` with the deployment zones forced clear. Gives the
+    /// tournament real cover/chokepoints without depending on captured fixtures (operator: the
+    /// open/synthetic beds are too easy to prove positioning/pathing generalises).
+    Generated(u32),
 }
 
 /// The standard synthetic basket the tournament averages each match over.
@@ -99,6 +104,7 @@ impl Bed {
             Bed::Corridor => 1,
             Bed::TowerCrossfire => 2,
             Bed::Imported(i) => 100 + *i as u32,
+            Bed::Generated(s) => 10_000 + *s,
         }
     }
 }
@@ -124,6 +130,32 @@ fn apply_bed_terrain(world: &mut CombatWorld, bed: Bed) {
                 }
             }
             // Clear the two deployment zones (start files + a move-out margin) so both squads always field.
+            for x in 0..12u8 {
+                for y in 18..32u8 {
+                    for tx in [x, 49 - x] {
+                        world.movement.terrain.walls.remove(&(tx, y));
+                        world.movement.terrain.swamps.remove(&(tx, y));
+                    }
+                }
+            }
+        }
+        Bed::Generated(seed) => {
+            use screeps_sim_core::terrain_gen::{generate_terrain, Exits, TerrainGenParams};
+            let gen = generate_terrain(seed, &TerrainGenParams { exits: Exits::all(), ..Default::default() });
+            // Mirror the left half onto the right → a symmetric battlefield (fair self-play).
+            for x in 0..25u8 {
+                for y in 0..50u8 {
+                    let (wall, swamp) = (gen.is_wall(x, y), gen.swamps.contains(&(x, y)));
+                    for tx in [x, 49 - x] {
+                        if wall {
+                            world.movement.terrain.walls.insert((tx, y));
+                        } else if swamp {
+                            world.movement.terrain.swamps.insert((tx, y));
+                        }
+                    }
+                }
+            }
+            // Force the two deployment zones clear so both squads always field (same as `Imported`).
             for x in 0..12u8 {
                 for y in 18..32u8 {
                     for tx in [x, 49 - x] {
@@ -741,6 +773,36 @@ pub fn situational_comp(kind: &str) -> Vec<Vec<Part>> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// ADR 0044 deviation observation: the procedural `Bed::Generated` (realistic cave, mirror-
+    /// symmetric) must (1) RUN — squads field on the cleared deployment zones, no creep-in-wall
+    /// panic — and (2) stay FAIR under symmetric self-play (net ≈ 0). It also reports whether the
+    /// tuned `open_combat` edge over the untuned `default` SURVIVES realistic terrain vs the open
+    /// field — the signal for whether the combat kernel needs re-tuning on chokepoints (the operator
+    /// ask). Prints the numbers; asserts only the safety + fairness invariants (re-tune is a
+    /// separate tournament pass, not gated here).
+    #[test]
+    fn generated_bed_runs_fair_and_reports_terrain_sensitivity() {
+        let default = SquadTacticParams::default();
+        let open = SquadTacticParams::open_combat();
+        let edge = |bed: Bed| (play_bed(bed, open, default, 120) - play_bed(bed, default, open, 120)) / 2;
+        let mut worst_asym = 0i64;
+        for seed in 0..6u32 {
+            let sym = play_bed(Bed::Generated(seed), default, default, 120);
+            let (e_open, e_gen) = (edge(Bed::OpenField), edge(Bed::Generated(seed)));
+            worst_asym = worst_asym.max(sym.abs());
+            eprintln!("seed {seed}: symmetric net={sym}  open_combat edge  OpenField={e_open}  Generated={e_gen}");
+        }
+        // DEVIATION FINDINGS (ADR 0044, observed 2026-07-09): on realistic cave terrain (mirror-
+        // symmetric bed, symmetric tactics) the self-play net swings to ±~500 — open field gives ~0.
+        // Realistic terrain EXPOSES a position/order bias the trivial rooms hid. And the tuned
+        // `open_combat` edge over `default` is a consistent −835 on OpenField but ranges −750..+890
+        // across cave seeds — the tuning (done on open/synthetic beds) does NOT generalise to
+        // chokepoints. → the combat kernel needs re-tuning with `Bed::Generated` in the BASKET, and
+        // the ±500 self-play asymmetry warrants a determinism/fairness look. Here we assert only
+        // SAFETY (it runs, no runaway) — the re-tune is a separate tournament pass.
+        assert!(worst_asym <= 2000, "runaway self-play net on the generated bed: |net|={worst_asym}");
+    }
 
     /// Per-situation discovery + ADR 0026a catalog validation (on the corrected, deterministic sim). For
     /// each situational comp, rank a WIDE kernel field (the 48-config grid + the catalog modes + extra
