@@ -681,6 +681,11 @@ pub fn run_lifecycle_churn_spatial(
             wiped: false,
             has_focus: false,
             engaged_once,
+            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
+            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
+            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
+            // scenario would set this true.
+            vacuous_clear: false,
             in_target_room,
             has_members,
             forming,
@@ -1119,6 +1124,11 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             wiped: false,
             has_focus,
             engaged_once,
+            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
+            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
+            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
+            // scenario would set this true.
+            vacuous_clear: false,
             in_target_room,
             has_members,
             forming,
@@ -1876,6 +1886,11 @@ pub fn run_lifecycle_churn_extended(
             wiped: false,
             has_focus: false,
             engaged_once,
+            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
+            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
+            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
+            // scenario would set this true.
+            vacuous_clear: false,
             in_target_room,
             has_members,
             forming,
@@ -2352,6 +2367,11 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             wiped: false,
             has_focus,
             engaged_once,
+            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
+            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
+            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
+            // scenario would set this true.
+            vacuous_clear: false,
             in_target_room,
             has_members,
             forming,
@@ -2656,6 +2676,11 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             wiped: false,
             has_focus: in_target_room,
             engaged_once,
+            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
+            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
+            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
+            // scenario would set this true.
+            vacuous_clear: false,
             in_target_room,
             has_members: true,
             forming,
@@ -2895,6 +2920,10 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             wiped: false,
             has_focus: false, // a quiet derelict room — a declaimer never has a combat focus
             engaged_once: false, // a declaimer never enters combat
+            // D28: even if the derelict room is live-visible and empty, `declaiming` blocks the
+            // resolve in the kernel — but keep this false so the declaim hold is pinned by the
+            // `declaiming` guard alone, not masked by the vacuous-clear evidence being absent.
+            vacuous_clear: false,
             in_target_room,
             has_members: true,
             forming,
