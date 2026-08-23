@@ -469,6 +469,17 @@ pub fn run_stronghold_assault(
     level: u8,
     boost_max_tier: screeps_combat_decision::bodies::BoostTier,
 ) -> RungOutcome {
+    run_stronghold_assault_recorded(scenario, level, boost_max_tier).0
+}
+
+/// [`run_stronghold_assault`] returning the tick RECORDING too (`None` when the rung never fought —
+/// Deferred/Unfieldable) — feeds the HTML replay writer (`write_stronghold_replays`) so the
+/// operator can WATCH each gauntlet rung.
+pub fn run_stronghold_assault_recorded(
+    scenario: &Scenario,
+    level: u8,
+    boost_max_tier: screeps_combat_decision::bodies::BoostTier,
+) -> (RungOutcome, Option<screeps_combat_engine::CombatRecording>) {
     use crate::harness::evaluate::{evaluate_recorded, AnyOf, ObjectivesDestroyed, SideWiped, StopReason};
     use crate::harness::validate::{merge_intents, place_at_entry};
     use screeps_combat_agent::squad::ManagedSimSquad;
@@ -541,12 +552,12 @@ pub fn run_stronghold_assault(
         false,
         &params,
     ) else {
-        return RungOutcome::Deferred;
+        return (RungOutcome::Deferred, None);
     };
 
     let mut world = scenario.world.clone();
     let Some(att_ids) = place_at_entry(&mut world, obj, &comp, scenario.attacker_owner, scenario.member_energy) else {
-        return RungOutcome::Unfieldable;
+        return (RungOutcome::Unfieldable, None);
     };
     let def_ids: Vec<u32> = defenders.iter().map(|c| c.id).collect();
 
@@ -562,7 +573,7 @@ pub fn run_stronghold_assault(
         conditions.push(Box::new(SideWiped(scenario.defender_owner)));
     }
     let run_until = AnyOf(conditions);
-    let (outcome, _rec) = evaluate_recorded(
+    let (outcome, rec) = evaluate_recorded(
         world,
         &mut |w| att.step(w),
         &mut |w, intents| {
@@ -573,7 +584,7 @@ pub fn run_stronghold_assault(
         &run_until,
         scenario.onsite_budget,
     );
-    match outcome.stop {
+    let rung = match outcome.stop {
         StopReason::ObjectivesComplete => RungOutcome::Killed { ticks: outcome.ticks },
         StopReason::SideWiped(side) if side == scenario.attacker_owner => RungOutcome::AttackerWiped { ticks: outcome.ticks },
         StopReason::SideWiped(_) | StopReason::ControllerNeutralized => RungOutcome::Killed { ticks: outcome.ticks },
@@ -583,7 +594,8 @@ pub fn run_stronghold_assault(
             });
             RungOutcome::Timeout { reached }
         }
-    }
+    };
+    (rung, Some(rec))
 }
 
 /// The objective structure's current hits from the world (falls back to the stronghold core pool).
@@ -800,6 +812,70 @@ mod tests {
                 println!("  {:>28}  attacker@{:?}  → {:?}", s.label, tier, out);
             }
         }
+    }
+
+    /// OPERATOR VIEWER — write interactive HTML replays of every gauntlet rung that actually
+    /// FIGHTS (Deferred/Unfieldable rungs have no fight to show; they appear in the index line
+    /// instead) to `target/replays/stronghold/`, plus an `index.html` table of every rung's
+    /// verdict. Open the index in a browser and click through. Run:
+    /// `cargo test --release -p screeps-combat-eval --lib write_stronghold_replays -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn write_stronghold_replays() {
+        use crate::harness::visualize::{replay_to_html, ReplayMeta};
+        let dir = "target/replays/stronghold";
+        let _ = std::fs::create_dir_all(dir);
+        let mut index: Vec<String> = Vec::new();
+        let mut emit = |scenario: &Scenario, level: u8, tier: BoostTier| {
+            let (out, rec) = run_stronghold_assault_recorded(scenario, level, tier);
+            let name = format!("{}-@{:?}", scenario.label.replace(['#', ':'], "_"), tier);
+            let row = match &rec {
+                Some(rec) => {
+                    let meta = ReplayMeta::from_world_and_recording(
+                        &scenario.world,
+                        Some(rec),
+                        &scenario.label,
+                        Some(format!("attacker@{tier:?} → {out:?}")),
+                    );
+                    let file = format!("{name}.html");
+                    std::fs::write(format!("{dir}/{file}"), replay_to_html(rec, &meta)).unwrap();
+                    format!("<tr><td><a href=\"{file}\">{}</a></td><td>{tier:?}</td><td>{out:?}</td></tr>", scenario.label)
+                }
+                None => format!("<tr><td>{}</td><td>{tier:?}</td><td>{out:?} (no fight — not fielded)</td></tr>", scenario.label),
+            };
+            index.push(row);
+            println!("  {:>28}  @{:?}  → {:?}", scenario.label, tier, out);
+        };
+        for &(terrain, multi) in &[
+            (StrongholdTerrain::Open, false),
+            (StrongholdTerrain::Chokepoint, false),
+            (StrongholdTerrain::Chokepoint, true),
+        ] {
+            for level in 1..=5u8 {
+                for &tier in &[BoostTier::T0, BoostTier::T3] {
+                    let s = StrongholdScenario::build(level, terrain, multi, 1);
+                    emit(&s, level, tier);
+                }
+            }
+        }
+        for grade in 1..=4u8 {
+            for &tier in &[BoostTier::T0, BoostTier::T3] {
+                let s = BorderGauntlet::build(grade, 3);
+                emit(&s, 1, tier);
+            }
+        }
+        let html = format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Stronghold gauntlet replays</title>\
+             <style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse}}\
+             td,th{{border:1px solid #ccc;padding:.35rem .7rem}}tr:nth-child(even){{background:#f6f6f6}}</style>\
+             <h1>Stronghold + border gauntlet — replay index</h1>\
+             <p>Rows with links fought (click to watch); rows without were Deferred by the sizing oracle \
+             (the honest pre-fight verdict) or unfieldable.</p>\
+             <table><tr><th>rung</th><th>attacker</th><th>verdict</th></tr>{}</table>",
+            index.join("\n")
+        );
+        std::fs::write(format!("{dir}/index.html"), html).unwrap();
+        println!("\nREPLAY INDEX: {}/index.html", std::fs::canonicalize(dir).unwrap().display());
     }
 
     /// Rung TRACE instrument — tick-by-tick positions + hp + squad state for ONE gauntlet rung.
