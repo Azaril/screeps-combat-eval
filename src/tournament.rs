@@ -346,6 +346,28 @@ pub fn realistic_comp_basket(n_comps: u32, energy: u32) -> Vec<(Bed, Vec<Vec<Par
     out
 }
 
+/// The R19 re-tune basket (ADR 0044 cross-sim finding, WS-4): [`realistic_comp_basket`] PLUS seeded
+/// procedural `Bed::Generated` CAVE beds — the chokepoint-heavy regime where the open-terrain tuning
+/// was shown NOT to generalize (`open_combat` edge −750..+890 across cave seeds vs a consistent −835
+/// on OpenField). Every kernel-parameter tuning pass MUST grade over this basket, not
+/// [`comp_basket`]/[`realistic_comp_basket`] alone, so the adopted parameters are proven across open,
+/// corridor, crossfire, real-terrain AND procedural-cave regimes. (The ±500 raw self-play asymmetry
+/// generated terrain exposes is start-side VARIANCE, not tuning bias — [`payoff_over_comps`] runs both
+/// side assignments and cancels it by construction.)
+pub fn chokepoint_comp_basket(n_comps: u32, energy: u32) -> Vec<(Bed, Vec<Vec<Part>>)> {
+    let mut out = realistic_comp_basket(n_comps, energy);
+    // The same six seeds the ADR 0044 deviation observation graded (0..6) — reproducible, and spanning
+    // the edge spread that motivated the re-tune.
+    for seed in 0..6u32 {
+        for s in 0..n_comps {
+            let mut rng = Rng::seeded(s.wrapping_mul(131).wrapping_add(seed).wrapping_add(9_000));
+            let n = rng.range(2, 5) as u8;
+            out.push((Bed::Generated(seed), random_squad(&mut rng, energy, n)));
+        }
+    }
+    out
+}
+
 /// The §12 Stage 4 **realistic base-attack set**: the `Raze` scenarios from the foreman-planned bases +
 /// the imported rooms (the "destroy the base" lens over real terrain + real foreman layouts). `Raze` is
 /// the breach-relevant objective; the other kinds exercise plumbing, not positioning under fire.
@@ -1220,6 +1242,77 @@ mod tests {
         println!("{}", base_attack_report(&pop, &ranking));
         let (best, score) = ranking[0];
         println!("[ADR0025 §12 realistic base-attack] {} real bases (foreman + imported, Raze/Breach); best assaulter = {} ({:+})", bases.len(), pop[best].name, score);
+    }
+
+    /// WS-4 / R19 (ADR 0044) — the CHOKEPOINT RE-TUNE pass. Ranks the fine kernel grid (48 configs)
+    /// + the catalog modes against the SHIPPED default over [`chokepoint_comp_basket`] (synthetic +
+    /// imported real terrain + 6 procedural cave seeds), reporting each config's payoff PER REGIME
+    /// (synthetic / imported / generated) and ranking by MIN-over-regimes (maximin — the R19
+    /// criterion is GENERALIZATION: a config must not buy its open-field edge with a chokepoint
+    /// regression, which a net average could hide). The shipped default scores 0 by construction;
+    /// `open_combat`'s row reproduces the R19 finding for reference. Run:
+    /// `cargo test --release -p screeps-combat-eval --lib r19_chokepoint_retune -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn r19_chokepoint_retune() {
+        let baseline = SquadTacticParams::default();
+        let ticks = TournamentBudget::Thorough.ticks();
+        let basket = chokepoint_comp_basket(3, 5600);
+        let regime_of = |bed: &Bed| -> usize {
+            match bed {
+                Bed::OpenField | Bed::Corridor | Bed::TowerCrossfire => 0, // synthetic
+                Bed::Imported(_) => 1,
+                Bed::Generated(_) => 2,
+            }
+        };
+        let split: Vec<Vec<(Bed, Vec<Vec<Part>>)>> = (0..3)
+            .map(|r| basket.iter().filter(|(b, _)| regime_of(b) == r).cloned().collect())
+            .collect();
+        eprintln!(
+            "basket: {} synthetic / {} imported / {} generated entries",
+            split[0].len(),
+            split[1].len(),
+            split[2].len()
+        );
+
+        let mut field = kernel_population_grid();
+        field.extend(catalog_strategies());
+        field.push(Strategy { name: "open_combat", tactics: SquadTacticParams::open_combat() });
+
+        let scored: Vec<(usize, [i64; 3])> = (0..field.len())
+            .into_par_iter()
+            .map(|i| {
+                let per: [i64; 3] = std::array::from_fn(|r| {
+                    payoff_over_comps(&split[r], field[i].tactics, baseline, ticks)
+                });
+                (i, per)
+            })
+            .collect();
+        let mut ranked: Vec<(usize, [i64; 3], i64, i64)> = scored
+            .into_iter()
+            .map(|(i, per)| {
+                let min = *per.iter().min().unwrap();
+                let mean = per.iter().sum::<i64>() / 3;
+                (i, per, min, mean)
+            })
+            .collect();
+        // Maximin first (generalization), then mean (strength), then name (deterministic).
+        ranked.sort_by(|a, b| (b.2, b.3).cmp(&(a.2, a.3)).then(field[a.0].name.cmp(field[b.0].name)));
+
+        println!("\n=== R19 chokepoint re-tune: payoff vs shipped default (0) — [synthetic, imported, generated] min mean ===");
+        for &(i, per, min, mean) in ranked.iter().take(12) {
+            println!("  {:>16} [{:+6} {:+6} {:+6}]  min {:+6}  mean {:+6}", field[i].name, per[0], per[1], per[2], min, mean);
+        }
+        if let Some(&(i, per, min, mean)) = ranked.iter().find(|&&(i, ..)| field[i].name == "open_combat") {
+            println!("  reference open_combat [{:+} {:+} {:+}] min {:+} mean {:+} (the R19 spread) — rank {}",
+                per[0], per[1], per[2], min, mean,
+                ranked.iter().position(|&(j, ..)| j == i).unwrap() + 1);
+        }
+        let best = ranked[0];
+        println!(
+            "[WS-4 R19] adoption candidate = {} (maximin {:+}, mean {:+}); shipped default = 0 baseline",
+            field[best.0].name, best.2, best.3
+        );
     }
 
     /// SIM DETERMINISM regression fence (ADR 0026 follow-on). The combat sim must give the SAME result
