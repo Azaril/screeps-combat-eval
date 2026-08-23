@@ -751,20 +751,22 @@ mod tests {
         );
     }
 
-    /// The CHECKED-IN floor — the HONEST current baseline (2026-08-23), pinned so any change is
-    /// LOUD in either direction:
-    /// - L1 DEFERS: with the PREFERRED_MEMBER_ENERGY=3000 clamp, the T0 heal ceiling cannot
+    /// The CHECKED-IN floor — the HONEST current baseline, pinned so any change is LOUD in either
+    /// direction:
+    /// - L1@T0 DEFERS: with the PREFERRED_MEMBER_ENERGY=3000 clamp, the T0 heal ceiling cannot
     ///   out-sustain even one point-blank stronghold tower — which is exactly why live has only
     ///   ever killed towerless (level-0) cores. The gauntlet quantified the gap.
-    /// - L1 FIELDS (the boost pipeline's unlock — the sizing accepts the fight); the combat
-    ///   outcome itself is graded by the `stronghold_gauntlet` dashboard, not gated here (current:
-    ///   members are picked off arriving staggered — the tactical follow-up workstream).
+    /// - L1-open@T3 is **KILLED** (Phase 4.5 item 1's acceptance bar, achieved 2026-08-24 by the
+    ///   cohesion-under-fire kernel work: deliverable-heal advance gating + the siege risk-currency
+    ///   floor + lockstep healer advertising + evidence-gated heal triage — current run: 151 ticks,
+    ///   ZERO members lost). Chokepoint/multi-room rungs stay dashboard-graded (`stronghold_gauntlet`):
+    ///   the corridor trickle-in commit window and the border crossing are the open follow-ups.
     #[test]
-    fn stronghold_floor_t0_defers_t3_fields() {
+    fn stronghold_floor_t0_defers_t3_kills_open() {
         let s = StrongholdScenario::build(1, StrongholdTerrain::Open, false, 1);
         assert_eq!(run_stronghold_assault(&s, 1, BoostTier::T0), RungOutcome::Deferred, "T0: the heal ceiling defers a stronghold tower (the pre-boost capability truth)");
         let boosted = run_stronghold_assault(&s, 1, BoostTier::T3);
-        assert!(!matches!(boosted, RungOutcome::Deferred | RungOutcome::Unfieldable), "T3 supply must at least FIELD the L1 assault: {boosted:?}");
+        assert!(matches!(boosted, RungOutcome::Killed { .. }), "T3 must TAKE the open L1 stronghold (the Phase 4.5 item-1 bar): {boosted:?}");
     }
 
     /// WS-VAL — the ESCALATION GAUNTLET (operator 2026-08-23: "increasingly challenging scenarios
@@ -798,5 +800,95 @@ mod tests {
                 println!("  {:>28}  attacker@{:?}  → {:?}", s.label, tier, out);
             }
         }
+    }
+
+    /// Rung TRACE instrument — tick-by-tick positions + hp + squad state for ONE gauntlet rung.
+    /// Point the `build(...)` line at whatever the dashboard says is broken and read the arc
+    /// (approach cohesion, wall camp, retreat) directly. This is how the cohesion-under-fire
+    /// defect chain was root-caused; keep it aimed at the top open rung (currently: chokepoint
+    /// trickle-in).
+    #[test]
+    #[ignore]
+    fn probe_rung() {
+        use crate::harness::evaluate::{evaluate_recorded, AnyOf, ObjectivesDestroyed, SideWiped};
+        use crate::harness::validate::{merge_intents, place_at_entry};
+        use screeps_combat_agent::squad::ManagedSimSquad;
+        use screeps_combat_decision::composition::{optimize_composition, CompositionParams};
+        use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination};
+        use screeps_combat_decision::force_sizing::{DefenseProfile, TowerThreat};
+        let s = StrongholdScenario::build(1, StrongholdTerrain::Chokepoint, false, 1);
+        let obj = &s.objectives[0];
+        let towers: Vec<TowerThreat> = s
+            .world
+            .towers
+            .iter()
+            .map(|t| TowerThreat { range_to_assault: t.pos.get_range_to(obj.assault_pos), energy: t.energy })
+            .collect();
+        eprintln!("core {:?} towers {:?} entry {:?} assault {:?}", obj.pos, s.world.towers.iter().map(|t| (t.pos.x().u8(), t.pos.y().u8())).collect::<Vec<_>>(), obj.entry, obj.assault_pos);
+        let breach_hits = s
+            .world
+            .structures
+            .iter()
+            .filter(|st| st.is_alive() && st.kind == StructureKind::Rampart && st.pos.get_range_to(obj.pos) <= 1)
+            .map(|st| st.hits)
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(2);
+        let defense = DefenseProfile {
+            towers,
+            breach_hits,
+            objective_hits: obj_hits(&s),
+            repair_per_tick: 0.0,
+            safe_mode: false,
+            ..Default::default()
+        };
+        let comp = optimize_composition(
+            DoctrineObjective::KillImmuneStructure,
+            &defense,
+            None,
+            None,
+            10_000_000.0,
+            s.onsite_budget,
+            EnemyCoordination::Coordinated,
+            0.0,
+            true,
+            false,
+            &CompositionParams { member_energy: s.member_energy, boost_max_tier: BoostTier::T3, ..Default::default() },
+        )
+        .expect("fields");
+        let mut world = s.world.clone();
+        let ids = place_at_entry(&mut world, obj, &comp, s.attacker_owner, s.member_energy).expect("places");
+        let mut att = ManagedSimSquad::new(s.attacker_owner, ids.clone(), obj.assault_pos);
+        let run_until = AnyOf(vec![
+            Box::new(ObjectivesDestroyed(vec![obj.id])),
+            Box::new(SideWiped(s.attacker_owner)),
+        ]);
+        let mut t = 0u32;
+        let (outcome, _rec) = evaluate_recorded(
+            world,
+            &mut |w| {
+                t += 1;
+                let out = att.step(w);
+                if t <= 4 || t % 10 == 0 {
+                    let st = format!("{:?}", att.state());
+                    let ps: Vec<String> = w
+                        .movement
+                        .creeps
+                        .iter()
+                        .filter(|c| ids.contains(&c.id))
+                        .map(|c| format!("#{}@({},{}){}", c.id, c.pos.x().u8(), c.pos.y().u8(), c.body.hits))
+                        .collect();
+                    eprintln!("t{} [{}]: moves={} {:?}", t, st, out.moves.len(), ps);
+                }
+                out
+            },
+            &mut |w, intents| {
+                stronghold_tower_intents(w, 1, DEFENDER, intents);
+                let _ = merge_intents;
+            },
+            &run_until,
+            s.onsite_budget,
+        );
+        eprintln!("OUTCOME: {:?} @ t{}", outcome.stop, outcome.ticks);
     }
 }
