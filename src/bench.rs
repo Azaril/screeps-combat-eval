@@ -112,7 +112,7 @@ fn run_worst_case(ticks: usize, shared: bool) -> BenchResult {
         // Build-once-per-room: one PositionLayers per tick, shared by every block this tick (live, the
         // SquadManager does this in its per-tick room cache). The per-squad path rebuilds inside the loop.
         let layers =
-            shared.then(|| PositionLayers::build(&threats, &towers, room(), &matrix, MAX_KITE_OPS));
+            shared.then(|| PositionLayers::build(&threats, &towers, &[], room(), &matrix, MAX_KITE_OPS));
         for &c in &centroids {
             let view = SquadKiteView {
                 centroid: c,
@@ -125,6 +125,7 @@ fn run_worst_case(ticks: usize, shared: bool) -> BenchResult {
                 fragile_hits: 5000, // a boosted brick — edge tiles survivable, centre lethal (veto active)
                 squad_heal: 0,
                 weapon_range: 3,
+                cover: &[],
             };
             let mut cb = |_r: RoomName| Some(matrix.clone());
             if plan_kite_anchor(&view, layers.as_ref(), &mut cb, MAX_KITE_OPS).is_some() {
