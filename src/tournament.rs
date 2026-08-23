@@ -1315,6 +1315,96 @@ mod tests {
         );
     }
 
+    /// WS-4 — the KITE/ENGAGE PRESET-WEIGHTS re-tune (closes 0019 S4-TUNE, 0024 FU#4's preset half,
+    /// and 0033's kite-retune note — all three deferred to "the multi-bed tournament", which the
+    /// chokepoint basket now provides). One-axis perturbations of the shipped kite + engage
+    /// `KiteScoreParams` plus a few style combos, ranked vs the shipped default with the same
+    /// per-regime maximin as `r19_chokepoint_retune` (the kernel is held at the shipped params so
+    /// this isolates the preset weights). Run:
+    /// `cargo test --release -p screeps-combat-eval --lib s4_weights_retune -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn s4_weights_retune() {
+        use screeps_combat_decision::kite::KiteScoreParams;
+        let base = SquadTacticParams::default();
+        let ticks = TournamentBudget::Thorough.ticks();
+        let basket = chokepoint_comp_basket(3, 5600);
+        let regime_of = |bed: &Bed| -> usize {
+            match bed {
+                Bed::OpenField | Bed::Corridor | Bed::TowerCrossfire => 0,
+                Bed::Imported(_) => 1,
+                Bed::Generated(_) => 2,
+            }
+        };
+        let split: Vec<Vec<(Bed, Vec<Vec<Part>>)>> = (0..3)
+            .map(|r| basket.iter().filter(|(b, _)| regime_of(b) == r).cloned().collect())
+            .collect();
+
+        let kite_var = |name: &'static str, f: fn(&mut KiteScoreParams)| {
+            let mut k = base.kite;
+            f(&mut k);
+            Strategy { name, tactics: SquadTacticParams { kite: k, ..base } }
+        };
+        let engage_var = |name: &'static str, f: fn(&mut KiteScoreParams)| {
+            let mut e = base.engage;
+            f(&mut e);
+            Strategy { name, tactics: SquadTacticParams { engage: e, ..base } }
+        };
+        let field: Vec<Strategy> = vec![
+            // kite-preset one-axis perturbations (default: taken 2.0, future 1.0, coh .3, prox .5, edge .4)
+            kite_var("kite-taken-hot", |k| k.w_taken = 3.0),
+            kite_var("kite-taken-cool", |k| k.w_taken = 1.0),
+            kite_var("kite-future-off", |k| k.w_future = 0.0),
+            kite_var("kite-future-hot", |k| k.w_future = 2.0),
+            kite_var("kite-edge-hot", |k| k.w_edge = 1.0),
+            kite_var("kite-prox-hot", |k| k.w_prox = 1.0),
+            // engage-preset one-axis (default: taken .5, prox 1.5, dmg 2.0, close .35, edge .1)
+            engage_var("eng-dmg-hot", |e| e.w_dmg = 3.0),
+            engage_var("eng-dmg-cool", |e| e.w_dmg = 1.0),
+            engage_var("eng-prox-hot", |e| e.w_prox = 2.5),
+            engage_var("eng-prox-cool", |e| e.w_prox = 0.8),
+            engage_var("eng-taken-hot", |e| e.w_taken = 1.0),
+            engage_var("eng-close-hot", |e| e.w_close = 0.7),
+            engage_var("eng-close-off", |e| e.w_close = 0.0),
+            // style combos
+            Strategy {
+                name: "brave",
+                tactics: SquadTacticParams {
+                    engage: KiteScoreParams { w_taken: 0.25, w_dmg: 3.0, ..base.engage },
+                    ..base
+                },
+            },
+            Strategy {
+                name: "cautious",
+                tactics: SquadTacticParams {
+                    kite: KiteScoreParams { w_taken: 3.0, ..base.kite },
+                    engage: KiteScoreParams { w_taken: 1.0, w_dmg: 1.5, ..base.engage },
+                    ..base
+                },
+            },
+        ];
+
+        let scored: Vec<(usize, [i64; 3])> = (0..field.len())
+            .into_par_iter()
+            .map(|i| {
+                let per: [i64; 3] =
+                    std::array::from_fn(|r| payoff_over_comps(&split[r], field[i].tactics, base, ticks));
+                (i, per)
+            })
+            .collect();
+        let mut ranked: Vec<(usize, [i64; 3], i64, i64)> = scored
+            .into_iter()
+            .map(|(i, per)| (i, per, *per.iter().min().unwrap(), per.iter().sum::<i64>() / 3))
+            .collect();
+        ranked.sort_by(|a, b| (b.2, b.3).cmp(&(a.2, a.3)).then(field[a.0].name.cmp(field[b.0].name)));
+        println!("\n=== S4 preset-weights re-tune: payoff vs shipped default (0) — [synth, imported, generated] min mean ===");
+        for &(i, per, min, mean) in &ranked {
+            println!("  {:>16} [{:+6} {:+6} {:+6}]  min {:+6}  mean {:+6}", field[i].name, per[0], per[1], per[2], min, mean);
+        }
+        let best = ranked[0];
+        println!("[WS-4 S4] top = {} (maximin {:+}, mean {:+}); shipped default = 0", field[best.0].name, best.2, best.3);
+    }
+
     /// SIM DETERMINISM regression fence (ADR 0026 follow-on). The combat sim must give the SAME result
     /// over many rounds — bit-identical, NOT a brittle golden value. std `HashMap`/`HashSet` seed their
     /// hasher per-INSTANCE (an incrementing thread-local counter), so every round builds fresh maps with
