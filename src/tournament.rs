@@ -368,6 +368,126 @@ pub fn chokepoint_comp_basket(n_comps: u32, energy: u32) -> Vec<(Bed, Vec<Vec<Pa
     out
 }
 
+// ── WS-VAL boosted self-play (operator 2026-08-23: "boosted creeps self play") ──────────────────
+// The tier-aware lane: the same seeded comps and mirror beds as [`comp_basket`], but every part
+// boosted uniformly at a tier (the ADR 0041 fielding shape). Boosted fights are SPIKIER — ×4
+// output on both sides shrinks time-to-kill against fixed hit pools — so kernel behavior tuned on
+// unboosted play does not automatically generalize; this lane grades it.
+
+/// Uniformly boost every part of `body` at `tier` (`None` ⇒ byte-identical unboosted build).
+pub fn boost_body(body: &[Part], tier: screeps_sim_core::BoostTier) -> SimBody {
+    if tier == screeps_sim_core::BoostTier::None {
+        return SimBody::unboosted(body);
+    }
+    SimBody::new(
+        body.iter()
+            .map(|&p| screeps_sim_core::BodyPartDef::boosted(p, tier))
+            .collect(),
+    )
+}
+
+/// [`build_bed_comp`] generalized to per-side PRE-BUILT bodies — enables tier-asymmetric matches
+/// (T3 vs T0 twin) as well as boosted mirrors.
+fn build_bed_bodies(bed: Bed, a: &[SimBody], b: &[SimBody]) -> CombatWorld {
+    let file = |owner: PlayerId, first: u32, x: u8, bodies: &[SimBody]| -> Vec<SimCreep> {
+        bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| SimCreep {
+                id: first + i as u32,
+                owner,
+                pos: pos(x, 22 + i as u8),
+                body: body.clone(),
+                fatigue: 0,
+                carry_used: 0,
+            })
+            .collect()
+    };
+    let mut creeps = file(0, 1, 8, a);
+    creeps.extend(file(1, 1000, 41, b));
+    let mut world = CombatWorld {
+        movement: MovementState {
+            creeps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    apply_bed_terrain(&mut world, bed);
+    world
+}
+
+/// One match on `bed` with per-side bodies; returns side-0's retained-HP margin (as [`play_bed_comp`]).
+fn play_bed_bodies(
+    bed: Bed,
+    a_bodies: &[SimBody],
+    b_bodies: &[SimBody],
+    side0: SquadTacticParams,
+    side1: SquadTacticParams,
+    ticks: usize,
+) -> i64 {
+    let mut world = build_bed_bodies(bed, a_bodies, b_bodies);
+    let ids = |owner| -> Vec<_> {
+        world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner)
+            .map(|c| c.id)
+            .collect()
+    };
+    let (a_ids, b_ids) = (ids(0), ids(1));
+    let mut squads = [
+        ManagedSimSquad::new(0, a_ids, pos(41, 25)).with_tactics(side0),
+        ManagedSimSquad::new(1, b_ids, pos(8, 25)).with_tactics(side1),
+    ];
+    run_managed(&mut world, &mut squads, ticks);
+    let kept = |owner| -> i64 {
+        world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner && c.is_alive())
+            .map(|c| c.body.hits as i64)
+            .sum()
+    };
+    kept(0) - kept(1)
+}
+
+/// The BOOSTED mirror basket: [`comp_basket`]'s exact seeded comps (same beds, same draws), every
+/// part boosted at `tier` — so a tier sweep isolates what boosts change, not a comp reshuffle.
+pub fn boosted_comp_basket(
+    n_comps: u32,
+    energy: u32,
+    tier: screeps_sim_core::BoostTier,
+) -> Vec<(Bed, Vec<SimBody>)> {
+    comp_basket(n_comps, energy)
+        .into_iter()
+        .map(|(bed, bodies)| (bed, bodies.iter().map(|b| boost_body(b, tier)).collect()))
+        .collect()
+}
+
+/// [`payoff_over_comps`] over a boosted (pre-built-body) basket — antisymmetric, both side
+/// assignments per entry.
+pub fn payoff_over_boosted_comps(
+    basket: &[(Bed, Vec<SimBody>)],
+    a: SquadTacticParams,
+    b: SquadTacticParams,
+    ticks: usize,
+) -> i64 {
+    if basket.is_empty() {
+        return 0;
+    }
+    let sum: i64 = basket
+        .iter()
+        .map(|(bed, bodies)| {
+            (play_bed_bodies(*bed, bodies, bodies, a, b, ticks)
+                - play_bed_bodies(*bed, bodies, bodies, b, a, ticks))
+                / 2
+        })
+        .sum();
+    sum / basket.len() as i64
+}
+
 /// The §12 Stage 4 **realistic base-attack set**: the `Raze` scenarios from the foreman-planned bases +
 /// the imported rooms (the "destroy the base" lens over real terrain + real foreman layouts). `Raze` is
 /// the breach-relevant objective; the other kinds exercise plumbing, not positioning under fire.
@@ -795,6 +915,49 @@ pub fn situational_comp(kind: &str) -> Vec<Vec<Part>> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// WS-VAL boosted self-play — the END-TO-END boost pin: the SAME comp fights its unboosted twin
+    /// (identical tactics, both side assignments) and the T3 side must win DECISIVELY on the open
+    /// field. This is RED if boost multipliers stop flowing anywhere along the lane
+    /// (`BodyPartDef::boosted` → engine resolution → the sim→DTO adapter the kernels read):
+    /// with boosts inert the mirror is symmetric and the margin collapses to ~0.
+    #[test]
+    fn t3_twin_decisively_beats_unboosted_twin() {
+        let mut rng = Rng::seeded(7);
+        let comp = random_squad(&mut rng, 5600, 3);
+        let t3: Vec<SimBody> = comp.iter().map(|b| boost_body(b, screeps_sim_core::BoostTier::T3)).collect();
+        let t0: Vec<SimBody> = comp.iter().map(|b| boost_body(b, screeps_sim_core::BoostTier::None)).collect();
+        let p = SquadTacticParams::default();
+        let margin = (play_bed_bodies(Bed::OpenField, &t3, &t0, p, p, 200)
+            - play_bed_bodies(Bed::OpenField, &t0, &t3, p, p, 200))
+            / 2;
+        let total_hp: i64 = t0.iter().map(|b| b.hits_max() as i64).sum();
+        assert!(
+            margin > total_hp / 4,
+            "T3 must beat its unboosted twin decisively (margin {margin} vs comp HP {total_hp})"
+        );
+    }
+
+    /// WS-VAL boosted self-play dashboard — grade the kernel's default tactics against the ADR 0026a
+    /// situational catalog over the BOOSTED mirror basket at each tier (the spikier regime where
+    /// time-to-kill shrinks ×4 and unboosted tuning may not generalize). Prints per-tier edges;
+    /// asserts nothing (a reading instrument, like the stronghold gauntlet). Run:
+    /// `cargo test --release -p screeps-combat-eval --lib boosted_selfplay_dashboard -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn boosted_selfplay_dashboard() {
+        use screeps_sim_core::BoostTier as T;
+        let baseline = SquadTacticParams::default();
+        let ticks = TournamentBudget::Thorough.ticks();
+        for &(tier, label) in &[(T::None, "T0"), (T::T2, "T2"), (T::T3, "T3")] {
+            let basket = boosted_comp_basket(3, 5600, tier);
+            println!("=== boosted self-play @ {label} (mirror comps, default-vs-catalog edges) ===");
+            for s in catalog_strategies() {
+                let edge = payoff_over_boosted_comps(&basket, s.tactics, baseline, ticks);
+                println!("  {:>24} vs default: {edge:>6}", s.name);
+            }
+        }
+    }
 
     /// ADR 0044 deviation observation: the procedural `Bed::Generated` (realistic cave, mirror-
     /// symmetric) must (1) RUN — squads field on the cleared deployment zones, no creep-in-wall

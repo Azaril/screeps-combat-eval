@@ -558,7 +558,7 @@ fn managed_assault_comp(scenario: &Scenario) -> SquadComposition {
 
 /// Place `comp`'s members as attacker creeps clustered at the objective's ENTRY (a MOVING assault),
 /// returning their ids in slot order (the `ManagedSimSquad` roster). `None` ⇒ a body wouldn't build.
-fn place_at_entry(
+pub(crate) fn place_at_entry(
     world: &mut CombatWorld,
     obj: &Objective,
     comp: &SquadComposition,
@@ -633,6 +633,26 @@ fn place_at_entry(
     let mut ids = Vec::new();
     for (i, slot) in comp.slots.iter().enumerate() {
         let body = slot.body_type.build_body(energy, MoveProfile::Plains)?;
+        // ADR 0041 — honor the optimizer-STAMPED boost tier (uniform per body): a comp the boosted
+        // oracle sized at T1–T3 fields with every part boosted at that tier, so the sim fights the
+        // body the sizing promised (the boosted-self-play corpus rides this). T0 = unboosted,
+        // byte-identical to the pre-0041 build.
+        let screeps_combat_decision::composition::BodyType::Sized(spec) = &slot.body_type;
+        let sim_boost = match spec.boost {
+            screeps_combat_decision::bodies::BoostTier::T0 => screeps_sim_core::BoostTier::None,
+            screeps_combat_decision::bodies::BoostTier::T1 => screeps_sim_core::BoostTier::T1,
+            screeps_combat_decision::bodies::BoostTier::T2 => screeps_sim_core::BoostTier::T2,
+            screeps_combat_decision::bodies::BoostTier::T3 => screeps_sim_core::BoostTier::T3,
+        };
+        let sim_body = if sim_boost == screeps_sim_core::BoostTier::None {
+            SimBody::unboosted(&body)
+        } else {
+            SimBody::new(
+                body.iter()
+                    .map(|&p| screeps_sim_core::BodyPartDef::boosted(p, sim_boost))
+                    .collect(),
+            )
+        };
         let (x, y) = tiles[i];
         let id = i as u32 + 1;
         let pos = Position::new(
@@ -644,7 +664,7 @@ fn place_at_entry(
             id,
             owner: attacker,
             pos,
-            body: SimBody::unboosted(&body),
+            body: sim_body,
             fatigue: 0,
             carry_used: 0,
         });
@@ -895,7 +915,7 @@ impl Validator for ManagedSquadIntegration {
 // ── SelfPlay: BOTH sides run the real squad brain (the realistic, moving-on-both-sides engagement) ──
 
 /// Merge `src` intents into `dst` (the engine merges both squads' intents into one resolved tick).
-fn merge_intents(dst: &mut Intents, src: Intents) {
+pub(crate) fn merge_intents(dst: &mut Intents, src: Intents) {
     dst.creeps.extend(src.creeps);
     dst.moves.extend(src.moves);
     dst.pulls.extend(src.pulls);
