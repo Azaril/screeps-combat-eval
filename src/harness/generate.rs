@@ -646,7 +646,12 @@ fn twin_room_siege() -> Scenario {
     let target: RoomName = "W2N1".parse().unwrap();
     let core = (10u8, 25u8); // near the west edge of the target room (just across the border)
     let (assault_pos, front_tiles, support_tiles, rampart_xy) = breach_geometry(target, core);
-    let mut b = ScenarioBuilder::empty(home);
+    // WS-VAL fix (found by the full-roster H5-parity view): the builder starts in `home`, so the
+    // core + rampart below were silently being placed in the STAGING room at (10,25) while the
+    // objective claimed the target room — an aliased scenario the in-room-scoped view never
+    // noticed (the old test passed on 'crossed + engaged the skirmishers' alone). Build the
+    // defended structures in the TARGET room, as the fixture always intended.
+    let mut b = ScenarioBuilder::empty(home).in_room(target);
     // A corridor wall in the target room, west of the core, with a gap.
     for y in 1..=48u8 {
         if !(24..=26).contains(&y) {

@@ -561,7 +561,7 @@ pub fn run_stronghold_assault_recorded(
     };
     let def_ids: Vec<u32> = defenders.iter().map(|c| c.id).collect();
 
-    let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos);
+    let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos).with_rally(obj.entry);
     let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids.clone(), obj.pos)
         .with_intent(screeps_combat_decision::EngageObjective::Hold);
 
@@ -768,17 +768,44 @@ mod tests {
     /// - L1@T0 DEFERS: with the PREFERRED_MEMBER_ENERGY=3000 clamp, the T0 heal ceiling cannot
     ///   out-sustain even one point-blank stronghold tower — which is exactly why live has only
     ///   ever killed towerless (level-0) cores. The gauntlet quantified the gap.
-    /// - L1-open@T3 is **KILLED** (Phase 4.5 item 1's acceptance bar, achieved 2026-08-24 by the
-    ///   cohesion-under-fire kernel work: deliverable-heal advance gating + the siege risk-currency
-    ///   floor + lockstep healer advertising + evidence-gated heal triage — current run: 151 ticks,
-    ///   ZERO members lost). Chokepoint/multi-room rungs stay dashboard-graded (`stronghold_gauntlet`):
-    ///   the corridor trickle-in commit window and the border crossing are the open follow-ups.
+    /// - EVERY L1 rung @T3 is **KILLED** — open (item 1's bar: deliverable-heal advance gating,
+    ///   siege risk-currency floor, lockstep healer advertising, evidence-gated heal triage),
+    ///   chokepoint, AND multi-room (item 2's machinery: bloc border-crossing gate, full-roster
+    ///   H5-parity views, fight-room kernel anchoring — the plan_squad_ev room param — the
+    ///   room-gated mover anchor, exit-edge tile pricing, retreat-to-rally, state decay).
+    /// - The border gauntlet's g1 (both tiers) and g2@T3 are KILLED (item 2's bar): the squad
+    ///   gathers at the border, crosses as a bloc, and wipes the campers instead of trickling in
+    ///   one at a time (the operator-observed live stall class).
     #[test]
-    fn stronghold_floor_t0_defers_t3_kills_open() {
-        let s = StrongholdScenario::build(1, StrongholdTerrain::Open, false, 1);
-        assert_eq!(run_stronghold_assault(&s, 1, BoostTier::T0), RungOutcome::Deferred, "T0: the heal ceiling defers a stronghold tower (the pre-boost capability truth)");
-        let boosted = run_stronghold_assault(&s, 1, BoostTier::T3);
-        assert!(matches!(boosted, RungOutcome::Killed { .. }), "T3 must TAKE the open L1 stronghold (the Phase 4.5 item-1 bar): {boosted:?}");
+    fn stronghold_floor_t0_defers_t3_kills_every_l1_rung() {
+        for &(terrain, multi) in &[
+            (StrongholdTerrain::Open, false),
+            (StrongholdTerrain::Chokepoint, false),
+            (StrongholdTerrain::Chokepoint, true),
+        ] {
+            let s = StrongholdScenario::build(1, terrain, multi, 1);
+            assert_eq!(
+                run_stronghold_assault(&s, 1, BoostTier::T0),
+                RungOutcome::Deferred,
+                "{}: T0 defers (the pre-boost capability truth)",
+                s.label
+            );
+            let boosted = run_stronghold_assault(&s, 1, BoostTier::T3);
+            assert!(
+                matches!(boosted, RungOutcome::Killed { .. }),
+                "{}: T3 must TAKE the L1 stronghold (Phase 4.5 items 1+2 bars): {boosted:?}",
+                s.label
+            );
+        }
+        for (grade, tier) in [(1, BoostTier::T0), (1, BoostTier::T3), (2, BoostTier::T3)] {
+            let s = BorderGauntlet::build(grade, 3);
+            let out = run_stronghold_assault(&s, 1, tier);
+            assert!(
+                matches!(out, RungOutcome::Killed { .. }),
+                "{} @{tier:?}: the bloc crossing must beat the campers: {out:?}",
+                s.label
+            );
+        }
     }
 
     /// WS-VAL — the ESCALATION GAUNTLET (operator 2026-08-23: "increasingly challenging scenarios
@@ -878,93 +905,48 @@ mod tests {
         println!("\nREPLAY INDEX: {}/index.html", std::fs::canonicalize(dir).unwrap().display());
     }
 
-    /// Rung TRACE instrument — tick-by-tick positions + hp + squad state for ONE gauntlet rung.
-    /// Point the `build(...)` line at whatever the dashboard says is broken and read the arc
-    /// (approach cohesion, wall camp, retreat) directly. This is how the cohesion-under-fire
-    /// defect chain was root-caused; keep it aimed at the top open rung (currently: chokepoint
-    /// trickle-in).
+    /// Rung TRACE instrument — the REAL gauntlet rung (`run_stronghold_assault_recorded`, so the
+    /// sizing/enemy inputs are byte-identical to the dashboard) printed tick-by-tick from its
+    /// recording: attacker positions (with room), hp, and deaths. Point the `build(...)`/tier lines
+    /// at whatever the dashboard says is broken. This is how the cohesion-under-fire defect chain
+    /// was root-caused; currently aimed at the operator-observed border-crossing stall (g1: "one
+    /// creep enters and everything outside the room stalls").
     #[test]
     #[ignore]
     fn probe_rung() {
-        use crate::harness::evaluate::{evaluate_recorded, AnyOf, ObjectivesDestroyed, SideWiped};
-        use crate::harness::validate::{merge_intents, place_at_entry};
-        use screeps_combat_agent::squad::ManagedSimSquad;
-        use screeps_combat_decision::composition::{optimize_composition, CompositionParams};
-        use screeps_combat_decision::doctrine::{DoctrineObjective, EnemyCoordination};
-        use screeps_combat_decision::force_sizing::{DefenseProfile, TowerThreat};
-        let s = StrongholdScenario::build(1, StrongholdTerrain::Chokepoint, false, 1);
-        let obj = &s.objectives[0];
-        let towers: Vec<TowerThreat> = s
-            .world
-            .towers
-            .iter()
-            .map(|t| TowerThreat { range_to_assault: t.pos.get_range_to(obj.assault_pos), energy: t.energy })
-            .collect();
-        eprintln!("core {:?} towers {:?} entry {:?} assault {:?}", obj.pos, s.world.towers.iter().map(|t| (t.pos.x().u8(), t.pos.y().u8())).collect::<Vec<_>>(), obj.entry, obj.assault_pos);
-        let breach_hits = s
-            .world
-            .structures
-            .iter()
-            .filter(|st| st.is_alive() && st.kind == StructureKind::Rampart && st.pos.get_range_to(obj.pos) <= 1)
-            .map(|st| st.hits)
-            .max()
-            .unwrap_or(0)
-            .saturating_mul(2);
-        let defense = DefenseProfile {
-            towers,
-            breach_hits,
-            objective_hits: obj_hits(&s),
-            repair_per_tick: 0.0,
-            safe_mode: false,
-            ..Default::default()
+        let s = BorderGauntlet::build(1, 3);
+        let tier = BoostTier::T3;
+        let (out, rec) = run_stronghold_assault_recorded(&s, 1, tier);
+        eprintln!("rung {} @{:?} -> {:?}", s.label, tier, out);
+        for c in s.world.movement.creeps.iter().filter(|c| c.owner == DEFENDER) {
+            eprintln!("  camper #{} @{}({},{})", c.id, c.pos.room_name(), c.pos.x().u8(), c.pos.y().u8());
+        }
+        {
+            let t = s.world.terrain_for(s.objectives[0].room);
+            for y in 18..=32u8 {
+                let row: String = (40..=49u8).map(|x| if t.is_wall(x, y) { '#' } else { '.' }).collect();
+                eprintln!("  y{:02} x40-49: {}", y, row);
+            }
+        }
+        let Some(rec) = rec else {
+            eprintln!("(no fight — not fielded)");
+            return;
         };
-        let comp = optimize_composition(
-            DoctrineObjective::KillImmuneStructure,
-            &defense,
-            None,
-            None,
-            10_000_000.0,
-            s.onsite_budget,
-            EnemyCoordination::Coordinated,
-            0.0,
-            true,
-            false,
-            &CompositionParams { member_energy: s.member_energy, boost_max_tier: BoostTier::T3, ..Default::default() },
-        )
-        .expect("fields");
-        let mut world = s.world.clone();
-        let ids = place_at_entry(&mut world, obj, &comp, s.attacker_owner, s.member_energy).expect("places");
-        let mut att = ManagedSimSquad::new(s.attacker_owner, ids.clone(), obj.assault_pos);
-        let run_until = AnyOf(vec![
-            Box::new(ObjectivesDestroyed(vec![obj.id])),
-            Box::new(SideWiped(s.attacker_owner)),
-        ]);
-        let mut t = 0u32;
-        let (outcome, _rec) = evaluate_recorded(
-            world,
-            &mut |w| {
-                t += 1;
-                let out = att.step(w);
-                if t <= 4 || t % 10 == 0 {
-                    let st = format!("{:?}", att.state());
-                    let ps: Vec<String> = w
-                        .movement
-                        .creeps
-                        .iter()
-                        .filter(|c| ids.contains(&c.id))
-                        .map(|c| format!("#{}@({},{}){}", c.id, c.pos.x().u8(), c.pos.y().u8(), c.body.hits))
-                        .collect();
-                    eprintln!("t{} [{}]: moves={} {:?}", t, st, out.moves.len(), ps);
-                }
-                out
-            },
-            &mut |w, intents| {
-                stronghold_tower_intents(w, 1, DEFENDER, intents);
-                let _ = merge_intents;
-            },
-            &run_until,
-            s.onsite_budget,
-        );
-        eprintln!("OUTCOME: {:?} @ t{}", outcome.stop, outcome.ticks);
+        for f in &rec.frames {
+            if !(f.tick <= 4 || f.tick % 10 == 0 || !f.deaths.is_empty()) {
+                continue;
+            }
+            let ps: Vec<String> = f
+                .creeps
+                .iter()
+                .filter(|c| c.owner == s.attacker_owner)
+                .map(|c| format!("#{}@{}({},{}){}", c.id, c.room, c.x, c.y, c.hits))
+                .collect();
+            let deaths = if f.deaths.is_empty() { String::new() } else { format!("  DEATHS {:?}", f.deaths) };
+            eprintln!("t{}: {:?}{}", f.tick, ps, deaths);
+            if (40..=60).contains(&f.tick) {
+                eprintln!("   intents: {:?}", f.intents);
+            }
+        }
     }
 }

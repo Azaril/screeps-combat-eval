@@ -732,6 +732,7 @@ pub(crate) fn run_managed_assault_with(
         scenario.member_energy,
     )?;
     let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos)
+        .with_rally(obj.entry)
         .with_tactics(tactics);
     let defender = scenario.defender_owner;
     let core_pos = obj.pos;
@@ -769,6 +770,8 @@ pub(crate) fn run_managed_assault_drain(
         scenario.attacker_owner,
         scenario.member_energy,
     )?;
+    // NB: no rally on the DRAIN runner — a transient Retreating tick must kite locally (legacy),
+    // never march the tank off its standoff through tower fire toward the entry.
     let mut squad = ManagedSimSquad::new(scenario.attacker_owner, members, obj.assault_pos)
         .with_tactics(tactics)
         .with_drain_stance(true);
