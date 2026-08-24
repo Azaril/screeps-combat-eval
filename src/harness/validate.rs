@@ -763,9 +763,36 @@ pub(crate) fn run_managed_assault_drain(
     screeps_combat_engine::CombatRecording,
 )> {
     let mut world = scenario.world.clone();
+    // DRAIN-AWARE PLACEMENT (WS-VAL drain rework): a drain squad must START outside the tower
+    // falloff — the bed's breach entry sits well inside it, and placing there put the focused tank
+    // under ~4×450/tick before any directive governed (traced: dead in ~3 ticks, every run; the
+    // "drain" then only worked because the survivors' retreat accidentally found the r20 band).
+    // Live parity: a real squad approaches from the room edge and meets the drain standoff BEFORE
+    // entering the falloff — teleporting to r11 is a harness artifact, not a scenario property.
+    // Back the entry out along its ray from the objective to just past the falloff radius.
+    let drain_entry = {
+        use screeps_combat_engine::constants::TOWER_FALLOFF_RANGE;
+        let safe_r = TOWER_FALLOFF_RANGE as i32 + 2;
+        let (ex, ey) = (obj.entry.x().u8() as i32, obj.entry.y().u8() as i32);
+        let (ox, oy) = (obj.pos.x().u8() as i32, obj.pos.y().u8() as i32);
+        let (dx, dy) = (ex - ox, ey - oy);
+        let r = dx.abs().max(dy.abs()).max(1);
+        if r >= safe_r || obj.entry.room_name() != obj.pos.room_name() {
+            obj.entry
+        } else {
+            let bx = (ox + dx * safe_r / r).clamp(1, 48) as u8;
+            let by = (oy + dy * safe_r / r).clamp(1, 48) as u8;
+            Position::new(
+                screeps::RoomCoordinate::new(bx).unwrap(),
+                screeps::RoomCoordinate::new(by).unwrap(),
+                obj.entry.room_name(),
+            )
+        }
+    };
+    let drain_obj = Objective { entry: drain_entry, ..obj.clone() };
     let members = place_at_entry(
         &mut world,
-        obj,
+        &drain_obj,
         comp,
         scenario.attacker_owner,
         scenario.member_energy,
