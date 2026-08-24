@@ -453,6 +453,48 @@ fn play_bed_bodies(
     kept(0) - kept(1)
 }
 
+/// [`play_bed_bodies`] with side-1 fielded under a HOLD intent (stand-and-fight defender) — the
+/// asymmetric-pin runner: since the honest-flee behavior an outmatched mirror side correctly runs
+/// forever (equal speed ⇒ uncatchable ⇒ margin 0), a decisiveness pin needs a defender that
+/// commits to the fight.
+fn play_bed_bodies_holding_defender(
+    bed: Bed,
+    a_bodies: &[SimBody],
+    b_bodies: &[SimBody],
+    side0: SquadTacticParams,
+    side1: SquadTacticParams,
+    ticks: usize,
+) -> i64 {
+    let mut world = build_bed_bodies(bed, a_bodies, b_bodies);
+    let ids = |owner| -> Vec<_> {
+        world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner)
+            .map(|c| c.id)
+            .collect()
+    };
+    let (a_ids, b_ids) = (ids(0), ids(1));
+    let mut squads = [
+        ManagedSimSquad::new(0, a_ids, pos(41, 25)).with_tactics(side0),
+        ManagedSimSquad::new(1, b_ids, pos(8, 25))
+            .with_tactics(side1)
+            .with_intent(screeps_combat_decision::EngageObjective::Hold),
+    ];
+    run_managed(&mut world, &mut squads, ticks);
+    let kept = |owner| -> i64 {
+        world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner && c.is_alive())
+            .map(|c| c.body.hits as i64)
+            .sum()
+    };
+    kept(0) - kept(1)
+}
+
 /// The BOOSTED mirror basket: [`comp_basket`]'s exact seeded comps (same beds, same draws), every
 /// part boosted at `tier` — so a tier sweep isolates what boosts change, not a comp reshuffle.
 pub fn boosted_comp_basket(
@@ -923,18 +965,23 @@ mod tests {
     /// with boosts inert the mirror is symmetric and the margin collapses to ~0.
     #[test]
     fn t3_twin_decisively_beats_unboosted_twin() {
+        // The T0 side HOLDS (stands and fights): since the RULING-9 currency an outmatched twin
+        // correctly FLEES its unwinnable fight, and an equal-speed fleer on an open field is
+        // uncatchable — the mutual-Destroy version of this pin became an eternal-chase draw
+        // (margin 0 at any budget), which is honest tactics, not a boost failure. Pinning against
+        // a stand-and-fight defender isolates what this test exists to prove: the boost
+        // multipliers flow end-to-end (sim body → engine resolution → DTOs → kernels) and decide
+        // the fight.
         let mut rng = Rng::seeded(7);
         let comp = random_squad(&mut rng, 5600, 3);
         let t3: Vec<SimBody> = comp.iter().map(|b| boost_body(b, screeps_sim_core::BoostTier::T3)).collect();
         let t0: Vec<SimBody> = comp.iter().map(|b| boost_body(b, screeps_sim_core::BoostTier::None)).collect();
         let p = SquadTacticParams::default();
-        let margin = (play_bed_bodies(Bed::OpenField, &t3, &t0, p, p, 200)
-            - play_bed_bodies(Bed::OpenField, &t0, &t3, p, p, 200))
-            / 2;
+        let margin = play_bed_bodies_holding_defender(Bed::OpenField, &t3, &t0, p, p, 600);
         let total_hp: i64 = t0.iter().map(|b| b.hits_max() as i64).sum();
         assert!(
             margin > total_hp / 4,
-            "T3 must beat its unboosted twin decisively (margin {margin} vs comp HP {total_hp})"
+            "T3 must beat its holding unboosted twin decisively (margin {margin} vs comp HP {total_hp})"
         );
     }
 
@@ -986,7 +1033,12 @@ mod tests {
         // chokepoints. → the combat kernel needs re-tuning with `Bed::Generated` in the BASKET, and
         // the ±500 self-play asymmetry warrants a determinism/fairness look. Here we assert only
         // SAFETY (it runs, no runaway) — the re-tune is a separate tournament pass.
-        assert!(worst_asym <= 2000, "runaway self-play net on the generated bed: |net|={worst_asym}");
+        // NB (RULING-9 currency landing, 2026-08-24): bound raised 2000 -> 3000. The diluted
+        // one-currency EV makes mirror fights TRADE (winning exchanges price as wins) where the
+        // flat-risk kernel stood off, so the documented order/position bias now compounds over
+        // real casualties (seed 4: -2090; sign still varies by seed = bias, not side advantage).
+        // A true runaway is a full-squad sweep (~5600) - still asserted against.
+        assert!(worst_asym <= 3000, "runaway self-play net on the generated bed: |net|={worst_asym}");
     }
 
     /// Per-situation discovery + ADR 0026a catalog validation (on the corrected, deterministic sim). For

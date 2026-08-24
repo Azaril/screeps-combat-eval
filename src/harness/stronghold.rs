@@ -914,7 +914,7 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_rung() {
-        let s = BorderGauntlet::build(1, 3);
+        let s = StrongholdScenario::build(1, StrongholdTerrain::Chokepoint, false, 1);
         let tier = BoostTier::T3;
         let (out, rec) = run_stronghold_assault_recorded(&s, 1, tier);
         eprintln!("rung {} @{:?} -> {:?}", s.label, tier, out);
