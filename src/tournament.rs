@@ -1530,6 +1530,141 @@ mod tests {
         );
     }
 
+    /// Phase 4.5 item 6 — the BOOSTED kernel re-tune (merges ADR 0041 P4). Same maximin criterion
+    /// as [`r19_chokepoint_retune`] but the regimes are BOOST TIERS (T0 / T2 / T3 mirror baskets,
+    /// each spanning the full comp basket's beds): a config must not buy its boosted edge with an
+    /// unboosted regression or vice versa — the activation flip must not change which profile is
+    /// right. Field = the 48-config kernel grid + the catalog modes + the shipped `open_combat`;
+    /// payoff per tier is vs the untuned default (0 by construction). Run:
+    /// `cargo test --release -p screeps-combat-eval --lib boosted_tier_retune -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn boosted_tier_retune() {
+        use screeps_sim_core::BoostTier;
+        let baseline = SquadTacticParams::default();
+        let ticks = TournamentBudget::Thorough.ticks();
+        let tiers = [BoostTier::None, BoostTier::T2, BoostTier::T3];
+        let baskets: Vec<Vec<(Bed, Vec<SimBody>)>> =
+            tiers.iter().map(|&t| boosted_comp_basket(3, 5600, t)).collect();
+        eprintln!("baskets: {} entries per tier x {} tiers", baskets[0].len(), baskets.len());
+
+        let mut field = kernel_population_grid();
+        field.extend(catalog_strategies());
+        field.push(Strategy { name: "open_combat", tactics: SquadTacticParams::open_combat() });
+
+        let scored: Vec<(usize, [i64; 3])> = (0..field.len())
+            .into_par_iter()
+            .map(|i| {
+                let per: [i64; 3] = std::array::from_fn(|r| {
+                    payoff_over_boosted_comps(&baskets[r], field[i].tactics, baseline, ticks)
+                });
+                (i, per)
+            })
+            .collect();
+        let mut ranked: Vec<(usize, [i64; 3], i64, i64)> = scored
+            .into_iter()
+            .map(|(i, per)| {
+                let min = *per.iter().min().unwrap();
+                let mean = per.iter().sum::<i64>() / 3;
+                (i, per, min, mean)
+            })
+            .collect();
+        ranked.sort_by(|a, b| (b.2, b.3).cmp(&(a.2, a.3)).then(field[a.0].name.cmp(field[b.0].name)));
+
+        println!("\n=== item 6 boosted tier re-tune: payoff vs untuned default (0) — [T0, T2, T3] min mean ===");
+        for &(i, per, min, mean) in ranked.iter().take(12) {
+            println!("  {:>16} [{:+6} {:+6} {:+6}]  min {:+6}  mean {:+6}", field[i].name, per[0], per[1], per[2], min, mean);
+        }
+        if let Some(&(i, per, min, mean)) = ranked.iter().find(|&&(i, ..)| field[i].name == "open_combat") {
+            println!("  reference open_combat [{:+} {:+} {:+}] min {:+} mean {:+} — rank {}",
+                per[0], per[1], per[2], min, mean,
+                ranked.iter().position(|&(j, ..)| j == i).unwrap() + 1);
+        }
+        let best = ranked[0];
+        println!(
+            "[item 6] adoption candidate = {} (maximin {:+}, mean {:+}); untuned default = 0 baseline",
+            field[best.0].name, best.2, best.3
+        );
+    }
+
+    /// Phase 4.5 item 6, the ADOPTION instrument — the JOINT tier × terrain maximin. The tier lens
+    /// ([`boosted_tier_retune`]) and the terrain lens ([`r19_chokepoint_retune`]) crowned DIFFERENT
+    /// winners under the RULING-9 currency; the profile we ship must not buy either edge with a
+    /// regression on the other axis, so the regimes here are the full cross product: 3 boost tiers
+    /// × 3 terrain classes (synthetic / imported / generated) = 9 cells, ranked by MIN-over-cells.
+    /// Run: `cargo test --release -p screeps-combat-eval --lib joint_boosted_terrain_retune -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn joint_boosted_terrain_retune() {
+        use screeps_sim_core::BoostTier;
+        let baseline = SquadTacticParams::default();
+        let ticks = TournamentBudget::Thorough.ticks();
+        let regime_of = |bed: &Bed| -> usize {
+            match bed {
+                Bed::OpenField | Bed::Corridor | Bed::TowerCrossfire => 0,
+                Bed::Imported(_) => 1,
+                Bed::Generated(_) => 2,
+            }
+        };
+        let tiers = [BoostTier::None, BoostTier::T2, BoostTier::T3];
+        // cells[tier*3 + terrain] — built from the CHOKEPOINT basket (synthetic + imported real
+        // terrain + generated caves), boosted per tier. `comp_basket`/`boosted_comp_basket` is
+        // synthetic-only, which would leave the terrain cells empty.
+        let cells: Vec<Vec<(Bed, Vec<SimBody>)>> = tiers
+            .iter()
+            .flat_map(|&t| {
+                let basket: Vec<(Bed, Vec<SimBody>)> = chokepoint_comp_basket(3, 5600)
+                    .into_iter()
+                    .map(|(bed, bodies)| (bed, bodies.iter().map(|b| boost_body(b, t)).collect()))
+                    .collect();
+                (0..3usize).map(move |r| basket.iter().filter(|(b, _)| regime_of(b) == r).cloned().collect::<Vec<_>>())
+            })
+            .collect();
+        eprintln!("cells: {:?} entries", cells.iter().map(Vec::len).collect::<Vec<_>>());
+
+        let mut field = kernel_population_grid();
+        field.extend(catalog_strategies());
+        field.push(Strategy { name: "open_combat", tactics: SquadTacticParams::open_combat() });
+
+        let scored: Vec<(usize, Vec<i64>)> = (0..field.len())
+            .into_par_iter()
+            .map(|i| {
+                let per: Vec<i64> = cells
+                    .iter()
+                    .map(|c| payoff_over_boosted_comps(c, field[i].tactics, baseline, ticks))
+                    .collect();
+                (i, per)
+            })
+            .collect();
+        let mut ranked: Vec<(usize, Vec<i64>, i64, i64)> = scored
+            .into_iter()
+            .map(|(i, per)| {
+                let min = *per.iter().min().unwrap();
+                let mean = per.iter().sum::<i64>() / per.len() as i64;
+                (i, per, min, mean)
+            })
+            .collect();
+        ranked.sort_by(|a, b| (b.2, b.3).cmp(&(a.2, a.3)).then(field[a.0].name.cmp(field[b.0].name)));
+
+        println!("\n=== item 6 JOINT tier×terrain maximin vs untuned default (0) — cells [T0:syn,imp,gen | T2:… | T3:…] ===");
+        for &(i, ref per, min, mean) in ranked.iter().take(12) {
+            let row: Vec<String> = per.iter().map(|v| format!("{v:+5}")).collect();
+            println!("  {:>16} [{}]  min {:+6}  mean {:+6}", field[i].name, row.join(" "), min, mean);
+        }
+        for name in ["open_combat", "a2-i2-tight", "a1-i4-loose"] {
+            if let Some(&(i, ref per, min, mean)) = ranked.iter().find(|&&(i, ..)| field[i].name == name) {
+                let row: Vec<String> = per.iter().map(|v| format!("{v:+}")).collect();
+                println!("  reference {name} [{}] min {min:+} mean {mean:+} — rank {}",
+                    row.join(" "), ranked.iter().position(|&(j, ..)| j == i).unwrap() + 1);
+            }
+        }
+        let best = &ranked[0];
+        println!(
+            "[item 6 JOINT] adoption candidate = {} (maximin {:+}, mean {:+})",
+            field[best.0].name, best.2, best.3
+        );
+    }
+
     /// WS-4 — the KITE/ENGAGE PRESET-WEIGHTS re-tune (closes 0019 S4-TUNE, 0024 FU#4's preset half,
     /// and 0033's kite-retune note — all three deferred to "the multi-bed tournament", which the
     /// chokepoint basket now provides). One-axis perturbations of the shipped kite + engage
