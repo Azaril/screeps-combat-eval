@@ -565,13 +565,15 @@ pub fn run_stronghold_assault_recorded(
     let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids.clone(), obj.pos)
         .with_intent(screeps_combat_decision::EngageObjective::Hold);
 
-    let mut conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> = vec![
+    // NB (item 8a verdict fix, 2026-08-24): NO `SideWiped(defender)` stop — killing the defender
+    // CREEPS is not taking the stronghold (towers + core still stand and the towers still fire).
+    // The old stop mis-scored the L2 rungs as Killed{~20} the tick the lone camper died 13 tiles
+    // from the core; `Killed` now always means the OBJECTIVE was razed (or the attacker honestly
+    // timed out grinding it).
+    let conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> = vec![
         Box::new(ObjectivesDestroyed(vec![obj.id])),
         Box::new(SideWiped(scenario.attacker_owner)),
     ];
-    if !def_ids.is_empty() {
-        conditions.push(Box::new(SideWiped(scenario.defender_owner)));
-    }
     let run_until = AnyOf(conditions);
     let (outcome, rec) = evaluate_recorded(
         world,
@@ -587,6 +589,8 @@ pub fn run_stronghold_assault_recorded(
     let rung = match outcome.stop {
         StopReason::ObjectivesComplete => RungOutcome::Killed { ticks: outcome.ticks },
         StopReason::SideWiped(side) if side == scenario.attacker_owner => RungOutcome::AttackerWiped { ticks: outcome.ticks },
+        // Unreachable since the defender-wipe stop was removed (see the conditions NB); kept for
+        // the declaim-style ControllerNeutralized terminal.
         StopReason::SideWiped(_) | StopReason::ControllerNeutralized => RungOutcome::Killed { ticks: outcome.ticks },
         StopReason::Timeout => {
             let reached = outcome.world.movement.creeps.iter().any(|c| {
