@@ -160,7 +160,7 @@ impl Generator for RandomDefendedBase {
 
 /// A single-room layout shape — the room/wall structure the operator wants to SEE, and that a moving
 /// assault (the `ManagedSquadIntegration` validator) navigates.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {
     /// No terrain — an open field (the calibration baseline).
     Open,
@@ -221,7 +221,7 @@ fn layout_terrain(layout: Layout, core: (u8, u8)) -> (Tiles, Tiles) {
 /// (the validator's `derive_profile` sums it) and they fight the managed assault (the combat the
 /// operator sees). Stationary (`defense_intents` issues no moves), so they don't perturb the sizing
 /// calibration's movement-free purity.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForceSpec {
     /// No defender creeps (towers/structures only).
     None,
@@ -639,12 +639,12 @@ pub fn realistic_bases() -> Vec<Scenario> {
 }
 
 /// A multi-room fixture: the assault stages in `W1N1` and the objective core sits behind a corridor in
-/// the east neighbour `W2N1` — the managed assault paths across the room border to engage (visible
-/// cross-room movement).
+/// the neighbour `W2N1` across W1N1's WEST edge (W-coordinates grow westward) — the managed assault
+/// paths across the room border to engage (visible cross-room movement).
 fn twin_room_siege() -> Scenario {
     let home: RoomName = "W1N1".parse().unwrap();
     let target: RoomName = "W2N1".parse().unwrap();
-    let core = (10u8, 25u8); // near the west edge of the target room (just across the border)
+    let core = (10u8, 25u8); // deep in the target room, behind its corridor
     let (assault_pos, front_tiles, support_tiles, rampart_xy) = breach_geometry(target, core);
     // WS-VAL fix (found by the full-roster H5-parity view): the builder starts in `home`, so the
     // core + rampart below were silently being placed in the STAGING room at (10,25) while the
@@ -712,6 +712,201 @@ fn twin_room_siege() -> Scenario {
         onsite_budget: 1400,
         label: "designed#4 twin-room-siege".into(),
         seed: 4,
+    }
+}
+
+// ── ADR 0023a Phase B: the `MultiRoom` generator ───────────────────────────────────────────────────
+
+/// The staging-room layouts the composed multi-room beds enumerate (mirrored so the feature sits
+/// between the rally and the EXIT toward the target).
+const MR_LAYOUTS: [Layout; 4] = [
+    Layout::Open,
+    Layout::Corridor,
+    Layout::SwampApproach,
+    Layout::Bunker,
+];
+/// The target-room opponent forces the composed beds enumerate.
+const MR_FORCES: [ForceSpec; 3] = [ForceSpec::None, ForceSpec::Skirmishers(2), ForceSpec::Guard(2)];
+/// The border-gauntlet grades folded in (ADR 0023 cross-room Flee / Phase 4.5 item 2 ladder).
+const MR_GAUNTLET_GRADES: [u8; 4] = [1, 2, 3, 4];
+/// The gauntlet's ladder seed (the same one the stronghold floor pins).
+const MR_GAUNTLET_SEED: u32 = 3;
+/// The stronghold levels × terrains folded in, every one staged in the neighbour room.
+const MR_STRONGHOLD_LEVELS: [u8; 5] = [1, 2, 3, 4, 5];
+const MR_STRONGHOLD_TERRAINS: [crate::harness::stronghold::StrongholdTerrain; 2] = [
+    crate::harness::stronghold::StrongholdTerrain::Open,
+    crate::harness::stronghold::StrongholdTerrain::Chokepoint,
+];
+const MR_STRONGHOLD_SEED: u32 = 1;
+
+/// One decoded `MultiRoom` index — which builder it aliases, or the composed per-room sub-beds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultiRoomCase {
+    /// `Designed#4` — the twin-room siege fixture.
+    TwinRoomSiege,
+    /// `BorderGauntlet::build(grade, seed)`.
+    BorderGauntlet { grade: u8, seed: u32 },
+    /// `StrongholdScenario::build(level, terrain, multi_room = true, seed)`.
+    Stronghold {
+        level: u8,
+        terrain: crate::harness::stronghold::StrongholdTerrain,
+        seed: u32,
+    },
+    /// Composed per-room sub-beds: a staging-room layout (between the rally and the exit) and a
+    /// target-room layout (the defended base), an opponent force, and a seed for the defense draw.
+    Composed {
+        staging: Layout,
+        target: Layout,
+        force: ForceSpec,
+        seed: u32,
+    },
+}
+
+/// **ADR 0023a Phase B — `MultiRoom`**: the seeded, ENUMERABLE multi-room generator. Every index
+/// decodes ([`MultiRoom::decode`]) to either one of the standing multi-room builders — the
+/// twin-room siege, the border gauntlet grades, the strongholds staged in the neighbour room — or
+/// a COMPOSED bed built per room through `ScenarioBuilder::in_room` (a staging-room layout the
+/// squad must thread to reach the exit + a target-room base with its own layout, force, ramparts
+/// and towers), with the objective carrying its room. Folding the builders in as indices makes
+/// them `run_suite`-able against any validator (the calibration lens, the traversal lens, the
+/// oscillation metric) instead of reachable only from their own tests.
+pub struct MultiRoom;
+
+impl MultiRoom {
+    /// Named indices come first (so the ladder's rungs keep stable positions), then the composed
+    /// family: `staging × target × force` with the seed derived from the index.
+    const NAMED: u32 = 1
+        + MR_GAUNTLET_GRADES.len() as u32
+        + (MR_STRONGHOLD_LEVELS.len() * MR_STRONGHOLD_TERRAINS.len()) as u32;
+    const COMPOSED: u32 = (MR_LAYOUTS.len() * MR_LAYOUTS.len() * MR_FORCES.len()) as u32;
+
+    /// Decode an index into the case it enumerates (pure — the same index always decodes the same).
+    pub fn decode(index: u32) -> MultiRoomCase {
+        let i = index % (Self::NAMED + Self::COMPOSED);
+        if i == 0 {
+            return MultiRoomCase::TwinRoomSiege;
+        }
+        let i = i - 1;
+        if (i as usize) < MR_GAUNTLET_GRADES.len() {
+            return MultiRoomCase::BorderGauntlet {
+                grade: MR_GAUNTLET_GRADES[i as usize],
+                seed: MR_GAUNTLET_SEED,
+            };
+        }
+        let i = i - MR_GAUNTLET_GRADES.len() as u32;
+        let strongholds = (MR_STRONGHOLD_LEVELS.len() * MR_STRONGHOLD_TERRAINS.len()) as u32;
+        if i < strongholds {
+            return MultiRoomCase::Stronghold {
+                level: MR_STRONGHOLD_LEVELS[(i as usize) % MR_STRONGHOLD_LEVELS.len()],
+                terrain: MR_STRONGHOLD_TERRAINS[(i as usize) / MR_STRONGHOLD_LEVELS.len()],
+                seed: MR_STRONGHOLD_SEED,
+            };
+        }
+        let i = (i - strongholds) as usize;
+        MultiRoomCase::Composed {
+            staging: MR_LAYOUTS[i % MR_LAYOUTS.len()],
+            target: MR_LAYOUTS[(i / MR_LAYOUTS.len()) % MR_LAYOUTS.len()],
+            force: MR_FORCES[(i / (MR_LAYOUTS.len() * MR_LAYOUTS.len())) % MR_FORCES.len()],
+            seed: index,
+        }
+    }
+}
+
+impl Generator for MultiRoom {
+    fn label(&self) -> &str {
+        "multi-room"
+    }
+    fn count(&self) -> u32 {
+        Self::NAMED + Self::COMPOSED
+    }
+    fn generate(&self, index: u32) -> Scenario {
+        use crate::harness::stronghold::{BorderGauntlet, StrongholdScenario};
+        match Self::decode(index) {
+            MultiRoomCase::TwinRoomSiege => twin_room_siege(),
+            MultiRoomCase::BorderGauntlet { grade, seed } => BorderGauntlet::build(grade, seed),
+            MultiRoomCase::Stronghold { level, terrain, seed } => {
+                StrongholdScenario::build(level, terrain, true, seed)
+            }
+            MultiRoomCase::Composed { staging, target, force, seed } => {
+                assemble_multi_room(index, staging, target, force, seed)
+            }
+        }
+    }
+}
+
+/// Compose a two-room bed per room through `ScenarioBuilder::in_room` (ADR 0023a §1 `MultiRoom`):
+/// the TARGET is the single-room defended base exactly as [`assemble_single_room`] lays it out (core
+/// at (25,25), breach gate + layout features to its WEST, so the approach from the west edge meets
+/// them); the STAGING room is the target's WEST neighbour, carrying its own layout MIRRORED so the
+/// feature sits between the rally (25,25) and the east exit the squad must reach. The objective
+/// carries the target room; the entry carries the staging room. `seed` draws the rampart hits and
+/// tower count (the calibration substrate's spread) so the family covers undefended → towered.
+fn assemble_multi_room(index: u32, staging: Layout, target: Layout, force: ForceSpec, seed: u32) -> Scenario {
+    let rm = room();
+    let staging_rm = west_neighbor(rm);
+    const CORE: (u8, u8) = (25, 25);
+    const RALLY: (u8, u8) = (25, 25);
+    let mut rng = Rng::seeded(seed);
+    let rampart_hits = rng.pick(&PERM_RAMPARTS);
+    let n_towers = rng.range(0, 3) as usize;
+
+    let (assault_pos, front_tiles, support_tiles, rampart_xy) = breach_geometry(rm, CORE);
+    // Staging room first: its layout, mirrored east–west (x → 49 − x) around the rally so the
+    // corridor gap / swamp band / bunker gap lies on the way to the EAST exit.
+    let mut b = ScenarioBuilder::empty(staging_rm);
+    let (walls, swamps) = layout_terrain(staging, (49 - RALLY.0, RALLY.1));
+    for (x, y) in walls {
+        b.world_mut().terrain_mut(staging_rm).walls.insert((49 - x, y));
+    }
+    for (x, y) in swamps {
+        b.world_mut().terrain_mut(staging_rm).swamps.insert((49 - x, y));
+    }
+    // Then the target room: the defended base.
+    let mut b = b.in_room(rm);
+    let (walls, swamps) = layout_terrain(target, CORE);
+    for (x, y) in walls {
+        b.world_mut().terrain_mut(rm).walls.insert((x, y));
+    }
+    for (x, y) in swamps {
+        b.world_mut().terrain_mut(rm).swamps.insert((x, y));
+    }
+    let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), CORE.0, CORE.1, 50_000, 50_000);
+    if rampart_hits > 0 {
+        b.structure(
+            StructureKind::Rampart,
+            Some(DEFENDER),
+            rampart_xy.0,
+            rampart_xy.1,
+            rampart_hits,
+            rampart_hits,
+        );
+    }
+    for &(tx, ty) in TOWER_TILES.iter().take(n_towers) {
+        b.tower(DEFENDER, tx, ty, 100_000);
+    }
+    let mut world = b.build();
+    place_force(&mut world, rm, CORE, force, DEFENDER);
+
+    Scenario {
+        world,
+        objectives: vec![Objective {
+            id: core_id,
+            room: rm,
+            pos: pos_in(rm, CORE.0, CORE.1),
+            assault_pos,
+            front_tiles,
+            support_tiles,
+            entry: pos_in(staging_rm, RALLY.0, RALLY.1),
+            kind: ObjectiveKind::Raze,
+        }],
+        attacker_owner: ATTACKER,
+        defender_owner: DEFENDER,
+        member_energy: 5600,
+        onsite_budget: 1400,
+        label: format!(
+            "multi-room#{index} staging:{staging:?} target:{target:?} {force:?} r{rampart_hits} t{n_towers}"
+        ),
+        seed: seed as u64,
     }
 }
 
@@ -1267,5 +1462,208 @@ impl Generator for ForemanGenerator {
         let kind = OBJECTIVE_KINDS[((index / n) % k) as usize];
         let comp_seed = index / (n * k);
         realize_base(base, kind, comp_seed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::run_suite;
+    use crate::harness::validate::{ManagedSquadIntegration, OracleCalibration, Validator};
+
+    /// A canonical, order-independent digest of a scenario (the terrain sets are sorted — a
+    /// `HashSet`'s `Debug` order is per-instance and must not leak into an equality check).
+    fn fingerprint(s: &Scenario) -> String {
+        let terrain = |t: &SimTerrain| {
+            let mut walls: Vec<_> = t.walls.iter().copied().collect();
+            let mut swamps: Vec<_> = t.swamps.iter().copied().collect();
+            let mut roads: Vec<_> = t.roads.iter().copied().collect();
+            walls.sort_unstable();
+            swamps.sort_unstable();
+            roads.sort_unstable();
+            format!("w{walls:?} s{swamps:?} r{roads:?}")
+        };
+        let mut rooms: Vec<(String, String)> = s
+            .world
+            .movement
+            .rooms
+            .iter()
+            .map(|(name, t)| (name.to_string(), terrain(t)))
+            .collect();
+        rooms.sort();
+        format!(
+            "{} seed{} e{} b{} default[{}] rooms{:?} structures{:?} towers{:?} creeps{:?} controllers{:?} safe{:?} objectives{:?}",
+            s.label,
+            s.seed,
+            s.member_energy,
+            s.onsite_budget,
+            terrain(&s.world.movement.terrain),
+            rooms,
+            s.world.structures,
+            s.world.towers,
+            s.world.movement.creeps,
+            s.world.controllers,
+            s.world.safe_mode_owner,
+            s.objectives
+        )
+    }
+
+    /// The generator is reproducible: the same index yields a byte-identical world twice (SplitMix64
+    /// over the index; no `HashMap` order leaks into the layout), and distinct indices are distinct.
+    #[test]
+    fn multi_room_enumerates_deterministically() {
+        let g = MultiRoom;
+        let probe = [0u32, 1, 4, 5, 9, 14, MultiRoom::NAMED, MultiRoom::NAMED + 17, g.count() - 1];
+        let mut seen = std::collections::BTreeSet::new();
+        for &i in &probe {
+            let a = fingerprint(&g.generate(i));
+            let b = fingerprint(&g.generate(i));
+            assert_eq!(a, b, "multi-room#{i} generates the same world twice");
+            assert!(seen.insert(a), "multi-room#{i} is distinct from every other probed index");
+        }
+    }
+
+    /// Every index stages the assault in a DIFFERENT room than its objective (the generator's
+    /// defining property), with the staging geometry populated and the entry on a walkable tile.
+    #[test]
+    fn multi_room_every_index_stages_across_the_seam() {
+        let g = MultiRoom;
+        assert_eq!(g.count(), MultiRoom::NAMED + MultiRoom::COMPOSED);
+        for i in 0..g.count() {
+            let s = g.generate(i);
+            assert!(!s.objectives.is_empty(), "{}: has an objective", s.label);
+            let o = &s.objectives[0];
+            assert_ne!(o.entry.room_name(), o.room, "{}: stages across the seam", s.label);
+            assert_eq!(o.pos.room_name(), o.room, "{}: the objective carries its room", s.label);
+            assert!(
+                !o.front_tiles.is_empty() && !o.support_tiles.is_empty(),
+                "{}: staged",
+                s.label
+            );
+            let t = s.world.terrain_for(o.entry.room_name());
+            assert!(
+                !t.is_wall(o.entry.x().u8(), o.entry.y().u8()),
+                "{}: the entry is walkable",
+                s.label
+            );
+        }
+    }
+
+    /// The named indices ALIAS the standing builders byte-for-byte (the ladder's rungs are the
+    /// same worlds under the generator), so a `run_suite` over `MultiRoom` grades the very rungs the
+    /// stronghold floor pins.
+    #[test]
+    fn multi_room_named_indices_alias_their_builders() {
+        use crate::harness::stronghold::{BorderGauntlet, StrongholdScenario, StrongholdTerrain};
+        let g = MultiRoom;
+        assert_eq!(MultiRoom::decode(0), MultiRoomCase::TwinRoomSiege);
+        assert_eq!(fingerprint(&g.generate(0)), fingerprint(&Designed.generate(4)));
+        assert_eq!(
+            fingerprint(&g.generate(2)),
+            fingerprint(&BorderGauntlet::build(2, 3))
+        );
+        assert_eq!(
+            MultiRoom::decode(5),
+            MultiRoomCase::Stronghold {
+                level: 1,
+                terrain: StrongholdTerrain::Open,
+                seed: 1
+            }
+        );
+        assert_eq!(
+            fingerprint(&g.generate(12)),
+            fingerprint(&StrongholdScenario::build(3, StrongholdTerrain::Chokepoint, true, 1))
+        );
+        assert!(matches!(
+            MultiRoom::decode(MultiRoom::NAMED),
+            MultiRoomCase::Composed {
+                staging: Layout::Open,
+                target: Layout::Open,
+                force: ForceSpec::None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MultiRoom::decode(g.count() - 1),
+            MultiRoomCase::Composed {
+                staging: Layout::Bunker,
+                target: Layout::Bunker,
+                force: ForceSpec::Guard(2),
+                ..
+            }
+        ));
+    }
+
+    /// Every index is ASSESSABLE under the sizing-pure calibration lens (mirrors the imported-room
+    /// gate): the oracle runs over the whole enumeration without panicking, one verdict per index.
+    #[test]
+    fn multi_room_every_index_is_assessable() {
+        let g = MultiRoom;
+        let mut v = OracleCalibration::new();
+        let report = run_suite(&g, &mut v);
+        assert_eq!(
+            report.verdicts.len(),
+            g.count() as usize,
+            "a verdict per scenario"
+        );
+    }
+
+    /// The composed beds put the staging layout BETWEEN the rally and the exit (mirrored), so the
+    /// traversal lens actually has to thread it: the corridor's gap lies east of the rally.
+    #[test]
+    fn multi_room_composed_staging_layout_lies_on_the_way_to_the_exit() {
+        // staging = Corridor (index NAMED + 1), target = Open, no force.
+        let s = MultiRoom.generate(MultiRoom::NAMED + 1);
+        let o = &s.objectives[0];
+        let staging = s.world.terrain_for(o.entry.room_name());
+        let rally_x = o.entry.x().u8();
+        let wall_xs: std::collections::BTreeSet<u8> =
+            staging.walls.iter().map(|&(x, _)| x).collect();
+        assert_eq!(
+            wall_xs.len(),
+            1,
+            "one corridor wall column in the staging room: {wall_xs:?}"
+        );
+        let wx = *wall_xs.iter().next().unwrap();
+        assert!(
+            wx > rally_x,
+            "the corridor wall (x={wx}) stands between the rally (x={rally_x}) and the east exit"
+        );
+        assert!(
+            !staging.is_wall(wx, 25),
+            "the corridor keeps its gap at the rally's row"
+        );
+        assert!(
+            s.world.terrain_for(o.room).walls.is_empty(),
+            "the Open target room has no terrain walls"
+        );
+    }
+
+    /// The twin-room index crosses the border under the traversal lens — the Designed#4 crossing
+    /// re-expressed over the generator (so it grades wherever `MultiRoom` is swept).
+    #[test]
+    fn multi_room_twin_index_crosses_the_border() {
+        let s = MultiRoom.generate(0);
+        let verdict = ManagedSquadIntegration.validate(&s);
+        assert!(
+            verdict.pass,
+            "the assault did not cross into the objective room + engage: {}",
+            verdict.detail
+        );
+    }
+
+    /// Dashboard: every `MultiRoom` index under the traversal lens. Reading aid, asserts nothing.
+    /// `cargo test --release -p screeps-combat-eval --lib multi_room_traversal_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn multi_room_traversal_sweep() {
+        let report = run_suite(&MultiRoom, &mut ManagedSquadIntegration);
+        println!(
+            "\n=== MULTI-ROOM × traversal lens ({}/{} pass) ===",
+            report.passed, report.scenarios
+        );
+        for (i, v) in report.verdicts.iter().enumerate() {
+            println!("  {:>3}  {}  {}", i, if v.pass { "ok " } else { "NO " }, v.detail);
+        }
     }
 }

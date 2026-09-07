@@ -457,6 +457,7 @@ fn play_bed_bodies(
 /// asymmetric-pin runner: since the honest-flee behavior an outmatched mirror side correctly runs
 /// forever (equal speed ⇒ uncatchable ⇒ margin 0), a decisiveness pin needs a defender that
 /// commits to the fight.
+#[cfg(test)]
 fn play_bed_bodies_holding_defender(
     bed: Bed,
     a_bodies: &[SimBody],
@@ -1461,12 +1462,12 @@ mod tests {
 
     /// WS-4 / R19 (ADR 0044) — the CHOKEPOINT RE-TUNE pass. Ranks the fine kernel grid (48 configs)
     /// + the catalog modes against the SHIPPED default over [`chokepoint_comp_basket`] (synthetic +
-    /// imported real terrain + 6 procedural cave seeds), reporting each config's payoff PER REGIME
-    /// (synthetic / imported / generated) and ranking by MIN-over-regimes (maximin — the R19
-    /// criterion is GENERALIZATION: a config must not buy its open-field edge with a chokepoint
-    /// regression, which a net average could hide). The shipped default scores 0 by construction;
-    /// `open_combat`'s row reproduces the R19 finding for reference. Run:
-    /// `cargo test --release -p screeps-combat-eval --lib r19_chokepoint_retune -- --ignored --nocapture`.
+    ///   imported real terrain + 6 procedural cave seeds), reporting each config's payoff PER REGIME
+    ///   (synthetic / imported / generated) and ranking by MIN-over-regimes (maximin — the R19
+    ///   criterion is GENERALIZATION: a config must not buy its open-field edge with a chokepoint
+    ///   regression, which a net average could hide). The shipped default scores 0 by construction;
+    ///   `open_combat`'s row reproduces the R19 finding for reference. Run:
+    ///   `cargo test --release -p screeps-combat-eval --lib r19_chokepoint_retune -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn r19_chokepoint_retune() {

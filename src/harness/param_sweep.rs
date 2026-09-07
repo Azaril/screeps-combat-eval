@@ -338,11 +338,11 @@ mod tests {
     /// - `SWEEP_OVERPOWER`    over_power_margin list, default `1.3,1.5,1.8`
     /// - `SWEEP_MEMBER_ENERGY` member_energy list, default `1300,2000,3000,5400`
     /// - `SWEEP_COMMIT`       commit_ev_threshold list, default `0` (Tier-1 leaves the EV floor at the seed;
-    ///                        the 0.1·V / 0.2·V rungs need a target_value, swept in a later tier)
+    ///   the 0.1·V / 0.2·V rungs need a target_value, swept in a later tier)
     /// - `SWEEP_DYNAMIC`      dynamic_margin list, default `1.0`
     /// - `SWEEP_W_ENERGY`     w_energy list, default `0.001` (the seed)
     /// - `SWEEP_TOUGH`        reserved (the TOUGH ladder is internal to `optimize_composition`; accepted +
-    ///                        ignored so the explore env stays forward-compatible)
+    ///   ignored so the explore env stays forward-compatible)
     /// - `SWEEP_REGIME`       `structure|creep|defended|all`, default `all`
     /// - `SWEEP_OUT`          output path, default `<scratch>/sweep_composition_params.txt`
     ///
@@ -406,7 +406,7 @@ mod tests {
         // of completion order). The Default baseline is scored too (appended) so the table shows it inline.
         let default = CompositionParams::default();
         let mut all = candidates.clone();
-        if !all.iter().any(|c| *c == default) {
+        if !all.contains(&default) {
             all.push(default);
         }
         let scored: Vec<(CompositionParams, ParamScore)> = all

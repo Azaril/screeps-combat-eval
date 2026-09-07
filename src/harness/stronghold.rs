@@ -703,6 +703,176 @@ impl BorderGauntlet {
     }
 }
 
+// ── The cross-border ROUT bed (the flee counterpart of the gauntlet — ADR 0023 cross-room Flee) ───
+
+/// What a FORCED crossing into over-strength campers did after contact (see [`run_border_rout`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutOutcome {
+    /// Why the evaluation stopped.
+    pub stop: crate::harness::evaluate::StopReason,
+    pub ticks: u32,
+    /// First tick an attacker took damage INSIDE the target room (the crossing met the campers).
+    pub contact_tick: Option<u32>,
+    /// First tick after contact when the retreat leg had carried the crossers back across the
+    /// seam: at least one attacker alive, EVERY living attacker outside the target room, no
+    /// attacker death on that tick, and at least one of the living had stood in the target room
+    /// since contact (so a wipe inside the room can never read as a withdrawal).
+    pub withdrew_tick: Option<u32>,
+    /// Living attackers at `withdrew_tick` that had stood in the target room since contact (0
+    /// when never withdrew).
+    pub exited_alive: usize,
+    /// First tick after contact when EVERY living attacker stood in the staging room within
+    /// [`RALLY_REACH`] of the rally — the rout carried the survivors back to the rally itself.
+    pub rallied_tick: Option<u32>,
+    /// Living attackers at `rallied_tick` (0 when never rallied).
+    pub rallied_survivors: usize,
+    /// Living attackers at the end.
+    pub survivors: usize,
+}
+
+/// How close to the rally a routed survivor must stand to count as rallied — the Retreating
+/// travel arm's `MoveTo(rally, range 3)` plus the folded-slot spread of a regrouping bloc.
+pub const RALLY_REACH: u32 = 6;
+
+/// Field `comp` at the scenario's entry WITHOUT asking the sizing oracle (the oracle DEFERS on
+/// these grades — that is the honest ladder verdict, and the point here is what the squad does
+/// when it is in the room anyway: a mis-sized live commit, a target that grew since the
+/// assessment) and drive the real managed brain with its rally set. Grades the RETREAT leg:
+/// contact inside the target room, then the rout-to-rally path carrying the survivors back
+/// across the border to the staging-room rally (Phase 4.5 items 2/3 machinery), and the
+/// lone-survivor stall signature (`Timeout` with one attacker left).
+pub fn run_border_rout(
+    scenario: &Scenario,
+    level: u8,
+    comp: &screeps_combat_decision::composition::SquadComposition,
+) -> Option<RoutOutcome> {
+    use crate::harness::evaluate::{evaluate_recorded, AnyOf, ObjectivesDestroyed, SideWiped};
+    use crate::harness::validate::{merge_intents, place_at_entry};
+    use screeps_combat_agent::squad::ManagedSimSquad;
+
+    let obj = &scenario.objectives[0];
+    let mut world = scenario.world.clone();
+    let att_ids = place_at_entry(&mut world, obj, comp, scenario.attacker_owner, scenario.member_energy)?;
+    let def_ids: Vec<u32> = scenario
+        .world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner == scenario.defender_owner)
+        .map(|c| c.id)
+        .collect();
+    let mut att = ManagedSimSquad::new(scenario.attacker_owner, att_ids, obj.assault_pos).with_rally(obj.entry);
+    let mut def = ManagedSimSquad::new(scenario.defender_owner, def_ids, obj.pos)
+        .with_intent(screeps_combat_decision::EngageObjective::Hold);
+    let conditions: Vec<Box<dyn crate::harness::evaluate::RunUntil>> = vec![
+        Box::new(ObjectivesDestroyed(vec![obj.id])),
+        Box::new(SideWiped(scenario.attacker_owner)),
+    ];
+    let run_until = AnyOf(conditions);
+    let (outcome, rec) = evaluate_recorded(
+        world,
+        &mut |w| att.step(w),
+        &mut |w, intents| {
+            let d = def.step(w);
+            merge_intents(intents, d);
+            stronghold_tower_intents(w, level, scenario.defender_owner, intents);
+        },
+        &run_until,
+        scenario.onsite_budget,
+    );
+
+    let attacker = scenario.attacker_owner;
+    let m = rout_metrics(&rec.frames, attacker, obj.room, obj.entry);
+    let survivors = outcome
+        .world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner == attacker)
+        .count();
+    Some(RoutOutcome {
+        stop: outcome.stop,
+        ticks: outcome.ticks,
+        contact_tick: m.contact_tick,
+        withdrew_tick: m.withdrew_tick,
+        exited_alive: m.exited_alive,
+        rallied_tick: m.rallied_tick,
+        rallied_survivors: m.rallied_survivors,
+        survivors,
+    })
+}
+
+/// The frame-derived half of a [`RoutOutcome`] (see its field docs).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RoutMetrics {
+    contact_tick: Option<u32>,
+    withdrew_tick: Option<u32>,
+    exited_alive: usize,
+    rallied_tick: Option<u32>,
+    rallied_survivors: usize,
+}
+
+/// Read the rout metrics off a recording (pure): contact = the first frame an attacker is hit
+/// inside `target_room`; withdrawal = the first later frame with at least one attacker alive,
+/// every living attacker outside `target_room`, no attacker death on that tick, and at least one
+/// living attacker that had stood in `target_room` since contact (`exited_alive` counts them) —
+/// a member that never crossed cannot make a wipe inside the room read as a retreat; rallied =
+/// the first later frame with every living attacker within [`RALLY_REACH`] of `rally`.
+fn rout_metrics(
+    frames: &[screeps_combat_engine::record::TickFrame],
+    attacker: screeps_combat_engine::PlayerId,
+    target_room: RoomName,
+    rally: Position,
+) -> RoutMetrics {
+    use screeps_combat_engine::record::CreepFrame;
+    let mut m = RoutMetrics::default();
+    // Attackers seen alive inside the target room since contact (id-keyed, order-free).
+    let mut entered: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for f in frames {
+        let living: Vec<&CreepFrame> = f.creeps.iter().filter(|c| c.owner == attacker && c.hits > 0).collect();
+        if m.contact_tick.is_none() {
+            // Damaged-and-alive in the target room, or killed there outright this tick (a death
+            // frame still carries the creep at its last position with the hits it had).
+            let hit_in_room = |c: &CreepFrame| {
+                c.owner == attacker && c.room == target_room && (c.hits < c.hits_max || f.deaths.contains(&c.id))
+            };
+            if !f.creeps.iter().any(hit_in_room) {
+                continue;
+            }
+            m.contact_tick = Some(f.tick);
+        }
+        entered.extend(living.iter().filter(|c| c.room == target_room).map(|c| c.id));
+        if m.contact_tick == Some(f.tick) {
+            continue; // the metrics below start the frame after contact
+        }
+        let attacker_died = f
+            .deaths
+            .iter()
+            .any(|id| f.creeps.iter().any(|c| c.id == *id && c.owner == attacker));
+        if m.withdrew_tick.is_none() && !living.is_empty() && !attacker_died && living.iter().all(|c| c.room != target_room)
+        {
+            let exited = living.iter().filter(|c| entered.contains(&c.id)).count();
+            if exited > 0 {
+                m.withdrew_tick = Some(f.tick);
+                m.exited_alive = exited;
+            }
+        }
+        if m.rallied_tick.is_none() && !living.is_empty() {
+            let at_rally = |c: &&CreepFrame| {
+                c.room == rally.room_name()
+                    && Position::new(RoomCoordinate::new(c.x).unwrap(), RoomCoordinate::new(c.y).unwrap(), c.room)
+                        .get_range_to(rally)
+                        <= RALLY_REACH
+            };
+            if living.iter().all(at_rally) {
+                m.rallied_tick = Some(f.tick);
+                m.rallied_survivors = living.len();
+            }
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +980,123 @@ mod tests {
                 s.label
             );
         }
+    }
+
+    /// ADR 0023 cross-room Flee, squad side — the flee counterpart of the gauntlet's kill side,
+    /// pinned as the HONEST current baseline (the same convention as the L1@T0 defer above): a
+    /// ranged+heal quad FORCED across the border into the g2 camp (the oracle would not field it —
+    /// the bed asks what the brain does when an under-strength squad is in the room anyway) meets
+    /// the campers, and the retreat leg carries the crossers BACK ACROSS the seam (the withdraw
+    /// half of the rout works), with no lone-survivor `Timeout` stall (the item-3 watch bar).
+    ///
+    /// What does NOT hold yet, pinned so the fix is LOUD: the rally is never REACHED. `Retreating`
+    /// decays to `Forming` the moment no member stands in the fight room (the WS-VAL decay that
+    /// un-deadlocked the vanguard withdrawal), the bloc gate re-releases, and the single open column
+    /// funnels the members back in one at a time — trickle-and-die to `SideWiped`. The rally is a
+    /// DIRECTION, not a destination, until a re-entry/give-up rule exists (ADR 0027 Retreating
+    /// decay write-back; the M23 economic give-up is the designed answer). When `rallied_tick`
+    /// turns `Some`, promote this pin to assert it.
+    #[test]
+    fn border_rout_withdraws_across_the_seam_but_never_reaches_the_rally_yet() {
+        use crate::harness::evaluate::StopReason;
+        use crate::harness::validate::managed_assault_comp;
+        let s = BorderGauntlet::build(2, 3);
+        let comp = managed_assault_comp(&s);
+        let out = run_border_rout(&s, 1, &comp).expect("the quad fields at the staging entry");
+        println!("{}: {out:?}", s.label);
+        let contact = out.contact_tick.expect("the crossing met the campers inside the target room");
+        let withdrew = out
+            .withdrew_tick
+            .unwrap_or_else(|| panic!("the retreat leg carried the crossers back across the seam after contact at t{contact}: {out:?}"));
+        assert!(
+            withdrew - contact <= 4,
+            "the withdraw across the seam is immediate, not a slow bleed ({out:?})"
+        );
+        assert!(
+            out.exited_alive >= 1,
+            "the withdrawal is a crosser LEAVING alive, not the room-side members dying ({out:?})"
+        );
+        assert!(
+            !(out.stop == StopReason::Timeout && out.survivors == 1),
+            "no lone-survivor timeout stall (the item-3 signature): {out:?}"
+        );
+        // The HONEST BASELINE (2026-09-07, measured under the seam-gated engine — WS-CLOSE Phase B):
+        // the crossers withdraw across the seam alive (t35, three exited) and then the rout STOPS
+        // at the seam: Retreating decays to Forming, the bloc gate re-releases nobody, and the
+        // survivors (2) idle un-rallied to the timeout. Before the engine's same-room targeting gate
+        // the campers kept hitting the withdrawn crossers ACROSS the seam and the bed wiped at t69 —
+        // that wipe was the fidelity leak, not the rout. The un-rallied multi-survivor timeout is
+        // the same stall class as the item-3 lone-survivor signature (tracker §6 0034 F7: the
+        // rout-to-rally leg ends at the seam); flip these when the rally leg lands.
+        assert_eq!(
+            out.rallied_tick, None,
+            "BASELINE MOVED: the rout now reaches the staging rally — promote this pin ({out:?})"
+        );
+        assert_eq!(
+            out.stop,
+            StopReason::Timeout,
+            "BASELINE MOVED: the withdrawn survivors no longer idle at the seam to the timeout ({out:?})"
+        );
+        assert!(
+            out.survivors >= 2,
+            "the withdrawal keeps more than a lone survivor alive under the seam-gated engine ({out:?})"
+        );
+    }
+
+    /// The rout bed's withdrawal metric cannot be satisfied by dying inside the target room: a
+    /// member that never crossed, left alone outside after the crosser is killed in the room, is
+    /// NOT a withdrawal (`withdrew_tick` stays `None`, `exited_alive` 0); the crosser leaving the
+    /// room alive after contact IS (with `exited_alive` counting it).
+    #[test]
+    fn rout_withdrawal_needs_a_crosser_to_leave_alive_not_die_in_room() {
+        use screeps_combat_engine::record::{CreepFrame, TickFrame};
+        let staging: RoomName = "W0N1".parse().unwrap();
+        let target: RoomName = "W1N1".parse().unwrap();
+        let rally = Position::new(RoomCoordinate::new(25).unwrap(), RoomCoordinate::new(25).unwrap(), staging);
+        let creep = |id: u32, room: RoomName, x: u8, hits: u32| CreepFrame {
+            id,
+            owner: ATTACKER,
+            room,
+            x,
+            y: 25,
+            hits,
+            hits_max: 1000,
+            fatigue: 0,
+            attack_power: 0,
+            ranged_power: 30,
+            composition: [0; 7],
+        };
+        let frame = |tick: u32, creeps: Vec<CreepFrame>, deaths: Vec<u32>| TickFrame {
+            tick,
+            creeps,
+            deaths,
+            ..Default::default()
+        };
+        // A (1) never crosses; B (2) crosses, is hit at t1, dies in the room at t2.
+        let death_in_room = vec![
+            frame(0, vec![creep(1, staging, 2, 1000), creep(2, target, 47, 1000)], vec![]),
+            frame(1, vec![creep(1, staging, 2, 1000), creep(2, target, 46, 500)], vec![]),
+            frame(2, vec![creep(1, staging, 2, 1000), creep(2, target, 46, 200)], vec![2]),
+            frame(3, vec![creep(1, staging, 2, 1000)], vec![]),
+            frame(4, vec![creep(1, staging, 2, 1000)], vec![]),
+        ];
+        let m = rout_metrics(&death_in_room, ATTACKER, target, rally);
+        assert_eq!(m.contact_tick, Some(1));
+        assert_eq!(
+            m.withdrew_tick, None,
+            "B dying inside the room must not read as a withdrawal: {m:?}"
+        );
+        assert_eq!(m.exited_alive, 0);
+        // B is hit at t1 and steps back across the seam alive at t2 → withdrew at t2, one exited.
+        let left_alive = vec![
+            frame(0, vec![creep(1, staging, 2, 1000), creep(2, target, 47, 1000)], vec![]),
+            frame(1, vec![creep(1, staging, 2, 1000), creep(2, target, 48, 500)], vec![]),
+            frame(2, vec![creep(1, staging, 2, 1000), creep(2, staging, 49, 500)], vec![]),
+        ];
+        let m = rout_metrics(&left_alive, ATTACKER, target, rally);
+        assert_eq!(m.contact_tick, Some(1));
+        assert_eq!(m.withdrew_tick, Some(2), "{m:?}");
+        assert_eq!(m.exited_alive, 1);
     }
 
     /// WS-VAL — the ESCALATION GAUNTLET (operator 2026-08-23: "increasingly challenging scenarios

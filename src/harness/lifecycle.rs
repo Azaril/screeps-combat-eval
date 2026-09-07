@@ -20,6 +20,7 @@
 use screeps::{Position, RoomCoordinate};
 use screeps_combat_decision::bodies::MoveProfile;
 use screeps_combat_decision::composition::SquadComposition;
+use screeps_econ_decision::spawn_policy::{forming_burn_rate_milli, should_abandon_forming, EconomicGiveUp};
 use screeps_econ_engine::spawn_queue::{spawn_step, HomeLanes, QueuedSpawn};
 use screeps_combat_decision::{fielding, rally};
 use std::collections::BTreeSet;
@@ -45,6 +46,7 @@ pub struct EconomyPressure {
 }
 
 /// A colony forming scenario: who is being fielded, against what economy, at what bid.
+#[derive(Clone, Debug)]
 pub struct ColonyFormingScenario {
     pub composition: SquadComposition,
     pub homes: Vec<Home>,
@@ -277,6 +279,40 @@ pub const MAX_FORMING_BUDGET: u32 = 3000;
 /// realistic multi-room hop with margin.
 pub const MAX_TRAVEL_BUDGET: u32 = 1000;
 
+// (The REC-003 retreat budget and the ADR 0042 economic-give-up streak are NOT mirrored here — parity
+// M22/M23: the drivers run the SHARED `lifecycle::{RetreatClock, MAX_RETREAT_BUDGET}` and
+// `spawn_policy::{EconomicGiveUp, FORMING_ABANDON_STREAK}` kernels the live manager runs.)
+
+/// Parity M23 — per-slot body cost at the driver's build energy (`min(best_capacity, per_member_cap)`,
+/// the SAME energy K3 builds at). Mirrors the live `roster_present_cost`: the sunk body energy of the
+/// PRESENT members, whose lifetime bleeds while the squad forms. An unbuildable slot costs 0 — it can
+/// never be present.
+fn slot_body_costs(comp: &SquadComposition, build_energy: u32) -> Vec<u32> {
+    comp.slots
+        .iter()
+        .map(|slot| {
+            slot.body_type
+                .build_body(build_energy, MoveProfile::Plains)
+                .map(|body| body.iter().map(|p| p.cost()).sum())
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// The present roster's summed body cost (`filled[i]` ⇒ slot `i` is present).
+fn present_roster_cost(slot_costs: &[u32], filled: &[bool]) -> u32 {
+    slot_costs.iter().zip(filled).filter(|(_, f)| **f).map(|(c, _)| *c).sum()
+}
+
+/// Parity M23 — the manager's EXACT composition of the economic give-up input (ADR 0042 §5): a
+/// safe-moded target is EXEMPT (a bounded window, not permanent unwinnability); otherwise abandon iff
+/// the objective's completed rate cannot cover the burn of holding the present roster, at the
+/// conservative `opportunity_floor = 0` (ADR 0043 A2 raises it once the civilian lane is true-EV). The
+/// caller latches it through the shared [`EconomicGiveUp`].
+fn economic_abandon_now(objective_rate_milli: u32, present_cost_e: u32, target_safe_mode: bool) -> bool {
+    !target_safe_mode && should_abandon_forming(objective_rate_milli, forming_burn_rate_milli(present_cost_e), 0)
+}
+
 /// How the target room presents to a squad that ARRIVES — the contested-ness (drives the rally gate) and
 /// whether its room DTOs are populated on the arrival tick (the empty-DTO-on-arrival break).
 #[derive(Clone, Copy, Debug)]
@@ -347,6 +383,20 @@ pub struct ChurnTarget {
     /// `DeployedAndEngaged`). Models the divergence the kernel unit test
     /// `winnable_fight_with_critical_member_retreats_but_does_not_lose_so_does_not_abandon` proves.
     pub winnable_retreat_in_room: bool,
+    /// D28 (combat review §7.2a; parity M21) — the target room is LIVE-VISIBLE on arrival and holds ZERO
+    /// hostile creeps: the vacuous-clear evidence. The driver feeds the manager's exact form
+    /// (`vacuous_clear = in_target_room && live_visible_clear && !is_defend`, squad_manager
+    /// `game::rooms().get(room).is_some() && hostile().is_empty()`), and — because an empty room offers
+    /// no focus — an OFFENSE arrival does NOT short-circuit to `DeployedAndEngaged`: the shared kernel
+    /// decides, and its `Retire{Resolved, withdraw}` WITHOUT `engaged_once` is reported as
+    /// [`ChurnOutcome::VacuouslyResolved`]. `false` (the default) keeps every vision-gap fixture's
+    /// pre-D28 meaning (an empty-DTO arrival is NOT a live-visible clear — R10).
+    pub live_visible_clear: bool,
+    /// Parity M23 — the target room is under SAFE MODE: the economic forming give-up is SKIPPED (ADR
+    /// 0042 §5 — a bounded window, not permanent unwinnability), exactly as the manager's
+    /// `target_safe_mode` exemption. Only the give-up input reads it (the rally gate's uncontested
+    /// classification is `uncontested`, unchanged).
+    pub target_safe_mode: bool,
 }
 
 impl Default for ChurnTarget {
@@ -363,6 +413,8 @@ impl Default for ChurnTarget {
             arrival_has_towers: false,
             abandon_fixes_enabled: true, // default to the FIXED bot behaviour
             winnable_retreat_in_room: false,
+            live_visible_clear: false, // a vision-gap arrival is NOT a live-visible clear (R10)
+            target_safe_mode: false,
         }
     }
 }
@@ -490,6 +542,11 @@ pub fn run_lifecycle_churn_spatial(
     let engaged_once = false;
     let mut gen_start: u32 = 0;
     let mut travel_start: u32 = 0;
+    // Parity M23: the ECONOMIC forming give-up (ADR 0042 §5) — the shared K-tick latch over the present
+    // roster's burn vs the objective's rate. The spatial repro has no target-room model, so the target is
+    // never safe-moded here (the exemption is pinned through `run_lifecycle_churn`'s `target_safe_mode`).
+    let slot_costs = slot_body_costs(&s.composition, best_capacity.min(s.per_member_cap));
+    let mut economic_giveup = EconomicGiveUp::default();
 
     // Spatial member state: each member starts AT its home; `member_pos[i]` is set when slot i is present.
     let mut member_pos: Vec<WPos> = travel.homes.clone();
@@ -670,7 +727,15 @@ pub fn run_lifecycle_churn_spatial(
         // Reconcile (the shared kernel).
         let forming = has_members && !engaged_once && !departed && present < n_slots;
         let forming_progress = forming && present > prev_present;
-        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET;
+        // Parity M23: the forming lease is bounded by the clock AND the economic give-up (the manager's
+        // `budget_clock_remaining && !economic_giveup`) — the shared latch advances only while forming.
+        let economic_giveup_fired = if forming {
+            economic_giveup.advance(economic_abandon_now(s.objective_rate_milli, present_roster_cost(&slot_costs, &filled), false))
+        } else {
+            economic_giveup = EconomicGiveUp::default();
+            false
+        };
+        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET && !economic_giveup_fired;
         let travel_budget_remaining = tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET;
         let deadline_lapsed = tick >= deadline;
         let snapshot = ReconcileSnapshot {
@@ -681,10 +746,9 @@ pub fn run_lifecycle_churn_spatial(
             wiped: false,
             has_focus: false,
             engaged_once,
-            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
-            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
-            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
-            // scenario would set this true.
+            // D28: the spatial repro's arrival is the assault reaching the target room (a contested
+            // target with a focus) — never a live-visible EMPTY room, so the vacuous-clear evidence is
+            // absent (M21 is exercised by `run_lifecycle_churn`'s `live_visible_clear` + `run_v1_flow`).
             vacuous_clear: false,
             in_target_room,
             has_members,
@@ -699,7 +763,7 @@ pub fn run_lifecycle_churn_spatial(
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // ADR 0027 v1 reassign is exercised by `run_v1_flow`, not here
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
-            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by this driver
+            retreat_budget_exhausted: false, // REC-003 retreat bound — the in-room clock is `run_stall_flow` (M22)
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -727,6 +791,7 @@ pub fn run_lifecycle_churn_spatial(
                 deadline = tick + COMMITMENT_BUDGET;
                 prev_present = 0;
                 gen_start = tick;
+                economic_giveup = EconomicGiveUp::default();
                 member_pos = travel.homes.clone();
                 anchor = travel.rally;
                 departed = false;
@@ -865,6 +930,10 @@ pub enum ChurnOutcome {
     Reassigned {
         from_gen: u32,
         reassignments: u32,
+        /// D28 (parity M21): how many of `reassignments` were driven by the VACUOUS clear (the kernel's
+        /// `Reassign{withdraw_old: true}` on the arrival evidence — an empty live-visible room — with
+        /// `engaged_once` never latched).
+        vacuous_reassignments: u32,
         engage_tick: u32,
     },
     /// ADR 0035 (RED — the vacuous-intel engage cascade). The squad COMMITTED to a towered room on an EMPTY
@@ -881,6 +950,17 @@ pub enum ChurnOutcome {
     /// `generations` STABLE (the room sits in backoff, to be re-scouted when it expires). The de-commit is
     /// clean and bounded, ending the oscillation.
     AbandonedOnContact { generations: u32 },
+    /// D28 (combat review §7.2a; parity M21) — the VACUOUS clear: the squad massed in a LIVE-VISIBLE,
+    /// hostile-free target room and the shared kernel resolved it on the arrival evidence alone —
+    /// `engaged_once` NEVER latched (an empty room offers no focus). `withdraw`/`mark_unwinnable` are the
+    /// kernel's literal `Retire{Resolved, ..}` fields (a clean win: withdrawn, never backed off). The
+    /// pre-D28 gate held this squad until the budgets forced a GaveUp (the live border-oscillation hold).
+    VacuouslyResolved {
+        generations: u32,
+        resolve_tick: u32,
+        withdraw: bool,
+        mark_unwinnable: bool,
+    },
 }
 
 /// One squad-generation's lifecycle phase in the churn driver.
@@ -931,6 +1011,11 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
     let mut phase = Phase::Forming;
     let mut gen_start: u32 = 0; // tick this generation started forming (the forming-budget clock)
     let mut travel_start: u32 = 0; // tick the squad departed home (the travel-budget clock)
+    // Parity M23: the ECONOMIC forming give-up (ADR 0042 §5) — the SHARED K-tick latch (the same
+    // `EconomicGiveUp` the manager advances) over the present roster's burn vs the objective's rate, with
+    // the manager's safe-mode exemption (`target.target_safe_mode`). Reset per generation.
+    let slot_costs = slot_body_costs(&s.composition, best_capacity.min(s.per_member_cap));
+    let mut economic_giveup = EconomicGiveUp::default();
 
     // ── ADR 0035 H1/D3 — the COMMIT-TIME uncontested view (vacuous intel). During Forming/Travel the squad
     // commits on the (possibly EMPTY) cached snapshot; the manager's D3 fix decides `uncontested` from the
@@ -1086,6 +1171,12 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                         engaged_once = true;
                         retreated_from_contact = target.abandon_fixes_enabled;
                         // (when fixes disabled, the kernel sees a focus-less in-room engaged squad = a "clear")
+                    } else if target.live_visible_clear {
+                        // D28 (parity M21): the room is LIVE-VISIBLE and EMPTY — there is no focus to
+                        // compute and nothing to engage, so `engaged_once` can NEVER latch here. Do NOT
+                        // short-circuit: fall through to the shared kernel with the vacuous-clear evidence
+                        // (built below) and let IT decide — the pre-D28 gate held this squad until the
+                        // budgets forced a GaveUp (the live border-oscillation hold, obj 3423/W12N51).
                     } else {
                         // OFFENSE, clear room: once the room DTOs are readable a focus is computed and the
                         // squad ENGAGES — the deep bug is absent.
@@ -1107,7 +1198,19 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         //    `forming` mirrors the bot's `forming_state`: members, not engaged, below the requested roster.
         let forming = has_members && !engaged_once && phase == Phase::Forming && present < n_slots;
         let forming_progress = forming && present > prev_present;
-        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET;
+        // Parity M23: the forming lease is bounded by the clock AND the economic give-up — the manager's
+        // exact `budget_clock_remaining && !economic_giveup`; the shared latch advances only while forming.
+        let economic_giveup_fired = if forming {
+            economic_giveup.advance(economic_abandon_now(
+                s.objective_rate_milli,
+                present_roster_cost(&slot_costs, &filled),
+                target.target_safe_mode,
+            ))
+        } else {
+            economic_giveup = EconomicGiveUp::default();
+            false
+        };
+        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET && !economic_giveup_fired;
         let travel_budget_remaining = tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET;
         let deadline_lapsed = tick >= deadline;
         // FIX B2: a Defend squad GARRISONING its clear owned room (arrived, no in-room focus) holds its lease
@@ -1116,6 +1219,11 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
         // offense squad this is always false. The shared kernel is unchanged either way.
         let holding_station =
             target.garrison_holds && target.is_defend && in_target_room && !has_focus;
+        // D28 (parity M21): the manager's EXACT vacuous-clear evidence form — members stand in the room
+        // AND the room is live-visible with zero hostiles AND this is not a Defend garrison (whose quiet
+        // hold is deliberate — FIX B2). The vision-gap fixtures leave `live_visible_clear=false`
+        // (an empty-DTO arrival is NOT a live-visible clear — R10), so their pre-D28 meaning is intact.
+        let vacuous_clear = in_target_room && target.live_visible_clear && !target.is_defend;
         let snapshot = ReconcileSnapshot {
             objective_gone: false,
             duplicate: false,
@@ -1124,11 +1232,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             wiped: false,
             has_focus,
             engaged_once,
-            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
-            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
-            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
-            // scenario would set this true.
-            vacuous_clear: false,
+            vacuous_clear,
             in_target_room,
             has_members,
             forming,
@@ -1144,7 +1248,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
             // ADR 0035 D4 — the in-room LOST-FIGHT signal. Set only on arrival at a towered room with the
             // fixes enabled (the kernel then ABANDONS-with-backoff instead of mis-resolving the retreat).
             retreated_from_contact,
-            retreat_budget_exhausted: false, // REC-003 retreat bound — this driver exercises the D4 abandon, not the budget
+            retreat_budget_exhausted: false, // REC-003 retreat bound — the in-room clock is `run_stall_flow` (M22)
         };
         // BUG B2 (fixed state): a defender that has GARRISONED its owned room (in-room, focus-less) and held
         // its lease until the budget elapsed without churning — a single stable generation. Detected when the
@@ -1197,6 +1301,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                         engaged_once = false;
                         phase = Phase::Forming;
                         gen_start = tick;
+                        economic_giveup = EconomicGiveUp::default();
                         continue;
                     }
                     return match phase {
@@ -1217,12 +1322,26 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                 prev_present = 0;
                 phase = Phase::Forming;
                 gen_start = tick; // restart the forming-budget clock for the new generation
+                economic_giveup = EconomicGiveUp::default(); // M23: the latch is per generation (live: cleared on retire)
                 continue;
             }
             ReconcileAction::Retire {
                 reason: RetireReason::Resolved,
-                ..
+                withdraw,
+                mark_unwinnable,
             } => {
+                // D28 (parity M21): the VACUOUS clear — the kernel resolved a squad standing in a
+                // live-visible EMPTY room WITHOUT `engaged_once` (an empty room offers no focus, so the
+                // latch could never fire). Report the kernel's literal verdict so the pin can assert the
+                // clean-win shape (`withdraw`, never `mark_unwinnable`) end-to-end through the flow.
+                if !engaged_once && in_target_room && vacuous_clear {
+                    return ChurnOutcome::VacuouslyResolved {
+                        generations: generation,
+                        resolve_tick: tick,
+                        withdraw,
+                        mark_unwinnable,
+                    };
+                }
                 // ADR 0035 (RED — the VACUOUS-INTEL spiral). PRE-FIX (`abandon_fixes_enabled=false`), a squad
                 // that REACHED a towered room, engaged, and is RETREATING presents to the kernel as
                 // engaged_once + in_room + focus-less with `retreated_from_contact=false` (the manager never
@@ -1250,6 +1369,7 @@ pub fn run_lifecycle_churn(s: &ColonyFormingScenario, target: &ChurnTarget) -> C
                     engaged_once = false;
                     phase = Phase::Forming;
                     gen_start = tick;
+                    economic_giveup = EconomicGiveUp::default();
                     continue;
                 }
                 // A genuine resolve with no commit-cascade context (shouldn't occur in this driver) ends as
@@ -1511,6 +1631,11 @@ pub fn run_lifecycle_churn_extended(
     let engaged_once = false;
     let mut gen_start: u32 = 0;
     let mut travel_start: u32 = 0;
+    // Parity M23: the ECONOMIC forming give-up (ADR 0042 §5) — the shared K-tick latch over the present
+    // roster's burn vs the objective's rate. No target-room safe-mode model here (the exemption is pinned
+    // through `run_lifecycle_churn`'s `target_safe_mode`).
+    let slot_costs = slot_body_costs(&s.composition, best_capacity.min(s.per_member_cap));
+    let mut economic_giveup = EconomicGiveUp::default();
 
     // Spatial member state: each member starts AT its home `Position`; `member_pos[i]` is its live tile.
     let mut member_pos: Vec<Position> = travel.homes.clone();
@@ -1875,7 +2000,15 @@ pub fn run_lifecycle_churn_extended(
         // Reconcile (the shared kernel).
         let forming = has_members && !engaged_once && !departed && present < n_slots;
         let forming_progress = forming && present > prev_present;
-        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET;
+        // Parity M23: the forming lease is bounded by the clock AND the economic give-up (the manager's
+        // `budget_clock_remaining && !economic_giveup`) — the shared latch advances only while forming.
+        let economic_giveup_fired = if forming {
+            economic_giveup.advance(economic_abandon_now(s.objective_rate_milli, present_roster_cost(&slot_costs, &filled), false))
+        } else {
+            economic_giveup = EconomicGiveUp::default();
+            false
+        };
+        let forming_budget_remaining = tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET && !economic_giveup_fired;
         let travel_budget_remaining = tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET;
         let deadline_lapsed = tick >= deadline;
         let snapshot = ReconcileSnapshot {
@@ -1886,10 +2019,9 @@ pub fn run_lifecycle_churn_extended(
             wiped: false,
             has_focus: false,
             engaged_once,
-            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
-            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
-            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
-            // scenario would set this true.
+            // D28: the extended repro's arrival is the assault reaching a CONTESTED target room (a focus
+            // exists) — never a live-visible EMPTY room, so the vacuous-clear evidence is absent (M21 is
+            // exercised by `run_lifecycle_churn`'s `live_visible_clear` + `run_v1_flow`).
             vacuous_clear: false,
             in_target_room,
             has_members,
@@ -1904,7 +2036,7 @@ pub fn run_lifecycle_churn_extended(
             declaiming: false,
             reassign_available: false,
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
-            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by this driver
+            retreat_budget_exhausted: false, // REC-003 retreat bound — the in-room clock is `run_stall_flow` (M22)
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -1930,6 +2062,7 @@ pub fn run_lifecycle_churn_extended(
                 deadline = tick + COMMITMENT_BUDGET;
                 prev_present = 0;
                 gen_start = tick;
+                economic_giveup = EconomicGiveUp::default();
                 member_pos = travel.homes.clone();
                 departed = false;
                 gathered = false;
@@ -2158,6 +2291,17 @@ pub struct V1FlowScenario {
     pub form_ticks: u32,
     /// Tick budget.
     pub budget_ticks: u32,
+    /// The squad is a `Defend` garrison (`is_defend` in the reconcile snapshot — the threat-centric
+    /// Secure is the defense arm). `false` runs the SAME flow as an OFFENSE squad, which is what the D28
+    /// vacuous clear applies to (a defend garrison's quiet hold is deliberate — FIX B2 — and is EXCLUDED
+    /// from the vacuous resolve by the kernel).
+    pub is_defend: bool,
+    /// D28 (parity M21): the objective rooms are LIVE-VISIBLE on arrival. An arrival that finds the
+    /// threat ALREADY GONE then has nothing to engage — `engaged_once` does NOT latch — and the
+    /// vacuous-clear evidence (`in_target_room && live_visible_clear && !is_defend`, the manager's exact
+    /// form) is what lets the kernel resolve it (→ `Reassign{withdraw_old: true}` when a sibling
+    /// objective exists). `false` keeps the pre-existing model (an arrival "engages" the room).
+    pub live_visible_clear: bool,
 }
 
 /// One squad's live state in the v1 flow.
@@ -2196,6 +2340,9 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
     let mut queue = V1Queue::default();
     let mut generation: u32 = 0;
     let mut reassignments: u32 = 0;
+    // D28 (parity M21): how many of those rebinds were driven by the VACUOUS clear (the kernel's
+    // `Reassign{withdraw_old: true}` with `engaged_once` never latched — an empty live-visible room).
+    let mut vacuous_reassignments: u32 = 0;
 
     // The squad's per-generation state.
     let mut claimed_id: Option<u32> = None;
@@ -2207,6 +2354,11 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
     let mut gen_start: u32 = 0;
     let mut travel_start: u32 = 0;
     let mut prev_dist: Option<u32> = None;
+    // Parity M23: the shared economic give-up latch. This flow models forming as a ONE-member spawn
+    // timer — nothing is PRESENT while forming, so the burn is 0 and the give-up cannot fire (the
+    // multi-slot churn drivers carry the economic pins); wired so `forming_budget_remaining` has the
+    // manager's composition (`clock && !economic_giveup`) in every reconcile driver.
+    let mut economic_giveup = EconomicGiveUp::default();
     // The threat's index into its room path (advances one step per scan); None once the path is exhausted
     // (the threat left the map → its last objective TTL-lapses → the squad's objective_gone fires).
     let mut threat_step: usize = 0;
@@ -2337,8 +2489,15 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
                     in_target_room = true;
                     // Arrived: engage. If the threat is STILL here (the objective is fresh — the threat
                     // hasn't moved on), latch engaged_once + clear it (the squad clears the room / the threat
-                    // steps out next scan). Either way the latch marks "fought here".
-                    engaged_once = true;
+                    // steps out next scan). D28 (parity M21): with `live_visible_clear` an arrival that
+                    // finds the threat ALREADY GONE has nothing to engage — the latch needs an in-room
+                    // focus and an empty room offers none — so `engaged_once` stays false and only the
+                    // vacuous-clear evidence can resolve it. Without the flag the pre-existing model
+                    // stands (the arrival "fought here" either way).
+                    let threat_here_now = s.threat_path.get(threat_step.saturating_sub(1)).copied() == target_room;
+                    if threat_here_now || !s.live_visible_clear {
+                        engaged_once = true;
+                    }
                 }
             }
         }
@@ -2359,36 +2518,49 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
         // room" as has_focus=false once the threat has advanced past target_room (its objective will lapse).
         let threat_here = s.threat_path.get(threat_step.saturating_sub(1)).copied() == target_room;
         let has_focus = in_target_room && threat_here; // a focus only while the threat is actually here
+        // Parity M23 (see `economic_giveup` above): nothing is present while the one member spawns.
+        let economic_giveup_fired = if forming {
+            economic_giveup.advance(economic_abandon_now(0, 0, false))
+        } else {
+            economic_giveup = EconomicGiveUp::default();
+            false
+        };
+        // D28 (parity M21): the manager's exact vacuous-clear evidence form.
+        let vacuous_clear = in_target_room && s.live_visible_clear && !s.is_defend;
         let snapshot = ReconcileSnapshot {
             objective_gone,
             duplicate: false,
-            is_defend: true, // a defender (the threat-centric Secure is the defense arm)
+            is_defend: s.is_defend,
             deadline_lapsed,
             wiped: false,
             has_focus,
             engaged_once,
-            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
-            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
-            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
-            // scenario would set this true.
-            vacuous_clear: false,
+            vacuous_clear,
             in_target_room,
             has_members,
             forming,
             forming_progress: forming,
+            // Parity M20: this flow's forming IS the one member's spawn in flight for the whole window,
+            // so in-flight ≡ forming here (the churn drivers carry the measured queued/spawning signal).
             forming_in_flight: forming,
-            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET,
+            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET && !economic_giveup_fired,
             traveling,
             travel_progress,
             travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
-            holding_station: is_defend_holding(in_target_room, has_focus),
+            holding_station: s.is_defend && is_defend_holding(in_target_room, has_focus),
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available,
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by the v1 reassign flow
-            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by the v1 reassign flow
+            retreat_budget_exhausted: false, // REC-003 retreat bound — the in-room clock is `run_stall_flow` (M22)
         };
         match reconcile(snapshot) {
             ReconcileAction::Reassign { withdraw_old } => {
+                if !engaged_once && vacuous_clear {
+                    // D28: a rebind driven by the VACUOUS clear — the kernel's clean-win `withdraw_old`
+                    // (asserted by the M21 pin) fed from the arrival evidence, never from a fight.
+                    debug_assert!(withdraw_old, "a vacuous clear is a clean win: withdraw_old");
+                    vacuous_reassignments += 1;
+                }
                 // ── IN-PLACE REBIND (no Generation churn): release/withdraw the old claim → claim the new
                 //    → reset engaged_once/state/travel clocks → reopen the lease. Bodies reused. ──
                 let new_id = queue
@@ -2425,6 +2597,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
                     return ChurnOutcome::Reassigned {
                         from_gen: generation,
                         reassignments,
+                        vacuous_reassignments,
                         engage_tick: tick,
                     };
                 }
@@ -2446,6 +2619,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
             return ChurnOutcome::Reassigned {
                 from_gen: generation,
                 reassignments,
+                vacuous_reassignments,
                 engage_tick: tick,
             };
         }
@@ -2457,6 +2631,7 @@ pub fn run_v1_flow(s: &V1FlowScenario) -> ChurnOutcome {
         ChurnOutcome::Reassigned {
             from_gen: generation,
             reassignments,
+            vacuous_reassignments,
             engage_tick: s.budget_ticks,
         }
     } else if phase == V1Phase::Forming {
@@ -2589,6 +2764,9 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
     let mut gen_start: u32 = 0;
     let mut travel_start: u32 = 0;
     let mut emitted_any = false;
+    // Parity M23: the shared economic give-up latch (a one-member spawn timer: nothing present while
+    // forming ⇒ burn 0 ⇒ inert; wired for the manager's `clock && !economic_giveup` composition).
+    let mut economic_giveup = EconomicGiveUp::default();
 
     for tick in 0..s.budget_ticks {
         // ── OFFENSE SCAN: map each candidate through the production decision (source map + winnability gate)
@@ -2668,6 +2846,12 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
         }
 
         let forming = phase == V1Phase::Forming && tick < form_done_at;
+        let economic_giveup_fired = if forming {
+            economic_giveup.advance(economic_abandon_now(0, 0, false))
+        } else {
+            economic_giveup = EconomicGiveUp::default();
+            false
+        };
         let snapshot = ReconcileSnapshot {
             objective_gone,
             duplicate: false,
@@ -2676,17 +2860,17 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             wiped: false,
             has_focus: in_target_room,
             engaged_once,
-            // D28: the harness scenarios that arrive to an empty room model a VISION-GAP arrival
-            // (empty DTOs), not a live-visible clear - vacuous_clear stays false so the pre-D28
-            // pathology pins (lease-lapse GaveUp) keep their meaning. A live-visible-empty D28
-            // scenario would set this true.
+            // D28: this driver exits on reaching the target room (never in-room at the snapshot), so
+            // the vacuous-clear evidence cannot apply (M21 is exercised by `run_lifecycle_churn` +
+            // `run_v1_flow`).
             vacuous_clear: false,
             in_target_room,
             has_members: true,
             forming,
             forming_progress: forming,
+            // Parity M20: forming IS the one member's spawn in flight here (in-flight ≡ forming).
             forming_in_flight: forming,
-            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET,
+            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET && !economic_giveup_fired,
             traveling,
             travel_progress,
             travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
@@ -2694,7 +2878,7 @@ pub fn run_offense_flow(s: &OffenseFlowScenario) -> ChurnOutcome {
             declaiming: false, // ADR 0027 v1.1 P2 declaim is exercised by `run_declaim_flow`, not here
             reassign_available: false, // offense reassign is v1.2+; this driver isolates production→engage
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by this driver
-            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by this driver
+            retreat_budget_exhausted: false, // REC-003 retreat bound — the in-room clock is `run_stall_flow` (M22)
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -2812,6 +2996,9 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
     let mut next_strike_at: Option<u32> = None;
     let mut cadence_cycles: u32 = 0;
     let mut controller_neutral = false;
+    // Parity M23: the shared economic give-up latch (a one-member spawn timer: nothing present while
+    // forming ⇒ burn 0 ⇒ inert; wired for the manager's `clock && !economic_giveup` composition).
+    let mut economic_giveup = EconomicGiveUp::default();
 
     for tick in 0..s.budget_ticks {
         // ── PRODUCER (SalvageMission): emit the Declaim objective while the controller is still owned + the
@@ -2912,6 +3099,12 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
         //    the squad would GaveUp+mark_unwinnable mid-neutralization. ──
         let forming = phase == V1Phase::Forming && tick < form_done_at;
         let declaiming = in_target_room; // the manager's is_declaim && in_target_room && has_members
+        let economic_giveup_fired = if forming {
+            economic_giveup.advance(economic_abandon_now(0, 0, false))
+        } else {
+            economic_giveup = EconomicGiveUp::default();
+            false
+        };
         let snapshot = ReconcileSnapshot {
             objective_gone,
             duplicate: false,
@@ -2928,8 +3121,9 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             has_members: true,
             forming,
             forming_progress: forming,
+            // Parity M20: forming IS the one declaimer's spawn in flight here (in-flight ≡ forming).
             forming_in_flight: forming,
-            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET,
+            forming_budget_remaining: tick.saturating_sub(gen_start) < MAX_FORMING_BUDGET && !economic_giveup_fired,
             traveling,
             travel_progress,
             travel_budget_remaining: tick.saturating_sub(travel_start) < MAX_TRAVEL_BUDGET,
@@ -2937,7 +3131,7 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
             declaiming,
             reassign_available: false,
             retreated_from_contact: false, // ADR 0035 D4 — not exercised by the declaim flow
-            retreat_budget_exhausted: false, // REC-003 retreat bound — not exercised by the declaim flow
+            retreat_budget_exhausted: false, // REC-003 retreat bound — the in-room clock is `run_stall_flow` (M22)
         };
         match reconcile(snapshot) {
             ReconcileAction::Retire {
@@ -2979,6 +3173,171 @@ pub fn run_declaim_flow(s: &DeclaimFlowScenario) -> DeclaimOutcome {
     DeclaimOutcome::NeverReached {
         generations: generation,
     }
+}
+
+// ═══ REC-003 / ADR 0035 FU2 — run_stall_flow: the IN-ROOM give-up clock, end-to-end (parity M22) ═════
+//
+// Every other reconcile driver exits on the arrival-with-focus tick (`DeployedAndEngaged`), so the
+// composed manager-side clock — `RetreatClock` running across a period-2 Engaged/Retreating probe bounce
+// while `EnemyStallTracker` latches on ENGAGED no-headway ticks, and its terminal DOMINATING the in-room
+// focus-refresh through the full `Retire{GaveUp, mark_unwinnable}` — had only isolated unit tests. This
+// driver scripts the IN-ROOM fight per tick (`SquadOrderState` + total enemy hits) and runs the SHARED
+// kernels in the live manager's ORDER: Phase A (reconcile on LAST tick's applied state + the stall latch
+// from LAST tick's Phase-B advance) → Phase B (advance the stall tracker on `prev_state == Engaged`,
+// then apply this tick's scripted state). No mirrored constants: `MAX_RETREAT_BUDGET`, `ENEMY_STALL_TICKS`
+// and the two trackers are the decision crate's.
+
+/// How the scripted in-room fight evolves, tick by tick after arrival (`t` = ticks since arrival).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallScript {
+    /// The FU2 zombie: a period-2 Engaged/Retreating probe bounce (`t` even ⇒ Engaged, odd ⇒
+    /// Retreating) against enemy hits that stay FLAT (out-healed — no headway ever).
+    BounceFlat { enemy_hits: u32 },
+    /// The same bounce, but the enemy hits DROP by `drop` every `every` ticks — genuine (slow) headway.
+    BounceDecreasing { enemy_hits: u32, drop: u32, every: u32 },
+    /// In-room but never in contact: `Moving` every tick against flat enemy hits (the streak must FREEZE
+    /// — a squad not in contact cannot *fail* to make headway).
+    DisengagedFlat { enemy_hits: u32 },
+}
+
+/// The stall-flow scenario: when the squad arrives, how the fight is scripted, and whether/when the
+/// enemy is CLEARED (focus gone, hits 0 — the clean-clear signal).
+#[derive(Clone, Copy, Debug)]
+pub struct StallFlowScenario {
+    /// Ticks of travel before the squad stands in the target room (the clock must not run en route).
+    pub arrival_tick: u32,
+    pub script: StallScript,
+    /// The absolute tick the target room is CLEARED (no hostile ⇒ no focus, hits 0). `None` = never.
+    pub clear_at: Option<u32>,
+    pub budget_ticks: u32,
+}
+
+/// The stall-flow outcome — the kernel's literal terminal (or none within the budget).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallOutcome {
+    /// The REC-003 force-abort: `Retire{GaveUp, withdraw: false, mark_unwinnable}` at `tick`, the give-up
+    /// clock having STARTED (uninterrupted) at `clock_started_at`.
+    ForceAborted {
+        tick: u32,
+        clock_started_at: u32,
+        mark_unwinnable: bool,
+    },
+    /// A clean clear: `Retire{Resolved, withdraw, mark_unwinnable}` at `tick`.
+    Resolved {
+        tick: u32,
+        withdraw: bool,
+        mark_unwinnable: bool,
+    },
+    /// No terminal within the budget: the in-room focus refreshed the lease every tick and the clock
+    /// never exhausted. `max_streak` is the largest enemy-stall streak the tracker reached.
+    FoughtThroughBudget { ticks: u32, max_streak: u32 },
+    /// Any other retire (unexpected in this driver; reported verbatim).
+    Other {
+        tick: u32,
+        action: screeps_combat_decision::lifecycle::ReconcileAction,
+    },
+}
+
+/// Drive the in-room give-up clock end-to-end with the SHARED `RetreatClock` + `EnemyStallTracker` +
+/// `reconcile` kernels in the live manager's order. Deterministic (pure value math, no `HashMap`).
+pub fn run_stall_flow(s: &StallFlowScenario) -> StallOutcome {
+    use screeps_combat_decision::lifecycle::{
+        reconcile, EnemyStallTracker, ReconcileAction, ReconcileSnapshot, RetireReason, RetreatClock,
+    };
+    use screeps_combat_decision::SquadOrderState;
+
+    let mut clock = RetreatClock::default();
+    let mut tracker = EnemyStallTracker::default();
+    let mut max_streak: u32 = 0;
+    let mut deadline: u32 = COMMITMENT_BUDGET;
+    let mut engaged_once = false;
+    // The squad state APPLIED by the previous tick's Phase B (`ctx.state` when Phase A runs).
+    let mut applied_state = SquadOrderState::Moving;
+
+    for tick in 0..s.budget_ticks {
+        let in_room = tick >= s.arrival_tick;
+        let cleared = s.clear_at.is_some_and(|c| tick >= c);
+        // The scripted state + enemy hits for THIS tick (applied in Phase B below).
+        let (scripted_state, enemy_hits) = if !in_room || cleared {
+            (SquadOrderState::Moving, 0)
+        } else {
+            let t = tick - s.arrival_tick;
+            let bounce = if t.is_multiple_of(2) { SquadOrderState::Engaged } else { SquadOrderState::Retreating };
+            match s.script {
+                StallScript::BounceFlat { enemy_hits } => (bounce, enemy_hits),
+                StallScript::BounceDecreasing { enemy_hits, drop, every } => {
+                    (bounce, enemy_hits.saturating_sub(drop.saturating_mul(t / every.max(1))).max(1))
+                }
+                StallScript::DisengagedFlat { enemy_hits } => (SquadOrderState::Moving, enemy_hits),
+            }
+        };
+
+        // ── Phase A: reconcile on LAST tick's applied state; the stall latch is LAST tick's Phase-B advance.
+        let state_retreating = applied_state == SquadOrderState::Retreating;
+        let stalemate_latched = tracker.latched();
+        let retreat_budget_exhausted = clock.advance(tick, state_retreating, stalemate_latched);
+        let has_focus = in_room && !cleared;
+        let snapshot = ReconcileSnapshot {
+            objective_gone: false,
+            duplicate: false,
+            is_defend: false,
+            deadline_lapsed: tick >= deadline,
+            wiped: false,
+            has_focus,
+            engaged_once,
+            vacuous_clear: false, // the room is contested until `clear_at`; the clear is the engaged_once path
+            in_target_room: in_room,
+            has_members: true,
+            forming: false,
+            forming_progress: false,
+            forming_in_flight: false,
+            forming_budget_remaining: true,
+            traveling: !in_room,
+            travel_progress: !in_room,
+            travel_budget_remaining: true,
+            holding_station: false,
+            declaiming: false,
+            reassign_available: false,
+            // The scripted fight is a STALL (win-or-stall holds — the squad is not LOSING), so the ADR
+            // 0035 D4 lose verdict never fires; the FU2 clock is the terminal under test.
+            retreated_from_contact: false,
+            retreat_budget_exhausted,
+        };
+        match reconcile(snapshot) {
+            ReconcileAction::Retire { reason: RetireReason::GaveUp, mark_unwinnable, .. } if retreat_budget_exhausted => {
+                return StallOutcome::ForceAborted {
+                    tick,
+                    clock_started_at: clock.retreating_since.expect("an exhausted clock has a start"),
+                    mark_unwinnable,
+                };
+            }
+            ReconcileAction::Retire { reason: RetireReason::Resolved, withdraw, mark_unwinnable } => {
+                return StallOutcome::Resolved { tick, withdraw, mark_unwinnable };
+            }
+            action @ (ReconcileAction::Retire { .. } | ReconcileAction::Reassign { .. }) => {
+                return StallOutcome::Other { tick, action };
+            }
+            ReconcileAction::KeepRefreshLease => deadline = tick + COMMITMENT_BUDGET,
+            ReconcileAction::Keep => {}
+        }
+
+        // ── Phase B: advance the enemy-stall tracker (in-room only; engaged = LAST tick's applied state,
+        //    in contact — the scripted fight is always within weapon reach), latch `engaged_once` on an
+        //    in-room Engaged apply (FIX B1), then apply this tick's scripted state.
+        if in_room {
+            let stall_engaged = applied_state == SquadOrderState::Engaged;
+            tracker.advance(enemy_hits, stall_engaged);
+            max_streak = max_streak.max(tracker.streak());
+            if scripted_state == SquadOrderState::Engaged {
+                engaged_once = true;
+            }
+        } else {
+            tracker = EnemyStallTracker::default();
+        }
+        applied_state = scripted_state;
+    }
+
+    StallOutcome::FoughtThroughBudget { ticks: s.budget_ticks, max_streak }
 }
 
 // ═══ ADR 0032 v1.2 — run_auction_flow: the GLOBAL Hungarian matching flow (extends run_v1_flow to N
@@ -3673,11 +4032,792 @@ pub fn run_defended_lifecycle_with_params(
     }
 }
 
+// ═══ BED 3 — MULTI-SQUAD forming under K4 CLAIM PACING over SHARED home lanes ════════════════════════════
+//
+// ADR 0028 §Scenario coverage 3 (+ bed 1 at N>1) and ADR 0029 §11: a CLAIM BOARD of several objectives,
+// each fielding its own roster through the SAME home spawn lanes, admitted by the K4 kernel. `run_forming`
+// is single-squad by construction, so it cannot show the two failure classes that only exist BETWEEN
+// squads: (1) the `forming-cap=1` claim-board LOCKUP (one roster that never completes holds the single
+// forming slot, so nothing else is ever claimed and standing combat sits at N-1 for the whole budget —
+// the live 87.5 backfire's "combat: 2 2 2 2 0 2 3"), and (2) the ADR 0029 §11 N-1 stall of several
+// DEFENDERS contending for the lanes under an offense-shaped pace + a count-only rally gate. The driver
+// runs the live `SquadManager` phase order every tick — Phase A reconcile (the SHARED
+// `lifecycle::reconcile` kernel) → Phase C claim (K4) → Phase B field (K3) + spawn (K1, the shared lanes)
+// → the rally/proceed gate (K0) — with BOTH K4 arms available: the harness-only OFFENSE-only
+// `claims_allowed` budget (the ADR's named bed shape; it reproduces the lockup) and the live S5-CAP
+// `claim_admission` policy (defense exempt from the forming pace + admitted within cap + surge; it shows
+// the fix). Deterministic: `Vec`-ordered board, claim order = rank order, no `HashMap` anywhere.
+
+/// One objective on the claim board. `Vec` position IS the Phase C rank (objective 0 = the highest-EV
+/// claim — the live ranking is EV-desc with a stable tie-break; this bed supplies the order directly).
+#[derive(Clone, Debug)]
+pub struct BoardObjective {
+    pub composition: SquadComposition,
+    /// `is_defense_objective` (ownership-derived): exempt from the forming pace + admitted within the
+    /// surge under the live arm; treated as offense under the offense-only `claims_allowed` arm.
+    pub is_defense: bool,
+    /// Tick the producer first emits this objective (a threat that arrives mid-run). 0 = on the board
+    /// from the start.
+    pub available_at: u32,
+    /// Home indices within `MAX_SPAWN_DISTANCE` of the target (the live `queue_slot_spawn` broadcasts a
+    /// slot only to in-range homes). Empty = every home.
+    pub homes_in_range: Vec<usize>,
+    /// A STATIC forming bid (milli-e/t, the legacy `combat_priority`); `None` prices the bid via the REAL
+    /// `forming_completion_bid(objective_rate_milli)` (ADR 0042 R_net — the live producer's currency).
+    pub static_bid: Option<u32>,
+    /// The objective's completed rate `R_O` (milli-e/t): the value bid (when `static_bid` is `None`) AND
+    /// the ADR 0042 §5 economic give-up input (parity M23) read it.
+    pub objective_rate_milli: u32,
+    /// Ticks the DEPARTED squad fights before its objective RESOLVES (a clean win, slot freed). The
+    /// engaged phase is the engine beds' concern; only its DURATION reaches the claim board — the
+    /// concurrent slot the fighting squad holds.
+    pub fight_ticks: u32,
+    /// ADR 0029 D9 AS BUILT — the present-member count at which the manager's Lanchester
+    /// `present_force_wins_or_stalls` flips TRUE for this objective (the P(win)-driven proceed gate, ADR
+    /// 0028 "Reach bug #2"; the live manager assesses the real room view, this bed has none, so the
+    /// verdict is a fixture input). `None` = the present force never wins-or-stalls below the full roster
+    /// (count gate only).
+    pub wins_or_stalls_at: Option<usize>,
+}
+
+/// Which K4 admission policy Phase C runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimArm {
+    /// The harness-only OFFENSE-only scalar budget `claim_pacing::claims_allowed(active, forming,
+    /// max_concurrent, max_forming)` over a FLAT concurrent cap (the pre-S5-CAP flat 4) — the bed shape
+    /// ADR 0028 names for the `forming-cap=1` lockup. It has NO defense dimension: a DEFENSE roster counts
+    /// toward the forming pace and competes for the same cap (the pre-REC-008 / pre-S5-CAP bot).
+    ClaimsAllowed { max_concurrent: usize, max_forming: usize },
+    /// The LIVE Phase C policy `claim_pacing::claim_admission(active, forming, cap, is_defense)` over the
+    /// empire-scaled `max_concurrent_squads(homes)`: offense under the cap AND `MAX_FORMING_SQUADS`;
+    /// defense within cap + `DEFENSE_SURGE_SQUADS`, never paced (REC-008 / S5-CAP / ADR 0029 D10).
+    ClaimAdmission,
+}
+
+/// A multi-squad forming scenario over SHARED home lanes.
+#[derive(Clone, Debug)]
+pub struct MultiSquadFormingScenario {
+    /// The claim board, ranked (see [`BoardObjective`]).
+    pub objectives: Vec<BoardObjective>,
+    pub homes: Vec<Home>,
+    /// The per-home economy demand EVERY roster contends with (the same lanes).
+    pub economy: EconomyPressure,
+    pub arm: ClaimArm,
+    /// The proceed gate the rally runs. `true` = the LIVE composition (ADR 0028 "Reach bug #2" / ADR 0029
+    /// D9 as built): `winnable_fast_path_allowed(wins_or_stalls, have_target_intel) ||
+    /// ready_to_depart_gate(count) || deploy_then_retreat_allowed(..)`, where a DEFENSE objective of an
+    /// OWNED room has real intel by construction (live-visible) and an offense target here does not (the
+    /// contested/unscouted default — the intel-driven offense paths are `run_lifecycle_churn`'s). `false`
+    /// = the pre-D9 COUNT-ONLY `squad_ready_to_depart` (full roster, every objective kind).
+    pub d9_proceed_gate: bool,
+    pub per_member_cap: u32,
+    pub budget_ticks: u32,
+    /// Member lifetime (CREEP_LIFE_TIME); no renew in this bed (ADR 0029 D11 demoted it).
+    pub member_ttl: u32,
+}
+
+/// One objective's terminal on the board after the budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoardOutcome {
+    /// Phase C never admitted it (the lockup / cap starvation).
+    NeverClaimed,
+    /// Claimed, still forming at the end of the budget with `filled` of `of` present (`generations`
+    /// counts re-fields after a non-backoff GaveUp — a Defend re-claim).
+    Stalled { claimed_at: u32, filled: usize, of: usize, generations: u32 },
+    /// The proceed gate released it with `present` of `of`; `resolved_at` is set once its fight
+    /// resolved (slot freed) inside the budget. `active_at_claim` = the board's live-squad count when it
+    /// was admitted (the surge evidence: a defense claim admitted with `active_at_claim == cap`).
+    Departed {
+        claimed_at: u32,
+        active_at_claim: usize,
+        generations: u32,
+        departed_at: u32,
+        present: usize,
+        of: usize,
+        resolved_at: Option<u32>,
+    },
+    /// The kernel retired it `GaveUp + mark_unwinnable` (lease lapsed / forming budget / economic
+    /// give-up) — the room is backed off; the live backoff floor (2000t) exceeds every bed's remaining
+    /// budget, so it stays off the board.
+    Abandoned { claimed_at: u32, at: u32 },
+}
+
+/// The board's run report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiFormingReport {
+    /// Per objective, in board order.
+    pub outcomes: Vec<BoardOutcome>,
+    /// Objective indices in the order Phase C admitted them (re-fields included).
+    pub claim_order: Vec<usize>,
+    /// Combat members that STARTED spawning over the budget.
+    pub combat_spawns: u32,
+    /// Economy haulers that started spawning over the budget (the "economy not starved" evidence).
+    pub hauler_spawns: u32,
+    /// Peak over ticks of the PRESENT combat members across every live squad (the "standing combat"
+    /// number the live capture counted).
+    pub max_standing_combat: usize,
+    /// Peak over ticks of concurrently-FORMING OFFENSE rosters (the pace evidence — never above
+    /// `MAX_FORMING_SQUADS` under the live arm).
+    pub max_offense_forming: usize,
+    /// Peak over ticks of live squads (forming + fighting).
+    pub max_active: usize,
+}
+
+/// Combat slot ids are `objective * SLOT_ID_STRIDE + slot` (unique across the board; every economy id sits
+/// at ≥ `ECON_MINER_ID_BASE`, far above any board id).
+const SLOT_ID_STRIDE: u64 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoardPhase {
+    Forming,
+    Fighting { resolves_at: u32 },
+}
+
+/// One live (claimed) squad's state.
+#[derive(Clone, Debug)]
+struct BoardSquad {
+    obj: usize,
+    claimed_at: u32,
+    active_at_claim: usize,
+    generations: u32,
+    filled: Vec<bool>,
+    dies_at: Vec<u32>,
+    completing: Vec<(u64, u32)>,
+    deadline: u32,
+    gen_start: u32,
+    prev_present: usize,
+    economic_giveup: EconomicGiveUp,
+    phase: BoardPhase,
+    departed_at: u32,
+    departed_present: usize,
+}
+
+impl BoardSquad {
+    fn present(&self) -> usize {
+        self.filled.iter().filter(|f| **f).count()
+    }
+}
+
+/// Simulate the claim board forming its rosters over the shared lanes. Deterministic: same scenario →
+/// same report.
+pub fn run_multi_forming(s: &MultiSquadFormingScenario) -> MultiFormingReport {
+    use screeps_combat_decision::claim_pacing::{claim_admission, claims_allowed, max_concurrent_squads, DEFENSE_SURGE_SQUADS};
+    use screeps_combat_decision::lifecycle::{reconcile, ReconcileAction, ReconcileSnapshot, RetireReason};
+    use screeps_combat_decision::{deploy_then_retreat_allowed, winnable_fast_path_allowed};
+
+    let n_obj = s.objectives.len();
+    let best_capacity = s.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
+    let build_energy = best_capacity.min(s.per_member_cap);
+    let slot_costs: Vec<Vec<u32>> = s.objectives.iter().map(|o| slot_body_costs(&o.composition, build_energy)).collect();
+    let bid_of = |o: &BoardObjective| -> u32 {
+        o.static_bid
+            .unwrap_or_else(|| screeps_econ_decision::spawn_policy::forming_completion_bid(o.objective_rate_milli))
+    };
+    // The live cap: the empire-scaled kernel over the spawn base (Phase C `max_concurrent_squads(homes.len())`).
+    let live_cap = max_concurrent_squads(s.homes.len());
+
+    let mut outcomes: Vec<BoardOutcome> = vec![BoardOutcome::NeverClaimed; n_obj];
+    // Board bookkeeping per objective: claimed (index into `squads`), abandoned (backed off), generations.
+    // `off_board[i]`: the objective left the queue — WITHDRAWN on a clean `Resolved` (the live
+    // `withdraw`) or BACKED OFF on a `GaveUp + mark_unwinnable`.
+    let mut off_board: Vec<bool> = vec![false; n_obj];
+    let mut generations: Vec<u32> = vec![0; n_obj];
+    let mut squads: Vec<BoardSquad> = Vec::new();
+    let mut avail: Vec<u32> = s.homes.iter().map(|h| h.start_energy).collect();
+    let mut busy_until: Vec<u32> = vec![0; s.homes.len()];
+    let mut report = MultiFormingReport {
+        outcomes: Vec::new(),
+        claim_order: Vec::new(),
+        combat_spawns: 0,
+        hauler_spawns: 0,
+        max_standing_combat: 0,
+        max_offense_forming: 0,
+        max_active: 0,
+    };
+
+    for tick in 0..s.budget_ticks {
+        // 1. Complete spawns due this tick; age out members whose life ran out while still forming (no
+        //    renew in this bed — ADR 0029 D11). A departed squad's fight is a duration, not a roster.
+        for sq in squads.iter_mut() {
+            let n = sq.filled.len();
+            sq.completing.retain(|&(id, at)| {
+                if at <= tick {
+                    let slot = (id % SLOT_ID_STRIDE) as usize;
+                    if slot < n {
+                        sq.filled[slot] = true;
+                        sq.dies_at[slot] = tick + s.member_ttl;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            if sq.phase == BoardPhase::Forming {
+                for i in 0..n {
+                    if sq.filled[i] && sq.dies_at[i] <= tick {
+                        sq.filled[i] = false;
+                    }
+                }
+            }
+        }
+        report.max_standing_combat = report.max_standing_combat.max(squads.iter().map(|q| q.present()).sum());
+
+        // 2. Phase A — reconcile every live squad through the SHARED kernel (the manager's exact snapshot
+        //    composition: forming/progress/in-flight measured (M20), the economic give-up latched (M23)).
+        let mut retired: Vec<usize> = Vec::new(); // indices into `squads`, ascending
+        for (qi, sq) in squads.iter_mut().enumerate() {
+            let o = &s.objectives[sq.obj];
+            let n = sq.filled.len();
+            let present = sq.present();
+            let (in_target_room, has_focus, engaged_once) = match sq.phase {
+                BoardPhase::Forming => (false, false, false),
+                // The fight: a focus is held until the objective resolves; on the resolve tick the room
+                // is clear (in-room, engaged, no focus) → the kernel returns `Retire{Resolved}`.
+                BoardPhase::Fighting { resolves_at } => (true, tick < resolves_at, true),
+            };
+            let has_members = match sq.phase {
+                BoardPhase::Forming => present > 0 || !sq.completing.is_empty(),
+                BoardPhase::Fighting { .. } => true,
+            };
+            let forming = sq.phase == BoardPhase::Forming && has_members && present < n;
+            let forming_progress = forming && present > sq.prev_present;
+            // M20 (measured): a slot is QUEUED iff K3 would emit it this tick, or IN FLIGHT if spawning.
+            let any_queued = forming
+                && !fielding::slots_to_spawn(&o.composition, &sq.filled, best_capacity, s.per_member_cap, bid_of(o), MoveProfile::Plains)
+                    .is_empty();
+            let forming_in_flight = forming && (any_queued || !sq.completing.is_empty());
+            let economic_giveup_fired = if forming {
+                sq.economic_giveup.advance(economic_abandon_now(
+                    o.objective_rate_milli,
+                    present_roster_cost(&slot_costs[sq.obj], &sq.filled),
+                    false, // no safe-moded target on the claim board
+                ))
+            } else {
+                sq.economic_giveup = EconomicGiveUp::default();
+                false
+            };
+            let forming_budget_remaining = tick.saturating_sub(sq.gen_start) < MAX_FORMING_BUDGET && !economic_giveup_fired;
+            let snapshot = ReconcileSnapshot {
+                objective_gone: false,
+                duplicate: false,
+                is_defend: o.is_defense,
+                deadline_lapsed: tick >= sq.deadline,
+                wiped: false,
+                has_focus,
+                engaged_once,
+                vacuous_clear: false,
+                in_target_room,
+                has_members,
+                forming,
+                forming_progress,
+                forming_in_flight,
+                forming_budget_remaining,
+                traveling: false, // travel is a duration folded into `fight_ticks` here (`run_lifecycle_churn` models it)
+                travel_progress: false,
+                travel_budget_remaining: true,
+                holding_station: false,
+                declaiming: false,
+                reassign_available: false,
+                retreated_from_contact: false,
+                // REC-003 retreat bound (parity M22): the in-room clock is `run_stall_flow`'s; this board
+                // never enters Retreating (the fight is a duration), so the clock has nothing to advance.
+                retreat_budget_exhausted: false,
+            };
+            sq.prev_present = present;
+            match reconcile(snapshot) {
+                ReconcileAction::KeepRefreshLease => sq.deadline = tick + COMMITMENT_BUDGET,
+                ReconcileAction::Keep => {}
+                ReconcileAction::Retire { reason: RetireReason::Resolved, withdraw, .. } => {
+                    if let BoardOutcome::Departed { resolved_at, .. } = &mut outcomes[sq.obj] {
+                        *resolved_at = Some(tick);
+                    }
+                    off_board[sq.obj] = withdraw; // a clean clear is withdrawn from the queue
+                    retired.push(qi);
+                }
+                ReconcileAction::Retire { reason: RetireReason::GaveUp, mark_unwinnable, .. } => {
+                    if mark_unwinnable {
+                        off_board[sq.obj] = true;
+                        outcomes[sq.obj] = BoardOutcome::Abandoned { claimed_at: sq.claimed_at, at: tick };
+                    } else {
+                        // A Defend objective is never backed off: it returns to the board and Phase C
+                        // re-claims it (the live re-field churn) — the generation counter records it.
+                        generations[sq.obj] += 1;
+                        outcomes[sq.obj] = BoardOutcome::NeverClaimed;
+                    }
+                    retired.push(qi);
+                }
+                ReconcileAction::Retire { .. } | ReconcileAction::Reassign { .. } => retired.push(qi),
+            }
+        }
+        for qi in retired.into_iter().rev() {
+            squads.remove(qi);
+        }
+
+        // 3. Phase C — claim new objectives (K4). `forming` is the pace count the arm defines: the live
+        //    arm counts only ASSEMBLING OFFENSE rosters (`counts_toward_forming_cap`); the offense-only arm
+        //    has no defense dimension, so every forming roster counts.
+        let mut active = squads.len();
+        let counts_forming = |sq: &BoardSquad| sq.phase == BoardPhase::Forming && sq.present() < sq.filled.len();
+        let offense_forming = squads.iter().filter(|sq| counts_forming(sq) && !s.objectives[sq.obj].is_defense).count();
+        report.max_offense_forming = report.max_offense_forming.max(offense_forming);
+        let mut forming = match s.arm {
+            ClaimArm::ClaimsAllowed { .. } => squads.iter().filter(|sq| counts_forming(sq)).count(),
+            ClaimArm::ClaimAdmission => offense_forming,
+        };
+        let claimable: Vec<usize> = (0..n_obj)
+            .filter(|&i| s.objectives[i].available_at <= tick && !off_board[i] && !squads.iter().any(|q| q.obj == i))
+            .collect();
+        let mut claims: Vec<usize> = Vec::new();
+        match s.arm {
+            ClaimArm::ClaimsAllowed { max_concurrent, max_forming } => {
+                let mut budget = claims_allowed(active, forming, max_concurrent, max_forming);
+                for &i in &claimable {
+                    if budget == 0 {
+                        break;
+                    }
+                    budget -= 1;
+                    claims.push(i);
+                }
+            }
+            ClaimArm::ClaimAdmission => {
+                let mut iter = claimable.iter().copied();
+                while active < live_cap + DEFENSE_SURGE_SQUADS {
+                    let Some(i) = iter.next() else { break };
+                    let is_defense = s.objectives[i].is_defense;
+                    if !claim_admission(active, forming, live_cap, is_defense) {
+                        continue; // a blocked OFFENSE claim is passed over; a defense claim may still fit
+                    }
+                    claims.push(i);
+                    active += 1;
+                    if !is_defense {
+                        forming += 1;
+                    }
+                }
+            }
+        }
+        for i in claims {
+            let n = s.objectives[i].composition.slots.len();
+            squads.push(BoardSquad {
+                obj: i,
+                claimed_at: tick,
+                active_at_claim: squads.len(),
+                generations: generations[i],
+                filled: vec![false; n],
+                dies_at: vec![0; n],
+                completing: Vec::new(),
+                deadline: tick + COMMITMENT_BUDGET,
+                gen_start: tick,
+                prev_present: 0,
+                economic_giveup: EconomicGiveUp::default(),
+                phase: BoardPhase::Forming,
+                departed_at: 0,
+                departed_present: 0,
+            });
+            report.claim_order.push(i);
+        }
+        report.max_active = report.max_active.max(squads.len());
+
+        // 4. Phase B — field (K3) every FORMING roster's unfilled slots and run each home's spawn step (K1)
+        //    over economy + ALL of them: the shared lanes. Requests are queued in claim order (the live
+        //    `SpawnQueue` request order; equal bids keep it). Cross-home de-dup within the tick.
+        let mut in_flight: BTreeSet<u64> = squads.iter().flat_map(|q| q.completing.iter().map(|&(id, _)| id)).collect();
+        let mut combat_requests: Vec<(QueuedSpawn, usize)> = Vec::new(); // (request, objective)
+        for sq in squads.iter().filter(|q| q.phase == BoardPhase::Forming) {
+            let o = &s.objectives[sq.obj];
+            for mut req in fielding::slots_to_spawn(&o.composition, &sq.filled, best_capacity, s.per_member_cap, bid_of(o), MoveProfile::Plains) {
+                req.id += sq.obj as u64 * SLOT_ID_STRIDE;
+                combat_requests.push((req, sq.obj));
+            }
+        }
+        for h in 0..s.homes.len() {
+            avail[h] = (avail[h] + s.homes[h].income).min(s.homes[h].energy_capacity);
+            if tick < busy_until[h] {
+                continue;
+            }
+            let mut queue: Vec<QueuedSpawn> = Vec::new();
+            if let Some((p, c)) = s.economy.miner {
+                if s.economy.miner_period > 0 && tick % s.economy.miner_period == 0 {
+                    queue.push(QueuedSpawn {
+                        priority: p,
+                        body_cost: c,
+                        part_count: (c / 100).max(1),
+                        id: ECON_MINER_ID_BASE + (tick as u64) * 100 + h as u64,
+                    });
+                }
+            }
+            if let Some((p, c)) = s.economy.hauler {
+                queue.push(QueuedSpawn {
+                    priority: p,
+                    body_cost: c,
+                    part_count: (c / 100).max(1),
+                    id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64,
+                });
+            }
+            for (r, obj) in &combat_requests {
+                let in_range = s.objectives[*obj].homes_in_range.is_empty() || s.objectives[*obj].homes_in_range.contains(&h);
+                if in_range && !in_flight.contains(&r.id) {
+                    queue.push(*r);
+                }
+            }
+            let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: s.homes[h].energy_capacity };
+            for spawned in spawn_step(&mut lane, &queue) {
+                avail[h] = lane.available_energy;
+                busy_until[h] = tick + spawned.completes_in;
+                if spawned.id >= ECON_HAULER_ID_BASE {
+                    report.hauler_spawns += 1;
+                } else if spawned.id < ECON_MINER_ID_BASE {
+                    let obj = (spawned.id / SLOT_ID_STRIDE) as usize;
+                    if let Some(sq) = squads.iter_mut().find(|q| q.obj == obj) {
+                        sq.completing.push((spawned.id, tick + spawned.completes_in));
+                    }
+                    in_flight.insert(spawned.id);
+                    report.combat_spawns += 1;
+                }
+            }
+        }
+
+        // 5. The rally / proceed gate (K0) over each forming roster's present members.
+        for sq in squads.iter_mut().filter(|q| q.phase == BoardPhase::Forming) {
+            let o = &s.objectives[sq.obj];
+            let n = sq.filled.len();
+            let present = sq.present();
+            if present == 0 {
+                continue;
+            }
+            let positions: Vec<Option<Position>> = vec![Some(dummy_home_pos()); present];
+            let ready = if s.d9_proceed_gate {
+                // The live composition (`squad_manager` proceed gate): the P(win) fast-path over REAL
+                // intel, else the count gate (contested → full roster), else the no-intel quorum valve.
+                let wins_or_stalls = o.wins_or_stalls_at.is_some_and(|at| present >= at);
+                let have_target_intel = o.is_defense; // an owned room under attack is live-visible
+                let quorum = rally::squad_ready_to_depart_at_quorum(&positions, n);
+                winnable_fast_path_allowed(wins_or_stalls, have_target_intel)
+                    || rally::ready_to_depart_gate(&positions, n, false)
+                    || deploy_then_retreat_allowed(wins_or_stalls, have_target_intel, quorum)
+            } else {
+                rally::squad_ready_to_depart(&positions, n)
+            };
+            if ready {
+                sq.phase = BoardPhase::Fighting { resolves_at: tick + o.fight_ticks };
+                sq.departed_at = tick;
+                sq.departed_present = present;
+                sq.completing.clear(); // the fight owns it — refills are out of this bed's scope
+                outcomes[sq.obj] = BoardOutcome::Departed {
+                    claimed_at: sq.claimed_at,
+                    active_at_claim: sq.active_at_claim,
+                    generations: sq.generations,
+                    departed_at: tick,
+                    present,
+                    of: n,
+                    resolved_at: None,
+                };
+            }
+        }
+    }
+
+    // Terminal classification for squads still forming at the end of the budget.
+    for sq in &squads {
+        if sq.phase == BoardPhase::Forming {
+            outcomes[sq.obj] = BoardOutcome::Stalled {
+                claimed_at: sq.claimed_at,
+                filled: sq.present(),
+                of: sq.filled.len(),
+                generations: sq.generations,
+            };
+        }
+    }
+    report.outcomes = outcomes;
+    report
+}
+
+// ═══ ADR 0041 §7 P3 — the BOOSTED forming bed (`AwaitBoost` between spawn and depart) ═════════════════════
+//
+// The live P3 state machine, mirrored as harness state so it is validated offline (ADR 0041 §7 P3
+// "Validate (offline lifecycle harness, ADR 0028)"): the PRODUCER (`SquadManager` Phase B-renew block)
+// re-files each boosted-tier member's REMAINING compounds into the ephemeral `BoostQueue` every tick it is
+// still at home, inside the age window, with unboosted parts; the FULFILLER (`LabsMission::service_boosts`)
+// assigns one lab per distinct compound (in file order), loads it from the room's stock, and marks a
+// request READY once the lab holds the creep's full `30/part`; the CONSUMER (the member's `AwaitBoost`
+// job) walks to the ready lab, applies one compound per visit, and departs once `remaining_for_parts` is
+// empty — OR falls through UNBOOSTED past `AWAIT_BOOST_DEADLINE` (the bounded EP-4.5 contract). T0 slots
+// (and a member with the feature off) never enter the stage (byte-identical to `run_forming`). The
+// harness does not depend on the bot crate: the deadline is mirrored, the tick order (labs fulfil last
+// tick's filing → producer re-files → job consumes) is reproduced, and the stock is a plain ledger.
+
+/// MUST mirror the bot's `jobs::squad_combat::AWAIT_BOOST_DEADLINE` (300) — `pub(crate)` there, so it
+/// cannot be imported; a drift here silently changes the fall-through timing this bed pins.
+pub const AWAIT_BOOST_DEADLINE: u32 = 300;
+
+/// A boosted forming scenario: `run_forming`'s colony + the home's lab/stock model.
+#[derive(Clone, Debug)]
+pub struct BoostedFormingScenario {
+    pub base: ColonyFormingScenario,
+    /// The home's compound STOCK (storage + terminal + labs — what the transfer system can load), as
+    /// `(compound, units)`. 30 units boost one part (engine `boostCreep`).
+    pub stock: Vec<(screeps::ResourceType, u32)>,
+    /// Labs the fulfiller may assign (one per distinct compound per tick; the overflow waits, bounded by
+    /// the requester's deadline — exactly `service_boosts`).
+    pub labs: usize,
+    /// Ticks a member walks from its spawn to the boost tile (the lab-adjacent stamp tile, ADR 0010 §2).
+    pub walk_to_labs: u32,
+    /// Tick at which the home's compound stock is LOST mid-run (a raid / terminal sale / hauling stall);
+    /// `None` = never.
+    pub stock_loss_at: Option<u32>,
+    /// The P3 activation switch (`features.military.boost_military`).
+    pub boost_military: bool,
+    /// The `AwaitBoost` age deadline; fixtures pass [`AWAIT_BOOST_DEADLINE`] (`u32::MAX` = the pre-P3
+    /// "no deadline" shape a RED pin runs).
+    pub await_boost_deadline: u32,
+}
+
+/// The boosted bed's report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoostedFormingReport {
+    /// The forming outcome — `Completed{ticks}` = the roster departed (present AND every boosted-tier
+    /// member out of `AwaitBoost`).
+    pub outcome: FormingOutcome,
+    /// `BoostQueue` requests the producer filed over the run (0 ⇒ the stage was never touched).
+    pub boost_requests_filed: u32,
+    /// `boostCreep` intents applied at a lab (one compound per visit).
+    pub lab_visits: u32,
+    /// Members that departed FULLY boosted at their tier.
+    pub departed_boosted: usize,
+    /// Members that departed on the deadline with compounds unapplied (the bounded fall-through).
+    pub departed_by_deadline: usize,
+}
+
+/// A present member's pre-deploy stage (the `SquadCombatJob` state subset this bed models).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MemberStage {
+    /// `MoveToRoom` — departs with the roster.
+    Ready,
+    /// `AwaitBoost { tier }` — at home, applying compounds. `parts` is the LIVE body with per-part
+    /// boosted flags (the remaining set is DERIVED from it each tick, no progress state); `dist` = tiles
+    /// to the boost tile.
+    AwaitBoost { spawned_at: u32, parts: Vec<(screeps::Part, bool)>, dist: u32 },
+}
+
+/// Simulate the colony forming a (possibly boosted) roster through the P3 boost stage. Deterministic.
+pub fn run_boosted_forming(s: &BoostedFormingScenario) -> BoostedFormingReport {
+    use screeps::ResourceType;
+    use screeps_combat_decision::bodies::{boosts::remaining_for_parts, BoostTier};
+    use screeps_combat_decision::composition::BodyType;
+
+    let b = &s.base;
+    let n_slots = b.composition.slots.len();
+    let best_capacity = b.homes.iter().map(|h| h.energy_capacity).max().unwrap_or(0);
+    let build_energy = best_capacity.min(b.per_member_cap);
+    let tier_of = |slot: usize| -> BoostTier {
+        let BodyType::Sized(spec) = &b.composition.slots[slot].body_type;
+        spec.boost
+    };
+    let mut filled = vec![false; n_slots];
+    let mut stage: Vec<MemberStage> = vec![MemberStage::Ready; n_slots];
+    let mut avail: Vec<u32> = b.homes.iter().map(|h| h.start_energy).collect();
+    let mut busy_until: Vec<u32> = vec![0; b.homes.len()];
+    let mut completing: Vec<(u64, u32)> = Vec::new();
+    let mut dies_at: Vec<u32> = vec![0; n_slots];
+    let mut stock: Vec<(ResourceType, u32)> = s.stock.clone();
+    // Last tick's filing (the labs service it THIS tick — the stage order): (slot, compounds).
+    let mut requests: Vec<(usize, Vec<(ResourceType, u32)>)> = Vec::new();
+    let mut report = BoostedFormingReport {
+        outcome: FormingOutcome::Stalled { filled: 0, of: n_slots },
+        boost_requests_filed: 0,
+        lab_visits: 0,
+        departed_boosted: 0,
+        departed_by_deadline: 0,
+    };
+    let stock_of = |stock: &[(ResourceType, u32)], c: ResourceType| stock.iter().find(|(r, _)| *r == c).map(|(_, u)| *u).unwrap_or(0);
+
+    for tick in 0..b.budget_ticks {
+        if s.stock_loss_at == Some(tick) {
+            stock.clear();
+        }
+        // 1. Complete spawns → fill the slot; a boosted-tier member enters `AwaitBoost` at age 0 (the spawn
+        //    callback routes it there from the slot's stamped tier), a T0 member is `MoveToRoom` at once.
+        completing.retain(|&(id, at)| {
+            if at <= tick {
+                let slot = id as usize;
+                if slot < n_slots {
+                    filled[slot] = true;
+                    dies_at[slot] = tick + b.member_ttl;
+                    let tier = tier_of(slot);
+                    stage[slot] = if tier == BoostTier::T0 {
+                        MemberStage::Ready
+                    } else {
+                        let body = b.composition.slots[slot].body_type.build_body(build_energy, MoveProfile::Plains).unwrap_or_default();
+                        MemberStage::AwaitBoost { spawned_at: tick, parts: body.into_iter().map(|p| (p, false)).collect(), dist: s.walk_to_labs }
+                    };
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for i in 0..n_slots {
+            if filled[i] && dies_at[i] <= tick {
+                filled[i] = false;
+                stage[i] = MemberStage::Ready;
+            }
+        }
+
+        // 2. RunMission — the FULFILLER over LAST tick's filing: one lab per distinct compound in file
+        //    order (overflow compounds wait); a request is READY for a compound iff its lab can hold the
+        //    creep's full need from stock. Ready marks live for this tick only (cleared at tick start).
+        let mut demand: Vec<ResourceType> = Vec::new();
+        for (_, compounds) in &requests {
+            for &(c, _) in compounds {
+                if !demand.contains(&c) {
+                    demand.push(c);
+                }
+            }
+        }
+        let lab_of = |c: ResourceType| demand.iter().position(|d| *d == c).filter(|&i| i < s.labs);
+        let mut ready: Vec<(usize, ResourceType)> = Vec::new();
+        for (slot, compounds) in &requests {
+            for &(c, parts) in compounds {
+                if lab_of(c).is_some() && stock_of(&stock, c) >= parts * 30 {
+                    ready.push((*slot, c));
+                }
+            }
+        }
+
+        // 3. SquadManager — the PRODUCER re-files every awaiting member's remaining compounds (feature-
+        //    gated, at-home, inside the age window, unboosted parts left).
+        requests.clear();
+        if s.boost_military {
+            for (slot, st) in stage.iter().enumerate() {
+                if let MemberStage::AwaitBoost { spawned_at, parts, .. } = st {
+                    if tick - spawned_at > s.await_boost_deadline {
+                        continue; // the job fell through unboosted — stop demanding
+                    }
+                    let remaining = remaining_for_parts(parts, tier_of(slot));
+                    if !remaining.is_empty() {
+                        requests.push((slot, remaining));
+                        report.boost_requests_filed += 1;
+                    }
+                }
+            }
+        }
+
+        // 4. RunJob — the CONSUMER (`AwaitBoost::tick`) per awaiting member, in the live check order.
+        for (slot, st) in stage.iter_mut().enumerate() {
+            let MemberStage::AwaitBoost { spawned_at, parts, dist } = st else { continue };
+            let tier = tier_of(slot);
+            if !s.boost_military || tier == BoostTier::T0 {
+                *st = MemberStage::Ready;
+                continue;
+            }
+            let remaining = remaining_for_parts(parts, tier);
+            if remaining.is_empty() {
+                report.departed_boosted += 1;
+                *st = MemberStage::Ready;
+                continue;
+            }
+            if tick - *spawned_at > s.await_boost_deadline {
+                report.departed_by_deadline += 1;
+                *st = MemberStage::Ready;
+                continue;
+            }
+            // Consume a ready allocation: the first remaining compound with a loaded lab.
+            let target = remaining.iter().find_map(|&(c, parts_needed)| {
+                ready.iter().any(|&(sl, rc)| sl == slot && rc == c).then_some((c, parts_needed))
+            });
+            let Some((compound, parts_needed)) = target else { continue }; // loiter while the labs load
+            if *dist <= 1 {
+                // `boostCreep`: every unboosted part of that family takes the compound; 30 units/part.
+                let set = screeps_combat_decision::bodies::boosts::tier_compounds(tier).expect("tier > T0");
+                let fam = set.iter().position(|&c| c == compound).expect("a tier compound");
+                let part_of_family = |p: screeps::Part| -> bool {
+                    matches!(
+                        (fam, p),
+                        (0, screeps::Part::Attack) | (1, screeps::Part::RangedAttack) | (2, screeps::Part::Heal)
+                            | (3, screeps::Part::Work) | (4, screeps::Part::Tough) | (5, screeps::Part::Move)
+                    )
+                };
+                for (p, boosted) in parts.iter_mut() {
+                    if !*boosted && part_of_family(*p) {
+                        *boosted = true;
+                    }
+                }
+                if let Some(e) = stock.iter_mut().find(|(r, _)| *r == compound) {
+                    e.1 = e.1.saturating_sub(parts_needed * 30);
+                }
+                report.lab_visits += 1;
+            } else {
+                *dist -= 1; // walk to the lab tile
+            }
+        }
+
+        // 5. Ready to depart? The K0 gate over the present roster AND no member still in `AwaitBoost`.
+        let present = filled.iter().filter(|f| **f).count();
+        let member_positions: Vec<Option<Position>> = vec![Some(dummy_home_pos()); present];
+        let all_out_of_stage = (0..n_slots).all(|i| !filled[i] || stage[i] == MemberStage::Ready);
+        if rally::squad_ready_to_depart(&member_positions, n_slots) && all_out_of_stage {
+            report.outcome = FormingOutcome::Completed { ticks: tick };
+            return report;
+        }
+
+        // 6. The spawn lanes — `run_forming`'s exact per-home contest (K3 → K1), static bid, no renew.
+        let combat = fielding::slots_to_spawn(&b.composition, &filled, best_capacity, b.per_member_cap, b.combat_priority, MoveProfile::Plains);
+        let mut in_flight: BTreeSet<u64> = completing.iter().map(|&(id, _)| id).collect();
+        for h in 0..b.homes.len() {
+            avail[h] = (avail[h] + b.homes[h].income).min(b.homes[h].energy_capacity);
+            if tick < busy_until[h] {
+                continue;
+            }
+            let mut queue: Vec<QueuedSpawn> = Vec::new();
+            if let Some((p, c)) = b.economy.miner {
+                if b.economy.miner_period > 0 && tick % b.economy.miner_period == 0 {
+                    queue.push(QueuedSpawn {
+                        priority: p,
+                        body_cost: c,
+                        part_count: (c / 100).max(1),
+                        id: ECON_MINER_ID_BASE + (tick as u64) * 100 + h as u64,
+                    });
+                }
+            }
+            if let Some((p, c)) = b.economy.hauler {
+                queue.push(QueuedSpawn {
+                    priority: p,
+                    body_cost: c,
+                    part_count: (c / 100).max(1),
+                    id: ECON_HAULER_ID_BASE + (tick as u64) * 100 + h as u64,
+                });
+            }
+            for cs in &combat {
+                if !in_flight.contains(&cs.id) {
+                    queue.push(*cs);
+                }
+            }
+            let mut lane = HomeLanes { idle_spawns: 1, available_energy: avail[h], energy_capacity: b.homes[h].energy_capacity };
+            for spawned in spawn_step(&mut lane, &queue) {
+                avail[h] = lane.available_energy;
+                busy_until[h] = tick + spawned.completes_in;
+                if spawned.id < ECON_MINER_ID_BASE {
+                    completing.push((spawned.id, tick + spawned.completes_in));
+                    in_flight.insert(spawned.id);
+                }
+            }
+        }
+    }
+    report.outcome = FormingOutcome::Stalled { filled: filled.iter().filter(|f| **f).count(), of: n_slots };
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use screeps_combat_decision::composition::assemble_force;
     use screeps_combat_decision::force_sizing::RequiredForce;
+
+    /// Parity M23 — an objective rate that COVERS the burn of holding this WHOLE roster idle
+    /// (`forming_burn_rate_milli(Σ slot cost) + 1`, ADR 0042 §4/§5), so the economic give-up cannot fire
+    /// and a fixture keeps pinning the LEASE/travel envelope it was written for. `build_energy` is the
+    /// driver's `min(best_capacity, per_member_cap)`.
+    fn covering_rate_milli(comp: &SquadComposition, build_energy: u32) -> u32 {
+        forming_burn_rate_milli(slot_body_costs(comp, build_energy).iter().sum()) + 1
+    }
 
     /// A multi-slot placeholder composition (assembled template-free, ADR 0031 D16) the forming tests
     /// override with the oracle-sized one; several RANGED + several HEAL members at the home cap.
@@ -3919,6 +5059,7 @@ mod tests {
     /// A spawn-contended colony forming `comp`: two modest RCL7 homes banking slowly, a constant HIGH
     /// hauler eating a lane, combat at the live forming band (85). Expensive multi-slot rosters plateau here.
     fn contended(comp: SquadComposition) -> ColonyFormingScenario {
+        let rate = covering_rate_milli(&comp, 3000);
         ColonyFormingScenario {
             composition: comp,
             // ONE weak home: slot 0 spawns from the banked start_energy, but banking the next member's body
@@ -3942,7 +5083,11 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
-            objective_rate_milli: 0,
+            // Parity M23: a VALUED objective — its completed rate covers the burn of holding the whole
+            // roster, so the economic give-up stays quiet and this fixture keeps pinning the LEASE
+            // envelope. (At rate 0 the same roster is a worthless objective: see
+            // `below_burn_objective_abandons_forming_early`.)
+            objective_rate_milli: rate,
         }
     }
 
@@ -4097,6 +5242,7 @@ mod tests {
             3000,
         )
         .expect("an offense force");
+        let rate = covering_rate_milli(&comp, 3000);
         ColonyFormingScenario {
             composition: comp,
             homes: vec![
@@ -4122,7 +5268,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
-            objective_rate_milli: 0,
+            objective_rate_milli: rate, // M23: a valued objective (give-up quiet)
         }
     }
 
@@ -4399,6 +5545,7 @@ mod tests {
             2,
             "the spatial repro uses a 2-slot roster (one member per home)"
         );
+        let rate = covering_rate_milli(&comp, 3000);
         ColonyFormingScenario {
             composition: comp,
             homes: vec![
@@ -4424,7 +5571,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
-            objective_rate_milli: 0,
+            objective_rate_milli: rate, // M23: a valued objective (give-up quiet)
         }
     }
 
@@ -4588,6 +5735,7 @@ mod tests {
             comp.slots.len()
         );
         let n = comp.slots.len();
+        let rate = covering_rate_milli(&comp, 3000);
         ColonyFormingScenario {
             composition: comp,
             // One easily-fieldable home per slot — isolate the MOVEMENT stall from spawn contention.
@@ -4609,7 +5757,7 @@ mod tests {
             member_ttl: 1500,
             renew: false,
             escalating_completion: false,
-            objective_rate_milli: 0,
+            objective_rate_milli: rate, // M23: a valued objective (give-up quiet)
         }
     }
 
@@ -4983,7 +6131,9 @@ mod tests {
     #[test]
     fn assembler_kills_across_defended_regimes() {
         use crate::harness::generate::{ForceSpec, Layout};
-        let regimes: &[(&str, u32, &[((u8, u8), u32)], Layout, ForceSpec)] = &[
+        /// (label, rampart hits, towers, layout, guard force).
+        type Regime<'a> = (&'a str, u32, &'a [((u8, u8), u32)], Layout, ForceSpec);
+        let regimes: &[Regime] = &[
             (
                 "rampart-only + light guard",
                 50_000,
@@ -5057,6 +6207,8 @@ mod tests {
             reassign_enabled: reassign,
             form_ticks: 2,
             budget_ticks: 400,
+            is_defend: true,
+            live_visible_clear: false, // the pre-existing model: an arrival "engages" its room
         }
     }
 
@@ -5135,6 +6287,8 @@ mod tests {
             reassign_enabled: true, // enabled, but there is no sibling to reassign TO
             form_ticks: 2,
             budget_ticks: 200,
+            is_defend: true,
+            live_visible_clear: false,
         };
         let out = run_v1_flow(&scenario);
         assert!(
@@ -5687,5 +6841,817 @@ mod tests {
             matches!(out, DeclaimOutcome::Neutralized { .. }),
             "the declaimer holds across a lease that DOES lapse between strikes, got {out:?}"
         );
+    }
+
+    // ═══ Parity M20–M23 (WS-CLOSE lane b1, 2026-09-07): the four Seam-7 reconcile inputs the harness
+    //     never exercised — each now driven end-to-end through a flow by the SHARED kernel, with live
+    //     computing the same input from the same crate (no mirrored constants). ═══
+
+    // ── M23: the ECONOMIC forming give-up (ADR 0042 §5) ──
+
+    /// The M23 bed: TWO 3000e members at ONE trickle home. Slot 0 spawns from the bank at once; the NEXT
+    /// member then banks ~1000 ticks at 3e/t — far past `COMMITMENT_BUDGET` (400) — so the forming lease
+    /// is carried ONLY by the bounded in-flight refresh, which is exactly what the economic give-up
+    /// withdraws (live and harness alike: the give-up stops the REFRESH; the retire is the base lease
+    /// lapse). The budget is EXACTLY `MAX_FORMING_BUDGET`, so the clock-only backstop can never fire
+    /// within it, while a valued roster still completes (~1200t) — the control.
+    fn trickle_bank() -> ColonyFormingScenario {
+        let mut comp = placeholder_comp(); // 3000e-capped members
+        comp.slots.truncate(2);
+        assert_eq!(slot_body_costs(&comp, 3000), vec![3000, 3000], "two full-cap members");
+        let rate = covering_rate_milli(&comp, 3000);
+        ColonyFormingScenario {
+            composition: comp,
+            homes: vec![Home { energy_capacity: 5300, income: 3, start_energy: 3000 }],
+            economy: EconomyPressure { hauler: Some((75_000, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 85_000,
+            per_member_cap: 3000,
+            budget_ticks: MAX_FORMING_BUDGET,
+            member_ttl: 1500,
+            renew: false,
+            escalating_completion: false,
+            objective_rate_milli: rate,
+        }
+    }
+
+    /// M23 — a WORTHLESS objective (rate 0) with a present roster ABANDONS forming EARLY: the shared
+    /// `EconomicGiveUp` latches `FORMING_ABANDON_STREAK` (20) reconciles after the first member is present
+    /// (`should_abandon_forming(0, burn > 0, 0)`), the forming lease stops refreshing, and the base
+    /// `COMMITMENT_BUDGET` lapse retires it (GaveUp → re-field → repeat). Every generation counted here is
+    /// the ECONOMIC abandon (~20 reconciles + one lease window ≪ the 3000t backstop, which the budget
+    /// excludes). The SAME bed at a covering rate rides the in-flight refresh to completion (the control).
+    #[test]
+    fn below_burn_objective_abandons_forming_early() {
+        let valued = trickle_bank();
+        let control = run_lifecycle_churn(&valued, &ChurnTarget::default());
+        assert!(
+            matches!(control, ChurnOutcome::DeployedAndEngaged { generations: 0, .. }),
+            "CONTROL: a valued objective rides the bounded in-flight refresh to completion, got {control:?}"
+        );
+        let mut s = valued;
+        s.objective_rate_milli = 0; // worthless: cannot cover ANY present roster's burn
+        let out = run_lifecycle_churn(&s, &ChurnTarget::default());
+        match out {
+            ChurnOutcome::ChurnedNeverDeployed { generations, max_present } => {
+                assert!(
+                    generations >= 2,
+                    "a below-burn objective must abandon + re-field repeatedly WELL inside the 3000t backstop \
+                     (each generation ≈ first member + {} reconciles + {COMMITMENT_BUDGET}t lease), got {generations} generations",
+                    screeps_econ_decision::spawn_policy::FORMING_ABANDON_STREAK
+                );
+                assert!(max_present >= 1, "the give-up needs a PRESENT member to price a burn (got {max_present})");
+            }
+            other => panic!("a worthless objective must churn on the economic give-up, never deploy, got {other:?}"),
+        }
+        assert_eq!(run_lifecycle_churn(&s, &ChurnTarget::default()), out, "deterministic");
+    }
+
+    /// M23 — the SAFE-MODE exemption (ADR 0042 §5: a bounded window, not permanent unwinnability): the
+    /// same worthless objective under a safe-moded target NEVER trips the economic give-up — the roster
+    /// rides the forming lease to completion exactly like a valued objective.
+    #[test]
+    fn safe_mode_target_exempts_the_economic_giveup() {
+        let mut s = trickle_bank();
+        s.objective_rate_milli = 0;
+        let out = run_lifecycle_churn(&s, &ChurnTarget { target_safe_mode: true, ..Default::default() });
+        assert!(
+            matches!(out, ChurnOutcome::DeployedAndEngaged { .. }),
+            "a safe-moded target skips the economic give-up — the roster forms + deploys, got {out:?}"
+        );
+    }
+
+    /// M23 — the shared latch constant and the covering-rate helper agree with the kernel: the fixture
+    /// rates strictly cover the whole roster's burn (so the re-based envelope pins mean what they say),
+    /// and the K the harness latches on IS the live K (one constant, one crate).
+    #[test]
+    fn covering_rate_covers_the_whole_roster_burn() {
+        let comp = oversized_defense_comp();
+        let rate = covering_rate_milli(&comp, 3000);
+        let all_present = vec![true; comp.slots.len()];
+        let burn = forming_burn_rate_milli(present_roster_cost(&slot_body_costs(&comp, 3000), &all_present));
+        assert!(burn > 0, "the oversized roster bleeds a real burn");
+        assert!(!should_abandon_forming(rate, burn, 0), "the covering rate covers the FULL roster's burn ({rate} ≥ {burn})");
+        assert!(should_abandon_forming(0, burn, 0), "a zero rate covers nothing");
+        assert_eq!(screeps_econ_decision::spawn_policy::FORMING_ABANDON_STREAK, 20, "the ADR 0042 §5 K-latch, shared with live");
+    }
+
+    // ── M21: the D28 vacuous clear (combat review §7.2a) ──
+
+    /// M21 — an uncontested offense squad that ARRIVES in a LIVE-VISIBLE, hostile-free room is a clean
+    /// clear ON THE ARRIVAL TICK with `engaged_once` never latched: the kernel returns
+    /// `Retire{Resolved, withdraw: true, mark_unwinnable: false}` — the objective is withdrawn (no one
+    /// re-fields a cleared room) and NEVER backed off. Pre-D28 this squad was held until the budgets
+    /// forced a GaveUp (the live border-oscillation hold on obj 3423/W12N51).
+    #[test]
+    fn live_visible_empty_room_resolves_vacuously_on_arrival() {
+        let target = ChurnTarget {
+            travel_ticks: 20,
+            uncontested: true, // proven-uncontested → the single member departs at once
+            live_visible_clear: true,
+            ..Default::default()
+        };
+        let out = run_lifecycle_churn(&easy_single_slot(), &target);
+        match out {
+            ChurnOutcome::VacuouslyResolved { generations, resolve_tick, withdraw, mark_unwinnable } => {
+                assert_eq!(generations, 0, "one generation — no churn");
+                assert!(withdraw, "a vacuous clear is a clean win: the objective is WITHDRAWN");
+                assert!(!mark_unwinnable, "a cleared room is never backed off");
+                assert!(
+                    resolve_tick < COMMITMENT_BUDGET,
+                    "the clear fires on the arrival evidence, not after a lease wait (tick {resolve_tick})"
+                );
+            }
+            other => panic!("a live-visible empty room must resolve vacuously without engaging, got {other:?}"),
+        }
+        // CONTROL (R10): the SAME arrival with the room NOT live-visible (a vision-gap arrival) is not a
+        // clear — the pre-D28 model's arrival-with-focus engage stands.
+        let control = run_lifecycle_churn(&easy_single_slot(), &ChurnTarget { live_visible_clear: false, ..target });
+        assert!(
+            matches!(control, ChurnOutcome::DeployedAndEngaged { .. }),
+            "without live visibility the vacuous evidence is absent (R10), got {control:?}"
+        );
+    }
+
+    /// M21 — the `is_defend` EXCLUSION through the flow: a Defend garrison arriving in its live-visible
+    /// EMPTY owned room is NOT vacuously resolved out of it — its quiet hold is deliberate (FIX B2), it
+    /// GARRISONS for the whole budget (one stable generation) and its terminal is `objective_gone`.
+    #[test]
+    fn defend_garrison_is_excluded_from_the_vacuous_clear() {
+        let out = run_lifecycle_churn(
+            &easy_single_slot(),
+            &ChurnTarget {
+                travel_ticks: 20,
+                uncontested: true,
+                is_defend: true,
+                live_visible_clear: true, // the SAME evidence that resolves an offense squad
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(out, ChurnOutcome::Garrisoned { generations: 0 }),
+            "a Defend garrison holds its live-visible empty owned room — never a vacuous resolve, got {out:?}"
+        );
+    }
+
+    /// M21 — the vacuous clear feeds REASSIGN's `withdraw_old: true` through `run_v1_flow`: the threat
+    /// leaves the owned room BEFORE the (slower-forming) squad arrives, so the arrival finds a
+    /// LIVE-VISIBLE empty room — nothing to engage, `engaged_once` never latches — and the kernel rebinds
+    /// the squad in place to the neighbour Secure on the vacuous evidence (a clean win: the old objective
+    /// is withdrawn). The squad then reaches + engages the threat at the neighbour, same generation.
+    #[test]
+    fn vacuous_clear_drives_reassign_with_withdraw_old() {
+        let scenario = V1FlowScenario {
+            owned: vec![((0, 0), 1.0)],
+            home: (0, 0),
+            // The threat is in the owned room for ONE scan, then walks to the neighbour and stays.
+            threat_path: vec![(0, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0)],
+            scan_period: 2,
+            objective_ttl: 6,
+            reassign_enabled: true,
+            form_ticks: 3, // slower than the threat: it has left by the time the squad stands in the room
+            budget_ticks: 400,
+            is_defend: false, // an OFFENSE squad — the vacuous clear does not apply to a Defend garrison
+            live_visible_clear: true,
+        };
+        let out = run_v1_flow(&scenario);
+        match out {
+            ChurnOutcome::Reassigned { from_gen, reassignments, vacuous_reassignments, .. } => {
+                assert_eq!(from_gen, 0, "rebound in place — no Generation churn");
+                assert!(reassignments >= 1);
+                assert!(
+                    vacuous_reassignments >= 1,
+                    "the rebind was driven by the VACUOUS clear (Reassign{{withdraw_old: true}} without engaged_once)"
+                );
+            }
+            other => panic!("the vacuous clear must drive an in-place reassign, got {other:?}"),
+        }
+        // CONTROL: the same scenario without live visibility runs the pre-existing model (the arrival
+        // "engages" its room) — the rebind is the engaged-once path, never the vacuous one.
+        let control = run_v1_flow(&V1FlowScenario { live_visible_clear: false, ..scenario.clone() });
+        assert!(
+            matches!(control, ChurnOutcome::Reassigned { vacuous_reassignments: 0, .. }),
+            "without live visibility no rebind is vacuous, got {control:?}"
+        );
+        assert_eq!(run_v1_flow(&scenario), out, "deterministic");
+    }
+
+    // ── M22: the REC-003 / ADR 0035 FU2 give-up clock, end-to-end ──
+
+    /// The stall-flow bed: arrival at tick 50 (the clock must not run en route), the scripted in-room fight.
+    fn stall_bed(script: StallScript, clear_at: Option<u32>) -> StallFlowScenario {
+        StallFlowScenario { arrival_tick: 50, script, clear_at, budget_ticks: 3000 }
+    }
+
+    /// The tick the give-up clock starts running UNINTERRUPTED in the flat probe bounce. Phase B advances
+    /// the stall streak on the ticks whose PREVIOUS applied state was Engaged (arrival+1, +3, …), so the
+    /// streak reaches `ENEMY_STALL_TICKS` at arrival + 2·ENEMY_STALL_TICKS − 1; the next tick (a Retreating
+    /// tick) starts the clock and — the stall now latched — every later Engaged probe tick HOLDS it.
+    const BOUNCE_CLOCK_START: u32 = 50 + 2 * screeps_combat_decision::ENEMY_STALL_TICKS;
+
+    /// M22 (a) — the FU2 zombie: a period-2 Engaged/Retreating probe bounce against FLAT enemy hits is
+    /// force-aborted `Retire{GaveUp, mark_unwinnable: true}` at EXACTLY `clock_start + MAX_RETREAT_BUDGET`
+    /// DESPITE the in-room focus refreshing its lease every tick — the clock accrues ACROSS the bounce
+    /// (the pre-FU2 clock was cleared on every Engaged probe tick → immortal).
+    #[test]
+    fn probe_bounce_with_flat_hits_force_aborts_at_exactly_the_retreat_budget() {
+        use screeps_combat_decision::lifecycle::MAX_RETREAT_BUDGET;
+        let out = run_stall_flow(&stall_bed(StallScript::BounceFlat { enemy_hits: 5_000 }, None));
+        assert_eq!(
+            out,
+            StallOutcome::ForceAborted {
+                tick: BOUNCE_CLOCK_START + MAX_RETREAT_BUDGET,
+                clock_started_at: BOUNCE_CLOCK_START,
+                mark_unwinnable: true,
+            },
+            "the bounce zombie must force-abort at exactly retreating_since + MAX_RETREAT_BUDGET ({})",
+            MAX_RETREAT_BUDGET
+        );
+    }
+
+    /// M22 (b) — the same bounce with the enemy hits DECREASING (slow but real headway) NEVER trips: each
+    /// drop resets the streak before it can latch, so every Engaged probe tick clears the clock — the
+    /// squad fights through the whole 3000t budget with no terminal.
+    #[test]
+    fn probe_bounce_with_decreasing_hits_never_trips() {
+        let out = run_stall_flow(&stall_bed(StallScript::BounceDecreasing { enemy_hits: 5_000, drop: 10, every: 60 }, None));
+        match out {
+            StallOutcome::FoughtThroughBudget { ticks, max_streak } => {
+                assert_eq!(ticks, 3000);
+                assert!(
+                    max_streak < screeps_combat_decision::ENEMY_STALL_TICKS,
+                    "headway every 60t keeps the streak below the latch (max {max_streak})"
+                );
+            }
+            other => panic!("a fight making headway must never be force-aborted, got {other:?}"),
+        }
+    }
+
+    /// M22 (c) — the streak is FROZEN while disengaged: in-room but never in contact (`Moving` every tick)
+    /// against flat hits accrues NOTHING — a squad not in contact cannot fail to make headway — so the
+    /// clock never holds and nothing trips.
+    #[test]
+    fn streak_is_frozen_while_disengaged() {
+        let out = run_stall_flow(&stall_bed(StallScript::DisengagedFlat { enemy_hits: 5_000 }, None));
+        assert_eq!(
+            out,
+            StallOutcome::FoughtThroughBudget { ticks: 3000, max_streak: 0 },
+            "disengaged flat hits must neither grow the streak nor run the clock"
+        );
+    }
+
+    /// M22 (d) — REC-061 in the FLOW: the room is CLEARED (no hostile ⇒ no focus) on the very tick the
+    /// clock exhausts; the clean clear DOMINATES — `Retire{Resolved, withdraw: true, mark_unwinnable:
+    /// false}`, never a backed-off WON room.
+    #[test]
+    fn resolved_dominates_the_exhaust_tick_in_the_flow() {
+        use screeps_combat_decision::lifecycle::MAX_RETREAT_BUDGET;
+        let exhaust = BOUNCE_CLOCK_START + MAX_RETREAT_BUDGET;
+        let out = run_stall_flow(&stall_bed(StallScript::BounceFlat { enemy_hits: 5_000 }, Some(exhaust)));
+        assert_eq!(
+            out,
+            StallOutcome::Resolved { tick: exhaust, withdraw: true, mark_unwinnable: false },
+            "a clean clear on the exhaust tick wins the terminal — withdrawn, never marked unwinnable"
+        );
+        // CONTROL: a clear one tick LATER is too late — the force-abort already fired.
+        let late = run_stall_flow(&stall_bed(StallScript::BounceFlat { enemy_hits: 5_000 }, Some(exhaust + 1)));
+        assert!(matches!(late, StallOutcome::ForceAborted { tick, .. } if tick == exhaust), "got {late:?}");
+    }
+
+    /// M22 — the new driver is deterministic (pure value math, no `HashMap`).
+    #[test]
+    fn stall_flow_is_deterministic() {
+        for script in [
+            StallScript::BounceFlat { enemy_hits: 5_000 },
+            StallScript::BounceDecreasing { enemy_hits: 5_000, drop: 10, every: 60 },
+            StallScript::DisengagedFlat { enemy_hits: 5_000 },
+        ] {
+            let bed = stall_bed(script, Some(700));
+            assert_eq!(run_stall_flow(&bed), run_stall_flow(&bed), "{script:?}");
+        }
+    }
+
+    // ── M20: the MEASURED forming in-flight signal (WS-CLOSE D3, Option A) ──
+
+    /// M20 — a roster whose UNFILLED remainder can NEVER be queued (slot 1's spec exceeds the per-member
+    /// energy cap ⇒ `build_body` None at the build energy, the live `queue_slot_spawn` silent stall) does
+    /// NOT hold its forming lease: slot 0 spawns (present 1/2, forming), nothing is queued and nothing is
+    /// spawning ⇒ `forming_in_flight = false` ⇒ the lease is refreshed only on the present++ tick and
+    /// lapses `COMMITMENT_BUDGET` later → GaveUp → re-field → repeat. The budget is below
+    /// `MAX_FORMING_BUDGET`, so the pre-fix degenerate feed (in-flight ≡ forming: refreshed every tick to
+    /// the 3000t backstop) yields ZERO generations here — the difference IS the measured signal.
+    #[test]
+    fn unbuildable_remainder_lapses_the_forming_lease() {
+        use screeps_combat_decision::composition::BodyType;
+        let mut comp = assemble_force(
+            &RequiredForce { anti_creep_parts: 4, heal_parts: 4, ..Default::default() },
+            3000,
+        )
+        .expect("a 2-slot fighter+healer force");
+        assert_eq!(comp.slots.len(), 2);
+        {
+            // Inflate the healer slot past the 3000e per-member cap: it can never be built ⇒ never queued.
+            let BodyType::Sized(spec) = &mut comp.slots[1].body_type;
+            spec.heal = 40; // 40 × 250e = 10_000e ≫ the cap
+        }
+        assert!(comp.slots[1].body_type.build_body(3000, MoveProfile::Plains).is_none(), "slot 1 is unbuildable at the cap");
+        assert!(comp.slots[0].body_type.build_body(3000, MoveProfile::Plains).is_some(), "slot 0 still builds");
+        let rate = covering_rate_milli(&comp, 3000); // M23 stays quiet: isolate the in-flight signal
+        let s = ColonyFormingScenario {
+            composition: comp,
+            homes: vec![Home { energy_capacity: 5300, income: 300, start_energy: 3000 }],
+            economy: EconomyPressure { hauler: Some((75_000, 1000)), miner: None, miner_period: 0 },
+            combat_priority: 87_500,
+            per_member_cap: 3000,
+            budget_ticks: 2500, // < MAX_FORMING_BUDGET (3000): the clock-only backstop cannot fire
+            member_ttl: 1500,
+            renew: false,
+            escalating_completion: false,
+            objective_rate_milli: rate,
+        };
+        let out = run_lifecycle_churn(&s, &ChurnTarget::default()); // contested → needs the full roster
+        match out {
+            ChurnOutcome::ChurnedNeverDeployed { generations, max_present } => {
+                assert_eq!(max_present, 1, "only the buildable slot ever fields");
+                assert!(
+                    generations >= 2,
+                    "with nothing queued/in flight the +{COMMITMENT_BUDGET} lease must lapse and re-field \
+                     repeatedly inside {} ticks (got {generations} generations)",
+                    s.budget_ticks
+                );
+            }
+            other => panic!("an unbuildable remainder can never deploy, got {other:?}"),
+        }
+    }
+
+    // ═══ BED 3 — multi-squad + K4 claim pacing over SHARED home lanes (ADR 0028 §coverage 3; ADR 0029 §11) ═══
+    //
+    // Every pin below runs `run_multi_forming` on ONE fixture under BOTH K4 arms: the harness-only
+    // offense-only `claims_allowed` budget (the pre-REC-008 / pre-S5-CAP bot — the ADR's named lockup
+    // shape) and the live `claim_admission` policy. The RED half of each pair IS the un-fixed arm's
+    // reproduction; the GREEN half is the same board under the live kernel.
+
+    use screeps_combat_decision::bodies::{BoostTier, CombatBodySpec};
+    use screeps_combat_decision::claim_pacing::{max_concurrent_squads, MAX_FORMING_SQUADS};
+    use screeps_combat_decision::composition::{BodyType, FormationMode, FormationShape, SquadSlot};
+
+    /// `n` identical force-SIZED members (explicit part counts — no catalog, ADR 0031 D16).
+    fn sized_comp(n: usize, ranged_attack: u32, heal: u32, boost: BoostTier) -> SquadComposition {
+        let spec = CombatBodySpec { ranged_attack, heal, boost, ..Default::default() };
+        SquadComposition {
+            label: format!("{n}x RA{ranged_attack}/H{heal}@{boost:?}"),
+            slots: (0..n).map(|_| SquadSlot { role: SquadRole::RangedDPS, body_type: BodyType::Sized(spec) }).collect(),
+            formation_shape: FormationShape::None,
+            formation_mode: FormationMode::Loose,
+            retreat_threshold: 0.3,
+        }
+    }
+
+    /// A HEAVY quad: 4 × (8 RA + 4 HEAL + 12 MOVE) = 2800e / 24 parts (72 spawn ticks) per member.
+    fn heavy_quad() -> SquadComposition {
+        sized_comp(4, 8, 4, BoostTier::T0)
+    }
+
+    /// A LIGHT duo: 2 × (4 RA + 1 HEAL + 5 MOVE) = 1100e / 10 parts (30 spawn ticks) per member.
+    fn light_duo() -> SquadComposition {
+        sized_comp(2, 4, 1, BoostTier::T0)
+    }
+
+    fn offense(comp: SquadComposition, static_bid: Option<u32>, rate: u32, fight_ticks: u32) -> BoardObjective {
+        BoardObjective {
+            composition: comp,
+            is_defense: false,
+            available_at: 0,
+            homes_in_range: vec![],
+            static_bid,
+            objective_rate_milli: rate,
+            fight_ticks,
+            wins_or_stalls_at: None,
+        }
+    }
+
+    fn home(income: u32) -> Home {
+        Home { energy_capacity: 5300, income, start_energy: 2000 }
+    }
+
+    const HAULER: EconomyPressure = EconomyPressure { hauler: Some((75_000, 1000)), miner: None, miner_period: 0 };
+
+    /// The pre-S5-CAP flat concurrent cap the `claims_allowed` arm ran under.
+    const FLAT_CAP: usize = 4;
+
+    /// THE LOCKUP BOARD. One trickle-income home (5e/t) and three OFFENSE objectives ranked heavy-first: a
+    /// heavy quad whose forming OUTLASTS a member's life (2800e banks in ~560t, so the 4th member lands
+    /// after the 1st aged out — a roster that is always in flight and never complete) and two light duos
+    /// the home could finish in ~70t. `static_bid` = the live 87.5 backfire config; `None` = the ADR 0042
+    /// value bids (the duos' higher completed rate orders their slots ahead of the quad's).
+    fn lockup_board(arm: ClaimArm, static_bid: Option<u32>) -> MultiSquadFormingScenario {
+        let quad = heavy_quad();
+        let quad_rate = covering_rate_milli(&quad, 3000); // a VALUED objective: the M23 give-up stays quiet
+        MultiSquadFormingScenario {
+            objectives: vec![
+                offense(quad, static_bid, quad_rate, 200),
+                offense(light_duo(), static_bid, 20_000, 200),
+                offense(light_duo(), static_bid, 20_000, 200),
+            ],
+            homes: vec![home(5)],
+            economy: HAULER,
+            arm,
+            d9_proceed_gate: true,
+            per_member_cap: 3000,
+            budget_ticks: 2500, // < MAX_FORMING_BUDGET: only the K4 pace can free the board
+            member_ttl: 1500,
+        }
+    }
+
+    /// The ADR 0028 bed-3 lockup, reproduced: under the offense-only `claims_allowed` budget with
+    /// `max_forming = 1` at the 87.5 bid, the heavy roster (always in flight, never complete — its lease
+    /// is refreshed through the whole budget) holds the ONLY forming slot, so the two finishable duos are
+    /// NEVER claimed, nothing departs, and standing combat sits at N-1 (the live capture's
+    /// "combat: 2 2 2 2 0 2 3") for 2500 ticks — while the head-of-line break behind the unaffordable
+    /// quad slot starves the HIGH hauler outright.
+    #[test]
+    fn forming_cap_one_locks_the_claim_board() {
+        let arm = ClaimArm::ClaimsAllowed { max_concurrent: FLAT_CAP, max_forming: 1 };
+        let r = run_multi_forming(&lockup_board(arm, Some(87_500)));
+        assert_eq!(r.claim_order, vec![0], "only the heavy quad is ever claimed (the forming slot never frees): {:?}", r.claim_order);
+        assert!(
+            matches!(r.outcomes[0], BoardOutcome::Stalled { filled, of: 4, .. } if filled < 4),
+            "the stuck roster is still forming at the end of the budget: {:?}",
+            r.outcomes[0]
+        );
+        assert_eq!(r.outcomes[1], BoardOutcome::NeverClaimed, "duo #1 blocked behind the stuck roster");
+        assert_eq!(r.outcomes[2], BoardOutcome::NeverClaimed, "duo #2 blocked behind the stuck roster");
+        assert!(r.max_standing_combat < 4, "standing combat never reaches a full roster (got {})", r.max_standing_combat);
+        assert_eq!(r.hauler_spawns, 0, "the 87.5 quad slot head-of-line-breaks the HIGH hauler for the whole budget");
+    }
+
+    /// THE FIX on the same board: the live `claim_admission` (MAX_FORMING_SQUADS = 2) admits the first
+    /// duo beside the stuck quad, the ADR 0042 value bids order the duo's cheap slots AHEAD of the quad's
+    /// unaffordable one (no head-of-line strand), the duo forms + departs + resolves, and the second duo
+    /// is admitted into the freed slot — the board is no longer locked by a roster that cannot complete.
+    #[test]
+    fn claim_admission_unlocks_the_board_behind_the_stuck_roster() {
+        let r = run_multi_forming(&lockup_board(ClaimArm::ClaimAdmission, None));
+        assert!(matches!(r.outcomes[1], BoardOutcome::Departed { .. }), "duo #1 forms + departs beside the stuck quad: {:?}", r.outcomes[1]);
+        assert!(matches!(r.outcomes[2], BoardOutcome::Departed { .. }), "duo #2 is admitted once #1 resolves: {:?}", r.outcomes[2]);
+        assert!(!matches!(r.outcomes[0], BoardOutcome::Departed { .. }), "the heavy quad still never completes: {:?}", r.outcomes[0]);
+        assert!(
+            r.max_offense_forming <= MAX_FORMING_SQUADS,
+            "offense rosters serialize at <= MAX_FORMING_SQUADS ({}) — got {}",
+            MAX_FORMING_SQUADS,
+            r.max_offense_forming
+        );
+        assert_eq!(r.claim_order, vec![0, 1, 2], "claims land in rank order as slots free: {:?}", r.claim_order);
+    }
+
+    /// THE COMPLETING BOARD: four RCL8 homes at 300e/t, six finishable offense duos with short fights
+    /// (so resolved slots free for the tail of the board). Value bids under the live arm.
+    fn completing_board(arm: ClaimArm, static_bid: Option<u32>) -> MultiSquadFormingScenario {
+        let rate = covering_rate_milli(&light_duo(), 3000);
+        MultiSquadFormingScenario {
+            objectives: (0..6).map(|_| offense(light_duo(), static_bid, rate, 60)).collect(),
+            homes: vec![home(300); 4],
+            economy: HAULER,
+            arm,
+            d9_proceed_gate: true,
+            per_member_cap: 3000,
+            budget_ticks: 400,
+            member_ttl: 1500,
+        }
+    }
+
+    fn last_departure(r: &MultiFormingReport) -> u32 {
+        r.outcomes
+            .iter()
+            .map(|o| match o {
+                BoardOutcome::Departed { departed_at, present, of, .. } if present == of => *departed_at,
+                other => panic!("every duo completes within the budget, got {other:?}"),
+            })
+            .max()
+            .expect("a non-empty board")
+    }
+
+    /// The settled live point (HIGH-band value bid + `forming-cap=2`): six finishable duos over four
+    /// shared homes all complete IN CLAIM ORDER, never more than `MAX_FORMING_SQUADS` form at once (and
+    /// the pace is actually used — two form in parallel), and the HIGH hauler keeps spawning on the lanes
+    /// the in-flight slots leave free (economy not starved).
+    #[test]
+    fn forming_cap_two_at_high_serializes_and_completes() {
+        let r = run_multi_forming(&completing_board(ClaimArm::ClaimAdmission, None));
+        let departed: Vec<u32> = r
+            .outcomes
+            .iter()
+            .map(|o| match o {
+                BoardOutcome::Departed { departed_at, present: 2, of: 2, .. } => *departed_at,
+                other => panic!("every duo completes within the budget, got {other:?}"),
+            })
+            .collect();
+        assert!(departed.windows(2).all(|w| w[0] <= w[1]), "rosters complete in claim order: {departed:?}");
+        assert_eq!(r.max_offense_forming, MAX_FORMING_SQUADS, "offense rosters serialize at exactly the pace (two in parallel)");
+        assert!(r.hauler_spawns >= 20, "the HIGH hauler keeps spawning while rosters form (got {})", r.hauler_spawns);
+    }
+
+    /// RED twin of the above: the same board under `forming-cap=1` (the rejected 87.5 setting) forms one
+    /// roster at a time and finishes the board LATER than the live pace does — the cap is throughput.
+    #[test]
+    fn forming_cap_one_finishes_the_completing_board_later() {
+        let arm = ClaimArm::ClaimsAllowed { max_concurrent: FLAT_CAP, max_forming: 1 };
+        let one = run_multi_forming(&completing_board(arm, Some(87_500)));
+        assert_eq!(one.max_offense_forming, 1, "one roster at a time");
+        let two = run_multi_forming(&completing_board(ClaimArm::ClaimAdmission, None));
+        assert!(
+            last_departure(&one) > last_departure(&two),
+            "forming-cap=1 finishes the board later than forming-cap=2 ({} > {})",
+            last_departure(&one),
+            last_departure(&two)
+        );
+    }
+
+    /// THE DEFENDER BOARD (ADR 0029 §11): four DEFENSE quads, two per home (each target within
+    /// `MAX_SPAWN_DISTANCE` of ONE home), homes banking 5e/t so a quad's 4th member (t≈1912) lands after
+    /// its 1st aged out (t≈1732). `wins_or_stalls_at = 2`: a duo of the sized quad already wins-or-stalls
+    /// the threat (the fixture's Lanchester verdict for D9-as-built).
+    fn defender_board(arm: ClaimArm, d9_proceed_gate: bool) -> MultiSquadFormingScenario {
+        let quad = heavy_quad();
+        let rate = covering_rate_milli(&quad, 3000);
+        let defend = |home_idx: usize| BoardObjective {
+            composition: quad.clone(),
+            is_defense: true,
+            available_at: 0,
+            homes_in_range: vec![home_idx],
+            static_bid: None,
+            objective_rate_milli: rate,
+            fight_ticks: 300,
+            wins_or_stalls_at: Some(2),
+        };
+        MultiSquadFormingScenario {
+            objectives: vec![defend(0), defend(1), defend(0), defend(1)],
+            homes: vec![home(5), home(5)],
+            economy: HAULER,
+            arm,
+            d9_proceed_gate,
+            per_member_cap: 3000,
+            budget_ticks: 2500,
+            member_ttl: 1500,
+        }
+    }
+
+    /// RED (the pre-D9/D10 bot): defense counted toward an offense-shaped pace + the count-only rally
+    /// gate. Each home's first defender masses for a 4th member the lane never delivers before the 1st
+    /// ages out (N-1 for the whole budget); the second defender behind it never fields a member and
+    /// churns through the +400 lease (a Defend GaveUp is never backed off, so Phase C re-claims it every
+    /// 400t). Nothing deploys.
+    #[test]
+    fn four_defenders_stall_at_n_minus_one_under_the_count_gate() {
+        let arm = ClaimArm::ClaimsAllowed { max_concurrent: FLAT_CAP, max_forming: 4 };
+        let r = run_multi_forming(&defender_board(arm, false));
+        assert!(
+            r.outcomes.iter().all(|o| !matches!(o, BoardOutcome::Departed { .. })),
+            "no defender deploys under the count-only gate: {:?}",
+            r.outcomes
+        );
+        for i in [0, 1] {
+            assert!(
+                matches!(r.outcomes[i], BoardOutcome::Stalled { filled: 3, of: 4, .. }),
+                "home {i}'s first defender sits at N-1 = 3/4: {:?}",
+                r.outcomes[i]
+            );
+        }
+        for i in [2, 3] {
+            assert!(
+                matches!(r.outcomes[i], BoardOutcome::Stalled { filled: 0, generations, .. } if generations >= 4),
+                "the defender queued behind it never fields and churns its lease: {:?}",
+                r.outcomes[i]
+            );
+        }
+    }
+
+    /// GREEN (D9 + D10 as built): `claim_admission` admits every defender within cap + surge with no
+    /// forming pace, and the live proceed gate deploys each one the moment its present duo wins-or-stalls
+    /// (the P(win) fast-path over the live-visible owned room) — all four deploy inside the budget, the
+    /// second defender at each home once the first's departure frees the lane.
+    #[test]
+    fn four_defenders_deploy_with_d9_d10() {
+        let r = run_multi_forming(&defender_board(ClaimArm::ClaimAdmission, true));
+        for (i, o) in r.outcomes.iter().enumerate() {
+            assert!(matches!(o, BoardOutcome::Departed { present: 2, of: 4, .. }), "defender {i} deploys at its winning duo: {o:?}");
+        }
+        assert_eq!(r.claim_order[..4], [0, 1, 2, 3], "all four admitted at once (defense is never paced): {:?}", r.claim_order);
+        assert_eq!(r.max_offense_forming, 0, "no offense roster ever counted toward the pace");
+    }
+
+    /// THE SURGE BOARD: four 1-slot offense objectives with long fights fill the concurrent board; a
+    /// DEFENSE duo appears at tick 300 with the board full.
+    fn surge_board(arm: ClaimArm) -> MultiSquadFormingScenario {
+        let solo = sized_comp(1, 4, 1, BoostTier::T0);
+        let solo_rate = covering_rate_milli(&solo, 3000);
+        let duo = light_duo();
+        let duo_rate = covering_rate_milli(&duo, 3000);
+        let mut objectives: Vec<BoardObjective> = (0..4).map(|_| offense(solo.clone(), None, solo_rate, 3000)).collect();
+        objectives.push(BoardObjective {
+            composition: duo,
+            is_defense: true,
+            available_at: 300,
+            homes_in_range: vec![],
+            static_bid: None,
+            objective_rate_milli: duo_rate,
+            fight_ticks: 300,
+            wins_or_stalls_at: None,
+        });
+        MultiSquadFormingScenario {
+            objectives,
+            homes: vec![home(300), home(300)],
+            economy: HAULER,
+            arm,
+            d9_proceed_gate: true,
+            per_member_cap: 3000,
+            budget_ticks: 1000,
+            member_ttl: 1500,
+        }
+    }
+
+    /// S5-CAP: with the OFFENSE board at the cap, a DEFENSE claim is still admitted (within
+    /// `cap + DEFENSE_SURGE_SQUADS`) the tick it appears, while the 4th offense claim stays refused at the
+    /// cap — and under the offense-only budget the same defender is NEVER claimed (the REC-008/S5-CAP
+    /// starvation the live kernel closed).
+    #[test]
+    fn defense_claim_admitted_past_a_full_offense_board() {
+        let cap = max_concurrent_squads(2);
+        let live = run_multi_forming(&surge_board(ClaimArm::ClaimAdmission));
+        assert!(
+            matches!(live.outcomes[4], BoardOutcome::Departed { claimed_at: 300, active_at_claim, .. } if active_at_claim == cap),
+            "the defender is admitted the tick it appears with the offense board full (active == cap {cap}): {:?}",
+            live.outcomes[4]
+        );
+        assert_eq!(live.outcomes[3], BoardOutcome::NeverClaimed, "the 4th offense claim is refused at the cap");
+        let old = run_multi_forming(&surge_board(ClaimArm::ClaimsAllowed { max_concurrent: FLAT_CAP, max_forming: 2 }));
+        assert_eq!(old.outcomes[4], BoardOutcome::NeverClaimed, "the offense-only budget starves the defender: {:?}", old.outcomes[4]);
+    }
+
+    #[test]
+    fn multi_forming_is_deterministic() {
+        for s in [
+            lockup_board(ClaimArm::ClaimAdmission, None),
+            completing_board(ClaimArm::ClaimAdmission, None),
+            defender_board(ClaimArm::ClaimAdmission, true),
+            surge_board(ClaimArm::ClaimAdmission),
+        ] {
+            assert_eq!(run_multi_forming(&s), run_multi_forming(&s));
+        }
+    }
+
+    // ── BED 1 at N>1 — forming under lane contention with N rosters sharing the lanes ──
+
+    /// N offense quads over two RCL8 homes at 300e/t against the constant HIGH hauler, static bid.
+    fn lanes_board(n: usize, bid: u32) -> MultiSquadFormingScenario {
+        let rate = covering_rate_milli(&heavy_quad(), 3000);
+        MultiSquadFormingScenario {
+            objectives: (0..n).map(|_| offense(heavy_quad(), Some(bid), rate, 3000)).collect(),
+            homes: vec![home(300), home(300)],
+            economy: HAULER,
+            arm: ClaimArm::ClaimAdmission,
+            d9_proceed_gate: true,
+            per_member_cap: 3000,
+            budget_ticks: 1500,
+            member_ttl: 1500,
+        }
+    }
+
+    /// Bed 1's stall at N=2: MEDIUM (50) combat below the HIGH (75) hauler never wins a lane on EITHER
+    /// home, so no roster fields a single member and both leases lapse at +400 (the live give-up).
+    #[test]
+    fn n_squads_below_economy_never_field_over_shared_lanes() {
+        let r = run_multi_forming(&lanes_board(2, 50_000));
+        assert_eq!(r.combat_spawns, 0, "MEDIUM combat never wins a lane from the HIGH hauler");
+        for o in &r.outcomes {
+            assert!(matches!(o, BoardOutcome::Abandoned { at: COMMITMENT_BUDGET, .. }), "a member-less roster lapses at +{COMMITMENT_BUDGET}: {o:?}");
+        }
+    }
+
+    /// Bed 1's completion at N=2: above-economy (87.5) combat completes BOTH rosters over the shared
+    /// lanes — serialized by the pace, the second departing after the first — at a contention cost
+    /// (the last departure lands later than the lone roster's).
+    #[test]
+    fn n_squads_above_economy_complete_every_roster_over_shared_lanes() {
+        let r = run_multi_forming(&lanes_board(2, 87_500));
+        let departed: Vec<u32> = r
+            .outcomes
+            .iter()
+            .map(|o| match o {
+                BoardOutcome::Departed { departed_at, present: 4, of: 4, .. } => *departed_at,
+                other => panic!("both rosters complete above economy, got {other:?}"),
+            })
+            .collect();
+        assert!(departed[0] < departed[1], "the lanes serialize the rosters: {departed:?}");
+        let alone = run_multi_forming(&lanes_board(1, 87_500));
+        let BoardOutcome::Departed { departed_at: alone_at, .. } = alone.outcomes[0] else {
+            panic!("the lone roster completes: {:?}", alone.outcomes[0]);
+        };
+        assert!(departed[1] > alone_at, "sharing the lanes costs the second roster ticks ({} > {alone_at})", departed[1]);
+        assert!(r.hauler_spawns > 0, "the hauler resumes once the rosters depart");
+    }
+
+    // ═══ ADR 0041 §7 P3 — the boosted forming bed (`AwaitBoost` between spawn and depart) ═══════════
+
+    /// A T3 duo (4 RA + 1 HEAL + 5 MOVE per member — three boost families) over one RCL8 home.
+    fn boosted_base(tier: BoostTier) -> ColonyFormingScenario {
+        ColonyFormingScenario {
+            composition: sized_comp(2, 4, 1, tier),
+            homes: vec![home(300)],
+            economy: HAULER,
+            combat_priority: 87_500,
+            per_member_cap: 3000,
+            budget_ticks: 1500,
+            member_ttl: 1500,
+            renew: false,
+            escalating_completion: false,
+            objective_rate_milli: 0,
+        }
+    }
+
+    fn boosted(tier: BoostTier, stock_loss_at: Option<u32>) -> BoostedFormingScenario {
+        let base = boosted_base(tier);
+        let stock = base.composition.required_boosts(); // covers `required_boosts()` exactly
+        BoostedFormingScenario {
+            base,
+            stock,
+            labs: 6,
+            walk_to_labs: 5,
+            stock_loss_at,
+            boost_military: true,
+            await_boost_deadline: AWAIT_BOOST_DEADLINE,
+        }
+    }
+
+    /// P3 (a): a boosted roster forms, each member routes to the loaded labs (one `boostCreep` per
+    /// family compound), and the roster departs FULLY boosted once the stock covers `required_boosts()`
+    /// — a few ticks after its unboosted twin (the walk + three applies), never a stall.
+    #[test]
+    fn boosted_roster_routes_to_the_labs_and_departs_boosted() {
+        let s = boosted(BoostTier::T3, None);
+        let r = run_boosted_forming(&s);
+        let FormingOutcome::Completed { ticks } = r.outcome else { panic!("the boosted roster departs, got {:?}", r.outcome) };
+        assert_eq!(r.departed_boosted, 2, "both members depart fully boosted");
+        assert_eq!(r.departed_by_deadline, 0, "no fall-through when the stock covers the need");
+        assert_eq!(r.lab_visits, 6, "three family compounds per member, one boostCreep each");
+        assert!(r.boost_requests_filed > 0, "the producer filed the demand");
+        let FormingOutcome::Completed { ticks: raw } = run_forming(&boosted_base(BoostTier::T0)) else { panic!("the T0 twin departs") };
+        assert!(ticks > raw && ticks <= raw + 2 * (s.walk_to_labs + 3), "the boost hop costs the walk + applies ({ticks} vs raw {raw})");
+    }
+
+    /// P3 (b): the stock is LOST while the first member is already in `AwaitBoost` — no lab ever loads,
+    /// so each member sits the age window out and falls through UNBOOSTED at `AWAIT_BOOST_DEADLINE`; the
+    /// roster departs at the last member's deadline (no permanent hold — the EP-4.5 bounded contract).
+    #[test]
+    fn stock_loss_mid_await_boost_falls_through_at_the_deadline() {
+        let r = run_boosted_forming(&boosted(BoostTier::T3, Some(32)));
+        let FormingOutcome::Completed { ticks } = r.outcome else { panic!("the roster must not hang, got {:?}", r.outcome) };
+        assert_eq!(r.departed_by_deadline, 2, "both members fall through on the deadline");
+        assert_eq!(r.departed_boosted, 0);
+        assert_eq!(r.lab_visits, 0, "nothing was ever applied");
+        // The second member spawns at t60 (two 30-tick spawns back to back) → its deadline releases it
+        // at age AWAIT_BOOST_DEADLINE + 1 → the roster departs the same tick.
+        assert_eq!(ticks, 60 + AWAIT_BOOST_DEADLINE + 1, "departs at the last member's deadline");
+    }
+
+    /// P3 (b) RED twin: WITHOUT the deadline the same stock loss holds the fully-present roster in
+    /// `AwaitBoost` for the whole budget — the hang the bounded fall-through exists to prevent.
+    #[test]
+    fn without_the_deadline_a_stock_loss_holds_the_roster_forever() {
+        let mut s = boosted(BoostTier::T3, Some(32));
+        s.await_boost_deadline = u32::MAX;
+        let r = run_boosted_forming(&s);
+        assert_eq!(r.outcome, FormingOutcome::Stalled { filled: 2, of: 2 }, "present but never released");
+        assert_eq!(r.departed_by_deadline, 0);
+    }
+
+    /// P3 (c): a T0 roster never touches the boost stage — no request filed, no lab visit, and the
+    /// departure tick is byte-identical to `run_forming`.
+    #[test]
+    fn t0_rosters_never_touch_the_boost_stage() {
+        let s = boosted(BoostTier::T0, None);
+        assert!(s.stock.is_empty(), "a T0 spec needs no compounds");
+        let r = run_boosted_forming(&s);
+        assert_eq!(r.boost_requests_filed, 0);
+        assert_eq!(r.lab_visits, 0);
+        assert_eq!(r.departed_boosted, 0);
+        assert_eq!(r.outcome, run_forming(&s.base), "identical to the unboosted forming driver");
+    }
+
+    /// The P3 activation switch: with `boost_military` OFF a boosted-tier spec departs raw exactly like
+    /// T0 (the live `AwaitBoost::tick` releases the member immediately; the producer files nothing).
+    #[test]
+    fn boost_stage_is_inert_while_boost_military_is_off() {
+        let mut s = boosted(BoostTier::T3, None);
+        s.boost_military = false;
+        let r = run_boosted_forming(&s);
+        assert_eq!(r.boost_requests_filed, 0);
+        assert_eq!(r.lab_visits, 0);
+        assert_eq!(r.outcome, run_forming(&boosted_base(BoostTier::T0)));
+    }
+
+    #[test]
+    fn boosted_forming_is_deterministic() {
+        let s = boosted(BoostTier::T3, Some(32));
+        assert_eq!(run_boosted_forming(&s), run_boosted_forming(&s));
     }
 }

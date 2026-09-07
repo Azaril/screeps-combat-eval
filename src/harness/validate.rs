@@ -511,7 +511,7 @@ fn choose_fielded_comp(scenario: &Scenario, obj: &Objective) -> (SquadCompositio
 /// catalog `quad_ranged` it used to field is gone (ADR 0031 P4b), so it is reconstructed template-free
 /// from `Sized` bodies — the same 2×RangedDPS + 2×Healer Box2x2 the positioning gates are calibrated
 /// against. (The sizing-pure siege force is `choose_fielded_comp`/`OracleCalibration`.)
-fn managed_assault_comp(scenario: &Scenario) -> SquadComposition {
+pub(crate) fn managed_assault_comp(scenario: &Scenario) -> SquadComposition {
     use screeps_combat_decision::composition::{FormationMode, FormationShape};
     let energy = scenario.member_energy;
     let ranged = max_role_parts(
@@ -1771,8 +1771,8 @@ mod invariant_tests {
     /// ADR 0031 P2 golden-output / byte-stability fence: the unified `emit_requirement` (which
     /// `siege_doctrine_plan` now routes through) must produce IDENTICAL sizing — verdict + `RequiredForce`
     /// + the full serialized composition — run-twice over EVERY realistic base. This is the bed-level
-    /// determinism the bot/eval parity depends on (the doctrine-crate unit fence covers the math in
-    /// isolation; this covers it over the real beds, defenders fed in). (ADR 0031 §3 Phase 2, §5.)
+    ///   determinism the bot/eval parity depends on (the doctrine-crate unit fence covers the math in
+    ///   isolation; this covers it over the real beds, defenders fed in). (ADR 0031 §3 Phase 2, §5.)
     #[test]
     fn emit_requirement_golden_output_is_stable_over_realistic_bases() {
         for scenario in crate::harness::generate::realistic_bases() {
