@@ -4805,6 +4805,163 @@ pub fn run_boosted_forming(s: &BoostedFormingScenario) -> BoostedFormingReport {
     report
 }
 
+// ═══ F10 (2026-09-07 live) — the RALLY-ROOM FLAP under a per-tick vision toggle ══════════════════════════
+//
+// The live defect (WS-CLOSE Phase C, offense objectives Dismantle W5N7 / W7N7): one squad's `[Lifecycle]
+// TRAVEL` lines alternated `rally=(W5N7,25,25) uncontested=true` ↔ `rally=(W4N7,25,25) uncontested=false`
+// tick to tick — with `in_room=false` on the uncontested lines, i.e. the target was visible from an eye that
+// was NOT a member (a scout / observer / the other squad passing the seam). The manager's classifier read
+// `uncontested` off THIS TICK's combat DTOs, which are a per-tick cache refilled only from live vision: eye
+// in the room → the core is seen → "real intel, no hostiles" → uncontested → the rally moves INTO the target;
+// eye gone → empty DTOs → "no real intel" → contested → the rally moves ONE ROOM SHORT. Members shuttled
+// across the seam chasing it, `gathered` never held, and the undefended L0 core sat at full hits.
+//
+// This driver scripts exactly that: a squad parked at the seam, the target room's TRUE state (a bare core
+// = clear, or militarised), a scouted record with an age, and a vision script (any member in-room, plus an
+// optional external eye that blinks with a period). Each tick it classifies `uncontested` with EITHER the
+// pre-fix per-tick-view composition OR the F10 evidence kernel, derives the rally through the PRODUCTION
+// geometry (`rally::shared_rally_point_for_members_biased`, the manager's exact call), runs the production
+// gather quorum + massing + FIX-A latch, and steps the members (solo-travel toward the rally; assault
+// toward the target once gathered). It reports the per-tick rally rooms, the number of rally-ROOM flips,
+// and the tick every member stood in the target room. Deterministic (integer world-coord math).
+
+/// Which `uncontested` classifier the F10 driver runs — the toggle that makes the pin RED/GREEN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RallyIntelMode {
+    /// PRE-FIX: `target_is_uncontested(real_view_this_tick, no_hostiles_in_view, no_towers_in_view, no_safe)`
+    /// where "real view" ⇔ an eye is in the room this tick (the per-tick DTO cache is non-empty).
+    PerTickView,
+    /// F10: `target_is_uncontested_by_evidence(record_with_age, RALLY_INTEL_FRESHNESS_TICKS)` over the
+    /// scouted record, which any sighting REPLACES (same content, age 0) and losing vision leaves alone.
+    Evidence,
+}
+
+/// The F10 rally-flap scenario.
+#[derive(Clone, Debug)]
+pub struct RallyFlapScenario {
+    /// Member positions at t=0 (real `Position`s, all outside the target room, at its seam).
+    pub members: Vec<Position>,
+    /// The assault target (the room centre of the objective room).
+    pub target: Position,
+    /// The target room's TRUE militarised state (hostile combat creeps / towers / spawn / safe mode).
+    pub target_contested: bool,
+    /// Age (ticks) of the scouted record at t=0, `None` = never scouted. Its content is the true state.
+    pub record_age_at_start: Option<u32>,
+    /// An external eye (scout / observer) that sees the target every `period` ticks (tick % period == 0)
+    /// regardless of where the members stand — the live "visibility toggles every tick" input.
+    pub external_eye_period: Option<u32>,
+    pub mode: RallyIntelMode,
+    pub ticks: u32,
+}
+
+/// What the F10 driver measured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RallyFlapOutcome {
+    /// The rally ROOM chosen on each tick (index = tick).
+    pub rally_rooms: Vec<screeps::RoomName>,
+    /// Consecutive-tick rally-room changes DURING SOLO TRAVEL (the leg where the rally is the members'
+    /// movement goal) — the FLAP count. 0 = one stable rally room per leg. (After the FIX-A latch the
+    /// assault anchors to the target and the rally is no longer a goal; the designed "arrived contested →
+    /// target centre" transition on bloc entry is therefore not a flap and is not counted.)
+    pub flips: u32,
+    /// The tick the FIX-A assault latch fired (gather quorum + massed), `None` = never.
+    pub latched_tick: Option<u32>,
+    /// First tick every living member stood in the target room, `None` = never (they shuttled).
+    pub converged_tick: Option<u32>,
+}
+
+/// Drive the F10 rally-flap bed. See the module header above for what it models.
+pub fn run_rally_flap_flow(s: &RallyFlapScenario) -> RallyFlapOutcome {
+    use screeps_combat_decision::rally::{
+        gather_quorum_met, roster_massed_for_anchor, shared_rally_point_for_members_biased, target_is_uncontested,
+        target_is_uncontested_by_evidence, TargetIntel, RALLY_GATHER_RADIUS, RALLY_INTEL_FRESHNESS_TICKS,
+    };
+    let target_room = s.target.room_name();
+    let n = s.members.len();
+    let mut member_pos: Vec<Position> = s.members.clone();
+    // The scouted record: `Some(last_seen_tick)` as a signed tick so a pre-t0 age is representable.
+    let mut record_last_seen: Option<i64> = s.record_age_at_start.map(|age| -(age as i64));
+    let mut rally_rooms: Vec<screeps::RoomName> = Vec::with_capacity(s.ticks as usize);
+    let mut flips: u32 = 0;
+    let mut solo_prev_room: Option<screeps::RoomName> = None;
+    let mut converged_tick: Option<u32> = None;
+    let mut latched = false; // FIX-A assault latch (the manager's `assault_latched`)
+    let mut latched_tick: Option<u32> = None;
+
+    for tick in 0..s.ticks {
+        let any_in_room = member_pos.iter().any(|p| p.room_name() == target_room);
+        let external_eye = s.external_eye_period.is_some_and(|period| tick.is_multiple_of(period));
+        let visible = any_in_room || external_eye;
+        if visible {
+            record_last_seen = Some(tick as i64); // a sighting REPLACES the record (same true content, age 0)
+        }
+
+        let uncontested = match s.mode {
+            RallyIntelMode::PerTickView => {
+                // Pre-fix: the DTO view is real ONLY on a visible tick (the room's core is in it); the
+                // hostiles/towers flags are readable only then too (an unseen room reads vacuously "none").
+                let real_view = visible;
+                let no_hostiles = !(visible && s.target_contested);
+                target_is_uncontested(real_view, no_hostiles, true, true)
+            }
+            RallyIntelMode::Evidence => {
+                let intel = match record_last_seen {
+                    Some(seen) => TargetIntel::Observed {
+                        age: (tick as i64 - seen).max(0) as u32,
+                        contested: s.target_contested,
+                    },
+                    None => TargetIntel::Unknown,
+                };
+                target_is_uncontested_by_evidence(intel, RALLY_INTEL_FRESHNESS_TICKS)
+            }
+        };
+
+        // PRODUCTION rally geometry — the manager's exact call (no danger veto / renewable bias in this bed).
+        let opts: Vec<Option<Position>> = member_pos.iter().map(|p| Some(*p)).collect();
+        let rally = shared_rally_point_for_members_biased(&opts, s.target, uncontested, &|_| false, &|_| false);
+        if !latched {
+            // Solo travel (the latch state entering this tick): the rally IS the movement goal — a room
+            // change here is the flap that turns the members around.
+            if solo_prev_room.is_some_and(|prev| prev != rally.room_name()) {
+                flips += 1;
+            }
+            solo_prev_room = Some(rally.room_name());
+        }
+        rally_rooms.push(rally.room_name());
+
+        // PRODUCTION gather decision: in-room members count at the rally (FIX A); quorum + massing; latch.
+        let gather_positions: Vec<Option<Position>> = member_pos
+            .iter()
+            .map(|p| if p.room_name() == target_room { Some(rally) } else { Some(*p) })
+            .collect();
+        let quorum = gather_quorum_met(&gather_positions, rally, n, uncontested, true, RALLY_GATHER_RADIUS);
+        let massed = roster_massed_for_anchor(&gather_positions, rally, RALLY_GATHER_RADIUS);
+        if !latched && quorum && massed {
+            latched = true;
+            latched_tick = Some(tick);
+        }
+        let gathered = latched;
+
+        // Movement: assault → toward the target; solo travel → toward the rally (one world tile per tick).
+        for p in member_pos.iter_mut() {
+            let goal = if gathered { s.target } else { rally };
+            if p.get_range_to(goal) > 0 {
+                *p = ExtendedTravel::step_toward(*p, goal);
+            }
+        }
+        if converged_tick.is_none() && member_pos.iter().all(|p| p.room_name() == target_room) {
+            converged_tick = Some(tick);
+        }
+    }
+
+    RallyFlapOutcome {
+        rally_rooms,
+        flips,
+        latched_tick,
+        converged_tick,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7653,5 +7810,103 @@ mod tests {
     fn boosted_forming_is_deterministic() {
         let s = boosted(BoostTier::T3, Some(32));
         assert_eq!(run_boosted_forming(&s), run_boosted_forming(&s));
+    }
+
+    // ── F10 (2026-09-07 live): the rally-room FLAP under a per-tick vision toggle ──────────────────────
+
+    fn rpos(x: u8, y: u8, room: &str) -> Position {
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room.parse::<screeps::RoomName>().unwrap(),
+        )
+    }
+
+    /// The live shape: a 3-member squad parked at the W4N7→W5N7 seam (W5N7 lies WEST of W4N7, so the seam
+    /// is W4N7's x=0 edge — the members stand 3 tiles from it, 22 tiles from W4N7's centre), the target an
+    /// undefended L0 core in W5N7 (clear), scouted clear 10 ticks before t0, and an external eye blinking
+    /// every other tick.
+    fn seam_flap(mode: RallyIntelMode, target_contested: bool) -> RallyFlapScenario {
+        RallyFlapScenario {
+            members: vec![rpos(3, 24, "W4N7"), rpos(3, 25, "W4N7"), rpos(3, 26, "W4N7")],
+            target: rpos(25, 25, "W5N7"),
+            target_contested,
+            record_age_at_start: Some(10),
+            external_eye_period: Some(2),
+            mode,
+            ticks: 200,
+        }
+    }
+
+    /// RED on the pre-fix per-tick-view classifier, GREEN on the F10 evidence kernel: with the target
+    /// visible on alternate ticks (an external eye — the live `in_room=false uncontested=true` lines), the
+    /// pre-fix rally ROOM flips every tick between the target (W5N7) and one room short (W4N7) and the
+    /// members shuttle at the seam without ever converging; the evidence classifier holds ONE rally room
+    /// (the target — the record is fresh and clear) for the whole window and the squad walks in.
+    #[test]
+    fn f10_rally_room_holds_under_a_per_tick_vision_toggle() {
+        let fixed = run_rally_flap_flow(&seam_flap(RallyIntelMode::Evidence, false));
+        assert_eq!(fixed.flips, 0, "F10: the rally room must not flip under the vision toggle, got {:?}", fixed.rally_rooms);
+        let target: screeps::RoomName = "W5N7".parse().unwrap();
+        assert!(
+            fixed.rally_rooms.iter().all(|r| *r == target),
+            "a fresh clear record stages AT the target room every tick, got {:?}",
+            fixed.rally_rooms
+        );
+        assert!(
+            fixed.converged_tick.is_some(),
+            "with one stable rally room the squad converges into the target, got {fixed:?}"
+        );
+
+        // The pre-fix composition under the SAME toggle: the flap (the live defect), no convergence.
+        let buggy = run_rally_flap_flow(&seam_flap(RallyIntelMode::PerTickView, false));
+        assert!(buggy.flips > 0, "the pre-fix per-tick-view classifier flips the rally room, got {:?}", buggy.rally_rooms);
+        let distinct: std::collections::BTreeSet<screeps::RoomName> = buggy.rally_rooms.iter().copied().collect();
+        assert_eq!(distinct.len(), 2, "pre-fix: the rally alternates between the target and one room short");
+        assert_eq!(buggy.converged_tick, None, "pre-fix: the members shuttle at the seam and never converge");
+    }
+
+    /// F10, the conservative side: a MILITARISED record (a scout SAW creeps/towers) keeps the rally ONE
+    /// ROOM SHORT through the same vision toggle — no flip either — and the bloc still masses there and
+    /// enters together (the contested doctrine is unchanged by the evidence classifier).
+    #[test]
+    fn f10_militarised_record_stages_one_room_short_without_flapping() {
+        let out = run_rally_flap_flow(&seam_flap(RallyIntelMode::Evidence, true));
+        assert_eq!(out.flips, 0, "no flap for a contested target either, got {:?}", out.rally_rooms);
+        let staging: screeps::RoomName = "W4N7".parse().unwrap();
+        // Solo travel stages one room short until the bloc masses at that staging room; only THEN does the
+        // assault cross, and the rally reads the target centre once members stand in the room (the designed
+        // "arrived contested" clause — after the latch, not a movement goal).
+        let latched = out.latched_tick.expect("the bloc masses at the staging room");
+        assert!(
+            out.rally_rooms[..=latched as usize].iter().all(|r| *r == staging),
+            "contested → the rally is one room short on the approach side for the whole solo-travel leg, got {:?}",
+            out.rally_rooms
+        );
+        assert!(out.converged_tick.is_some(), "the massed bloc crosses together, got {out:?}");
+    }
+
+    /// F10: a never-scouted target with no eye is UNKNOWN → contested (never trust no-vision emptiness), and a
+    /// STALE clear record without an eye is contested too — both stage one room short, stably.
+    #[test]
+    fn f10_unknown_or_stale_evidence_is_contested_and_stable() {
+        for record_age_at_start in [None, Some(screeps_combat_decision::rally::RALLY_INTEL_FRESHNESS_TICKS + 1)] {
+            let s = RallyFlapScenario {
+                record_age_at_start,
+                external_eye_period: None,
+                ticks: 30, // short of the seam crossing, so no member's own eye refreshes the record
+                ..seam_flap(RallyIntelMode::Evidence, false)
+            };
+            let out = run_rally_flap_flow(&s);
+            let staging: screeps::RoomName = "W4N7".parse().unwrap();
+            assert_eq!(out.flips, 0, "stable, got {:?}", out.rally_rooms);
+            assert!(out.rally_rooms.iter().all(|r| *r == staging), "unknown/stale evidence → one room short (record_age={record_age_at_start:?})");
+        }
+    }
+
+    #[test]
+    fn f10_rally_flap_flow_is_deterministic() {
+        let s = seam_flap(RallyIntelMode::PerTickView, false);
+        assert_eq!(run_rally_flap_flow(&s), run_rally_flap_flow(&s));
     }
 }
