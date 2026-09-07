@@ -123,6 +123,63 @@ experiments pass), the position-search budget, and the tournament ship-gate as s
 cargo test -p screeps-combat-eval
 ```
 
+
+## Stronghold / border / boosted lanes
+
+The WS-VAL corpus (ADR 0023a design deltas, 2026-09-07): real invader strongholds (`harness/stronghold.rs`),
+the border-crossing gauntlet, and boosted self-play (`tournament.rs`). Every command below is a `--lib`
+test target; the gates run under the plain `cargo test`, the dashboards are `#[ignore]`d reading
+instruments (they assert nothing — read the printed ladder). Use `--release` for anything that fields the
+managed brain over a full assault.
+
+**The six named gates** (the battery every kernel change must keep green):
+
+```bash
+cargo test --release -p screeps-combat-eval --lib stronghold_floor_t0_defers_t3_kills_every_l1_rung
+cargo test --release -p screeps-combat-eval --lib multi_member_drain_soak_kills_with_tank_forward_coordination
+cargo test --release -p screeps-combat-eval --lib assembler_kills_across_defended_regimes
+cargo test --release -p screeps-combat-eval --lib positioning_oscillation_stays_low_across_designed
+cargo test --release -p screeps-combat-eval --lib exp_register_passes_all_gates
+cargo test --release -p screeps-combat-eval --lib t3_twin_decisively_beats_unboosted_twin
+```
+
+**Dashboards and replay writers** (`--ignored --nocapture`):
+
+```bash
+# Every stronghold level x terrain x room-count x {T0,T3} + the border grades 1-4 (oracle-sized, managed brain)
+cargo test --release -p screeps-combat-eval --lib stronghold_gauntlet -- --ignored --nocapture
+# Interactive HTML replays of every rung that fought -> target/replays/stronghold/index.html
+cargo test --release -p screeps-combat-eval --lib write_stronghold_replays -- --ignored --nocapture
+# Tick-by-tick trace of ONE rung (edit the build(...)/tier lines in the test to aim it)
+cargo test --release -p screeps-combat-eval --lib probe_rung -- --ignored --nocapture
+# Default tactics vs the 0026a catalog over the boosted mirror basket at T0 / T2 / T3
+cargo test --release -p screeps-combat-eval --lib boosted_selfplay_dashboard -- --ignored --nocapture
+# Tier-regime maximin (T0/T2/T3 mirror baskets) over the kernel grid + catalog + open_combat
+cargo test --release -p screeps-combat-eval --lib boosted_tier_retune -- --ignored --nocapture
+# The ADOPTION instrument: 3 boost tiers x 3 terrain classes = 9-cell maximin over chokepoint_comp_basket
+cargo test --release -p screeps-combat-eval --lib joint_boosted_terrain_retune -- --ignored --nocapture
+# Every MultiRoom index under the traversal lens
+cargo test --release -p screeps-combat-eval --lib multi_room_traversal_sweep -- --ignored --nocapture
+```
+
+`Killed` in a rung verdict always means the objective (the core) was razed — there is no
+defender-wipe stop; `Deferred` is the sizing oracle honestly refusing to field one squad.
+
+**Debug environment gates** (all `eprintln!` to stderr; set any value, e.g. `SQ_DEBUG=1`, and run with
+`--nocapture`). They live in the agent / decision crates, so they fire for any harness test that drives
+the managed squad:
+
+| Variable | Where | What it prints |
+| --- | --- | --- |
+| `SQ_DEBUG` | `screeps-combat-agent/src/squad.rs` | Per tick, per squad: the decided `state` / focus / movement mode / goal count (`[sq <owner>]`), every member's move request (`req #id to(room,x,y) r<range> prio`), each combat action emitted (`act #id`), and every resolved direction (`resolved #id -> dir`) — both the scripted `SimSquad` and the managed squad. The driver trace that decomposed the border-crossing stall. |
+| `SQ_DEBUG2` | `screeps-combat-agent/src/squad.rs` | Per tick: every living member's position + hits (`[hp <owner>] #id@(x,y):hits`) — the survivability line. |
+| `SQ_DEBUG3=<member index>` | `screeps-combat-decision/src/kernel.rs` | For ONE member (by its index in the squad view): every candidate tile's `cost`, approach distance `d`, `net` and `act` in the EV kernel's tile loop — the per-tile trace that found the objective-blind plateau tie-break. |
+| `SQ_DEBUG4` | `screeps-combat-decision/src/kernel.rs` | The kernel's damage-target list head each tick: the top-4 targets' position, residual, value-per-hit and structure flag. |
+| `SQ_DEBUG6` | `screeps-combat-decision/src/lib.rs` | The engage/retreat gate inputs each tick: current state, `can_reengage`, Lanchester balance, `unwinnable`, any-critical, avg HP fraction, the re-engage band, hostile count. |
+| `SQ_DEBUG7` | `screeps-combat-decision/src/kernel.rs` | The contact predicate each tick: `block_advance`, `squad_in_contact`, and which of the three contact sources (raw threat, hostile creep within 4, hostile structure within 4) fired, plus the member count — the out-of-contact hand-off diagnostic. |
+| `SZ_DEBUG` | `screeps-combat-decision/src/composition.rs` | The force optimizer: per boost tier the ceiling `cap`, `winnable`, assault `mode` and base requirement; then per low-rung candidate (`k < 1.3`, `t < 0.1`) members / `p_surv` / `p_kill` / EV. |
+| `SWEEP_REGIME`, `SWEEP_OUT`, `SWEEP_HOLD`, `SWEEP_OVERPOWER`, `SWEEP_MEMBER_ENERGY`, `SWEEP_COMMIT`, `SWEEP_DYNAMIC`, `SWEEP_W_ENERGY` | `screeps-combat-eval/src/harness/param_sweep.rs` | Inputs to the `#[ignore]`d `sweep_composition_params` grid sweep (regime filter, output path, and the comma-separated value lists for each `CompositionParams` knob). |
+
 ## The experiment register
 
 `register()` runs these `EXP-*` experiments (each gated to pass/fail):
